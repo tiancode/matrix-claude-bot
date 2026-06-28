@@ -84,6 +84,12 @@ class Settings:
     pr_followup_interval = _i("PR_FOLLOWUP_INTERVAL", 180)   # 轮询间隔（秒）
     pr_autofix_max       = _i("PR_AUTOFIX_MAX", 3)           # 每个 PR 自动改评审/CI 的次数上限，防反复失败空转
 
+    # PR 自动合并：followup 巡检到 PR 可合并 + CI 通过（或无 CI）+ 无未决"请求改动" → 直接调 Gitea API 合并。
+    # 这是机械闸（不经 Claude 评审）：移除最后一道人工合并闸，安全性改由 CI（若配了）+ 快照环境兜底。
+    pr_automerge               = _b("PR_AUTOMERGE", False)
+    pr_merge_method            = _s("PR_MERGE_METHOD", "merge")   # merge / squash / rebase（须为仓库允许的方式）
+    pr_automerge_delete_branch = _b("PR_AUTOMERGE_DELETE_BRANCH", True)  # 合并后删源分支 claude/xxx
+
     # 主动性·自驱心跳：没人派活时也巡检各项目、主动找值得做的事
     proactive_heartbeat_enabled  = _b("PROACTIVE_HEARTBEAT_ENABLED", True)
     proactive_heartbeat_interval = _i("PROACTIVE_HEARTBEAT_INTERVAL", 3600)  # 巡检间隔（秒），别太密以免烧钱/打扰

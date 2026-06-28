@@ -1324,6 +1324,75 @@ def test_pr_followup_actions():
         _reset_ledger()
 
 
+# ---------- PR 自动合并：可合并+CI通过(或无CI)+无未决改动 → 合并销账；否则不动 ----------
+def test_pr_automerge():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    orig_am = (settings.pr_automerge, settings.pr_merge_method)
+    settings.store_path = tempfile.mkdtemp()
+    settings.pr_automerge = True
+    settings.pr_merge_method = "merge"
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent, merged = [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, bot.client, bot._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    bot.client = FC()
+    bot._spawn = lambda coro: coro.close()
+
+    async def open_mergeable(r, n):
+        return {"state": "open", "merged": False, "mergeable": True,
+                "head": {"ref": "claude/x", "sha": "s"}}
+    async def no_reviews(r, n): return []
+    async def no_ci(r, s): return ""
+    async def fake_merge(r, n, method="merge", delete_branch=False):
+        merged.append((n, method)); return True, ""
+    try:
+        gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge = (
+            open_mergeable, no_reviews, no_ci, fake_merge)
+        # a) 可合并 + 无 CI + 无评审 → 合并 + 销账 + 报"已自动合并"
+        pr_ledger.record("h/o/r", 1, "u1", "!room")
+        asyncio.run(bot._followup_one([e for e in pr_ledger.active() if e["number"] == 1][0]))
+        assert merged == [(1, "merge")]
+        assert not any(e["number"] == 1 for e in pr_ledger.active())   # 销账
+        assert any("已自动合并" in m for m in sent)
+
+        # b) 未决 REQUEST_CHANGES（非新评审，不会走派跟进）→ 不合并、仍在册
+        merged.clear()
+        pr_ledger.record("h/o/r", 2, "u2", "!room")
+        pr_ledger.update("h/o/r", 2, seen_review=10)   # 标记已"看过"，section 1 不再当新评审派活
+        async def rc_review(r, n): return [{"id": 10, "state": "REQUEST_CHANGES", "body": "改"}]
+        gitea.pr_reviews = rc_review
+        asyncio.run(bot._followup_one([e for e in pr_ledger.active() if e["number"] == 2][0]))
+        assert merged == [] and any(e["number"] == 2 for e in pr_ledger.active())
+
+        # c) 不可合并（有冲突）→ 不合并、仍在册
+        merged.clear()
+        gitea.pr_reviews = no_reviews
+        async def conflict(r, n):
+            return {"state": "open", "merged": False, "mergeable": False,
+                    "head": {"ref": "claude/x", "sha": "s"}}
+        gitea.pr_info = conflict
+        pr_ledger.record("h/o/r", 3, "u3", "!room")
+        asyncio.run(bot._followup_one([e for e in pr_ledger.active() if e["number"] == 3][0]))
+        assert merged == [] and any(e["number"] == 3 for e in pr_ledger.active())
+    finally:
+        (bot.projects.get_project, bot.client, bot._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge) = orig
+        settings.pr_automerge, settings.pr_merge_method = orig_am
+        settings.store_path = orig_store
+        _reset_ledger()
+
+
 TESTS = [
     ("启动+群任务全链路", test_startup_and_task_flow),
     ("认 reply / 点名", test_reply_addressing),
@@ -1372,6 +1441,7 @@ TESTS = [
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),
     ("PR 跟进 合并销账/评审派活", test_pr_followup_actions),
+    ("PR 自动合并 条件满足才合并", test_pr_automerge),
     ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),
 ]
 

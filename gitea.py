@@ -23,6 +23,15 @@ def _get(url: str):
         return r.status, json.loads(r.read().decode() or "null")
 
 
+def _post(url: str, payload: dict):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    if settings.gitea_token:
+        req.add_header("Authorization", "token " + settings.gitea_token)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.status, (r.read().decode(errors="ignore") or "")
+
+
 async def _aget(url: str):
     try:
         return await asyncio.to_thread(_get, url)
@@ -54,3 +63,24 @@ async def ci_state(rec: dict, sha: str) -> str:
         return ""
     st, d = await _aget(f"{_repo_api(rec)}/commits/{sha}/status")
     return (d or {}).get("state", "") if st == 200 and isinstance(d, dict) else ""
+
+
+async def merge(rec: dict, number: int, method: str = "merge",
+                delete_branch: bool = False) -> tuple[bool, str]:
+    """合并 PR（POST .../pulls/<n>/merge）。成功返回 (True, "")，失败返回 (False, 原因)。
+    method: merge / squash / rebase（须为仓库允许的方式）。合并是写操作，不像只读查询那样
+    把异常吞成默认值——把失败原因带回去好回报 / 记日志（不可合并、方法被禁、分支保护等）。"""
+    url = f"{_repo_api(rec)}/pulls/{number}/merge"
+    payload = {"Do": method, "delete_branch_after_merge": bool(delete_branch)}
+    try:
+        st, body = await asyncio.to_thread(_post, url, payload)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode(errors="ignore")
+        except Exception:
+            detail = ""
+        return False, f"HTTP {e.code} {detail[:200]}".strip()
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return False, str(e)[:200]
+    ok = st in (200, 201, 204)
+    return ok, ("" if ok else f"HTTP {st} {body[:200]}")

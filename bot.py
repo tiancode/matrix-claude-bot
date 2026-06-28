@@ -747,6 +747,33 @@ async def _followup_one(entry: dict):
             _spawn(_followup_dispatch(rec, entry, f"PR #{n} 的 CI（持续集成）检查失败，请定位并修复后推送。"))
         else:
             await send(room, f"❌ PR #{n} CI 还失败，已到自动处理上限（{cap} 次），需要人看看：{entry.get('url', '')}")
+        return
+
+    # 3) 没有待处理评审、CI 也不失败：满足条件就自动合并（PR_AUTOMERGE=1 才开）
+    if settings.pr_automerge:
+        await _maybe_automerge(rec, entry, info, ci, reviews)
+
+
+async def _maybe_automerge(rec: dict, entry: dict, info: dict, ci: str, reviews: list):
+    """followup 末尾的机械合并闸：PR 可合并 + CI 通过(或无 CI 配置) + 无未决"请求改动"评审 →
+    直接按 Gitea API 合并、销账、回报。不经 Claude 评审（"只做合并"）；移除人工合并这道闸，
+    安全性靠 CI（若配了）+ 快照环境。合并失败保持 PR 开启，下轮再试或等人工。"""
+    pid, n, room = entry["pid"], entry["number"], entry["room"]
+    if not info.get("mergeable"):
+        return                                   # 有冲突 / 暂不可合并：等下一轮
+    if ci not in ("", "success"):                # pending / 未知：CI 没跑完就先等（failure 已在上一段处理）
+        return
+    decisive = [r.get("state") for r in reviews if r.get("state") in ("APPROVED", "REQUEST_CHANGES")]
+    if decisive and decisive[-1] == "REQUEST_CHANGES":
+        return                                   # 最近一条决定性评审是"请求改动"：别合
+    ok, detail = await gitea.merge(rec, n, settings.pr_merge_method,
+                                   settings.pr_automerge_delete_branch)
+    if ok:
+        pr_ledger.remove(pid, n)
+        await send(room, f"✅ PR #{n} 已自动合并（{settings.pr_merge_method}）：{entry.get('url', '')}")
+        log.info("[%s] PR #%d 自动合并", pid, n)
+    else:
+        log.warning("[%s] PR #%d 自动合并失败（保持开启，下轮再试或待人工）：%s", pid, n, detail)
 
 
 async def _pr_followup_loop():
