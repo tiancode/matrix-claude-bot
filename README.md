@@ -112,9 +112,11 @@ journalctl --user -u matrix-claude -f
 
 ## 文件
 
-- `bot.py` — Matrix 客户端：登录/持久化、监听消息、触发判断、调 Claude、回发
-- `claude_runner.py` — 调 `claude -p`：`ask()` 带工具干活+多轮会话，`quick()` 一次性判断
+- `bot.py` — Matrix 客户端：登录/持久化、监听消息、触发判断、调 Claude、回发；PR 跟进与自驱心跳两个后台循环
+- `claude_runner.py` — 调 `claude -p`：`ask()` 带工具干活+多轮会话，`quick()` 一次性判断，`consult()` 只读查证
 - `memory.py` — 项目长期记忆：跨会话/跨重启留存的事实库，开新会话时注入系统提示
+- `pr_ledger.py` — PR 台账：bot 开过的 PR 记账，跟到合并/关闭才销账（持久化到 `store/pr_ledger.json`）
+- `gitea.py` — Gitea REST 只读小客户端：bot 自己轮询 PR 状态 / 评审 / CI
 - `projects.py` — 房间↔Gitea 仓库的解析/绑定/clone 与路由
 - `config.py` — 读取 `.env` 的全部开关
 - `tests/smoke.py` — 离线冒烟自检
