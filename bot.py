@@ -812,6 +812,11 @@ async def _heartbeat_one(rec: dict, room: str):
         "- 不值得打扰就只回一行：__PASS__\n"
         "- 值得就挑**最值得的一件**，简短说清：是什么、为什么值得、打算怎么改（这是只读巡检，先别动手）。"
     )
+    try:
+        await projects.prepare_worktree(rec)   # 巡检最新的干净 base，而不是上个任务残留的脏树/分支
+    except Exception:
+        pass
+    log.info("[%s] 自驱巡检中…", rec["id"])
     sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
     try:
         proposal = (await runner.consult(patrol, cwd=rec["path"], system_prompt=sp)).strip()
@@ -819,6 +824,7 @@ async def _heartbeat_one(rec: dict, room: str):
         log.exception("[%s] 自驱巡检失败", rec["id"])
         return
     if not proposal or "__PASS__" in proposal:
+        log.info("[%s] 自驱：本轮没有值得主动做的事（PASS）", rec["id"])
         return
     label = f"{rec['owner']}/{rec['repo']}"
     if settings.proactive_autopilot:
