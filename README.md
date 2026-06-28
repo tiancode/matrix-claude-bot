@@ -11,7 +11,7 @@
 - **图片 / 文件 / 多媒体** → 自动下载（加密房间会解密）存到本地并在上下文标注；被 @ 时把文件路径交给 Claude 读取/分析
 - 每个**房间 × 项目**维护**多轮上下文**（Claude Code 会话，不同房间/私聊互不串台），发 `重置` / `/reset` 清空
 - **项目长期记忆**（跨会话/跨重启留存）→ 会话有 TTL，但「当初为什么这么设计、项目约定、长期目标、踩过的坑」这类**值得跨周记住**的事实落在 `store/memory/<项目>/`（一事一文件 + 索引，工作树之外不会被误 commit）；开新会话时按预算注入系统提示，会话被 TTL 清掉也"记得住事"。补「无长程记忆」短板的第一步（详见 `memory.py`）
-- **PR 台账（对结果负责）**→ bot 开了 PR 不撒手：后台轮询该 PR，收到**评审意见**或 **CI 失败**就自动在原分支上处理并推送、把进展回报到当初派活的房间，**合并/关闭才销账**（带自动处理次数上限防空转）。补「fire-and-forget、不跟进」短板（详见 `pr_ledger.py` / `gitea.py`）
+- **PR 台账（对结果负责）**→ bot 开了 PR 不撒手：后台轮询该 PR，收到**评审意见**或 **CI 失败**就自动在原分支上处理并推送、把进展回报到当初派活的房间，**合并/关闭才销账**（带自动处理次数上限防空转）。**PR 自动合并默认开**（`PR_AUTOMERGE=1`）：PR 可合并 + CI 通过（或没配 CI）+ 无未决"请求改动" → 直接调 Gitea API 合并、销账、回报，无需人工点合并（机械闸、不经 Claude 评审，安全性靠 CI＋快照环境）。补「fire-and-forget、不跟进」短板（详见 `pr_ledger.py` / `gitea.py`）
 - **主动性·自驱心跳**→ 没人派活时也按 `PROACTIVE_HEARTBEAT_INTERVAL` 巡检各项目（只读），挑一件值得主动推进的事（陈旧 PR、TODO/FIXME、缺测试、小 bug）。**默认 autopilot**（`PROACTIVE_AUTOPILOT=1`）：自己认领、开 PR（开的 PR 自动进台账→被 PR 跟进盯到合并）；设 `PROACTIVE_AUTOPILOT=0` 则只提议到项目房间等你点头（更安全、不自动改）。补「永远被动、无自驱」短板
 - **聊天历史回溯**（`TRANSCRIPT_ENABLED`，默认开）→ 会话有 24h 滑动 TTL、背景缓冲只有最近十几条且重启即清，都答不了「前天我们聊了什么」。开启后按房间把对话**明文**落到 `store/transcripts/<房间>.jsonl`（一行一条 + 保留天数/行数上限滚动删旧），派活时把日志**路径**注入系统提示，让 Claude 被问到更早对话时**自己去读/grep**（与项目记忆同一套"告诉它存哪、按需取"的玩法，不把整段历史塞进每次 prompt）。`/backfill [天数]` 可从 Matrix 时间线回灌开启前的历史；首次启用还会对各房间自动回灌一次。E2EE 下落盘的是收到时的明文，回溯可靠
 - **多轮·对话延续**→ 单聊每条必回；群里被 @ / 回复 bot / 命中触发词触发，且 `GROUP_FOLLOWUP_WINDOW` 秒内你的后续消息**免重复 @**也接着处理（@ 别人则不算，避免插话到你和别人的对话）
@@ -106,7 +106,7 @@ journalctl --user -u matrix-claude -f
 - **工作目录隔离**：兜底目录是 `PROJECTS_ROOT/_scratch`，别把 `CLAUDE_WORKDIR` 指到含 `.env` / `store/` 的目录。
 - **出口脱敏**：外发文本自动抹掉 `GITEA_TOKEN`、登录密码与 Matrix access token（兜底，非主防线）。
 - **媒体**：下载收到的文件（不再按用户/房间过滤），单文件受 `MEDIA_MAX_MB` 限制、每房间按 `MEDIA_KEEP` 滚动删旧；文件名经消毒（挡 `../` 穿越）。存到 `PROJECTS_ROOT/_media`（已 gitignore），不放进仓库工作树以免被误 commit。Claude 用绝对路径读取，`CLAUDE_DANGEROUS=0` 时可能读不到 cwd 之外的文件。
-- **默认偏"积极自主"**：开箱默认 `PROACTIVE=1`（群里没 @ 也会判断要不要插话/纠错）、`PROACTIVE_AUTOPILOT=1`（巡检到事自己开 PR）、`TRANSCRIPT_ENABLED=1`（对话明文落盘）。想要安静/被动：`PROACTIVE=0`、`PROACTIVE_AUTOPILOT=0`、`TRANSCRIPT_ENABLED=0`。
+- **默认偏"积极自主"**：开箱默认 `PROACTIVE=1`（群里没 @ 也会判断要不要插话/纠错）、`PROACTIVE_AUTOPILOT=1`（巡检到事自己开 PR）、`PR_AUTOMERGE=1`（PR 满足条件自动合并）、`TRANSCRIPT_ENABLED=1`（对话明文落盘）。**合起来就是"巡检→开 PR→自动合并到 main"的全自动闭环**，且无访问控制、无审批。想要保守：把对应项设 `0`。
 
 > **把"谁能用"放到 homeserver 这层**：bot 自己不再挡人，所以谁能驱动它 = 谁能在你的 Synapse 上给它发消息。请在 homeserver 侧收紧（**关闭开放注册、别开放联邦**），而不是指望 bot 拦。
 >

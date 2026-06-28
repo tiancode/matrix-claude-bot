@@ -99,7 +99,7 @@ class Settings:
 
     # PR 自动合并：followup 巡检到 PR 可合并 + CI 通过（或无 CI）+ 无未决"请求改动" → 直接调 Gitea API 合并。
     # 这是机械闸（不经 Claude 评审）：移除最后一道人工合并闸，安全性改由 CI（若配了）+ 快照环境兜底。
-    pr_automerge               = _b("PR_AUTOMERGE", False)
+    pr_automerge               = _b("PR_AUTOMERGE", True)
     pr_merge_method            = _s("PR_MERGE_METHOD", "merge")   # merge / squash / rebase（须为仓库允许的方式）
     pr_automerge_delete_branch = _b("PR_AUTOMERGE_DELETE_BRANCH", True)  # 合并后删源分支 claude/xxx
 
