@@ -76,6 +76,8 @@ class Settings:
     claude_model   = _s("CLAUDE_MODEL")
     # 未绑定仓库时的兜底工作目录：与源码/凭证隔离的空目录
     claude_workdir = _s("CLAUDE_WORKDIR") or os.path.join(os.path.abspath(projects_root), "_scratch")
+    # agentic 干活的超时（秒）。流式(默认)下是【空闲】超时：只要 Claude 还在持续产出就不限总时长，
+    # 仅连续 CLAUDE_TIMEOUT 秒无任何输出才判为卡死；非流式回退路径下退化为整体超时。
     claude_timeout = _i("CLAUDE_TIMEOUT", 600)
     quick_timeout  = _i("CLAUDE_QUICK_TIMEOUT", 60)   # quick() 轻量判断专用的短超时，别和 claude_timeout 混用
     claude_system_prompt = _s(

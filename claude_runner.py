@@ -155,6 +155,7 @@ class ClaudeRunner:
 
         自己按 \\n 切行（不用 StreamReader.readline，避免 tool_result 里的大块输出撑爆行缓冲），
         on_line 是协程：在里面节流编辑 Matrix 消息。被 cancel() 杀掉时 stdout 直接 EOF，正常收尾。
+        超时是【空闲】超时（按单次 read 计）：持续产出就不限总时长，仅长时间静默才判卡死。
         """
         workdir = cwd or settings.claude_workdir
         os.makedirs(workdir, exist_ok=True)
@@ -182,7 +183,10 @@ class ClaudeRunner:
             async def _read_stdout():
                 buf = bytearray()
                 while True:
-                    chunk = await proc.stdout.read(65536)
+                    # eff 是【空闲】超时而非整体墙钟：只要还在持续产出（token / 工具事件）就一直读，
+                    # 仅当 eff 秒内一个字节都没来（真卡死）才超时。整体跑多久不设限——长任务
+                    # （clone→改→测→push→开 PR）边流式输出边干，常超 10 分钟，不该被误杀。
+                    chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=eff)
                     if not chunk:
                         break
                     buf.extend(chunk)
@@ -203,11 +207,16 @@ class ClaudeRunner:
                             log.exception("流式 on_line 回调异常（忽略，继续读）")
                     if len(buf) > 32 * 1024 * 1024:   # 防单行失控吃内存
                         del buf[:]
-                await proc.wait()
+                # stdout 已 EOF，进程应即将退出；给个上限别在僵死进程上无限等
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    _kill_group(proc)
+                    await proc.wait()
 
             err_task = asyncio.create_task(_drain_err())
             try:
-                await asyncio.wait_for(_read_stdout(), timeout=eff)
+                await _read_stdout()
             except asyncio.TimeoutError:
                 _kill_group(proc)
                 await proc.wait()
