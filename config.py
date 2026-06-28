@@ -79,6 +79,11 @@ class Settings:
     memory_enabled       = _b("MEMORY_ENABLED", True)
     memory_recall_budget = _i("MEMORY_RECALL_BUDGET", 6000)   # 注入系统提示的事实正文字符预算
 
+    # PR 台账：bot 开了 PR 就跟到合并（轮询评审/CI，自动处理并回报到原房间）
+    pr_followup_enabled  = _b("PR_FOLLOWUP_ENABLED", True)
+    pr_followup_interval = _i("PR_FOLLOWUP_INTERVAL", 180)   # 轮询间隔（秒）
+    pr_autofix_max       = _i("PR_AUTOFIX_MAX", 3)           # 每个 PR 自动改评审/CI 的次数上限，防反复失败空转
+
     # 媒体（图片 / 文件 / 音视频）
     media_enabled  = _b("MEDIA_ENABLED", True)
     media_root     = _s("MEDIA_ROOT") or os.path.join(os.path.abspath(projects_root), "_media")

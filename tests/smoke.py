@@ -130,12 +130,15 @@ def test_startup_and_task_flow():
     bot.runner.ask = fake_ask
 
     orig_allow = settings.allow_users
+    orig_pf = settings.pr_followup_enabled               # 关掉 PR 跟进守护循环，否则它会 sleep 住任务回收
     settings.allow_users = ["@alice:ex.org"]            # fail-closed：须显式授权派活人
+    settings.pr_followup_enabled = False
     bot._context["!g:ex.org"].clear()
     try:
         asyncio.run(bot.main())
     finally:
         settings.allow_users = orig_allow
+        settings.pr_followup_enabled = orig_pf
 
     assert bot.MY_ID == "@claudebot:ex.org" and bot.MY_NAME == "claude-bot"
     assert captured["key"] == "gitea.example.com/team/app|!g:ex.org"    # 会话按项目+房间（不串台）
@@ -1195,6 +1198,93 @@ def test_project_memory():
         settings.memory_enabled = orig
 
 
+def _reset_ledger():
+    import pr_ledger
+    pr_ledger._data = {}
+    pr_ledger._loaded = False
+
+
+# ---------- PR 台账：登记/去重/更新/销账 + 持久化 ----------
+def test_pr_ledger():
+    import tempfile
+    import pr_ledger
+    orig = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_ledger()
+    try:
+        assert pr_ledger.record("h/o/r", 5, "http://x/pulls/5", "!room") is True
+        assert pr_ledger.record("h/o/r", 5, "http://x/pulls/5", "!room") is False   # 不重复记
+        a = pr_ledger.active()
+        assert len(a) == 1 and a[0]["number"] == 5 and a[0]["room"] == "!room"
+        pr_ledger.update("h/o/r", 5, branch="claude/x", review_fixes=2)
+        assert pr_ledger.active()[0]["branch"] == "claude/x"
+        _reset_ledger()                                          # 清内存态 → 必须能从盘恢复
+        got = pr_ledger.active()
+        assert got and got[0]["number"] == 5 and got[0]["review_fixes"] == 2
+        pr_ledger.remove("h/o/r", 5)
+        assert pr_ledger.active() == []
+    finally:
+        settings.store_path = orig
+        _reset_ledger()
+
+
+# ---------- 从回复里抽取本项目的 PR 链接 ----------
+def test_extract_pr():
+    rec = {"host": "http://pi.lan:3000", "owner": "claude", "repo": "playground"}
+    assert bot._extract_pr("搞定，PR：http://pi.lan:3000/claude/playground/pulls/7 看下", rec) \
+        == (7, "http://pi.lan:3000/claude/playground/pulls/7")
+    assert bot._extract_pr("纯问答没开 PR", rec) is None
+    assert bot._extract_pr("http://pi.lan:3000/other/repo/pulls/3", rec) is None   # 别的库不算
+
+
+# ---------- PR 跟进：合并→销账回报；新评审→派跟进且记 seen/计数 ----------
+def test_pr_followup_actions():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent, spawned = [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, bot.client, bot._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    bot.client = FC()
+    bot._spawn = lambda coro: (spawned.append(1), coro.close())
+    try:
+        # a) 已合并 → 销账 + 报"已合并"
+        pr_ledger.record("h/o/r", 1, "u1", "!room")
+        async def merged_info(r, n): return {"state": "closed", "merged": True, "head": {"ref": "b", "sha": "s"}}
+        async def no_reviews(r, n): return []
+        async def no_ci(r, s): return ""
+        gitea.pr_info, gitea.pr_reviews, gitea.ci_state = merged_info, no_reviews, no_ci
+        asyncio.run(bot._followup_one([e for e in pr_ledger.active() if e["number"] == 1][0]))
+        assert not any(e["number"] == 1 for e in pr_ledger.active())   # 销账
+        assert any("已合并" in m for m in sent)
+
+        # b) 新 REQUEST_CHANGES 评审 → 派跟进 + 记 seen_review + review_fixes+1
+        pr_ledger.record("h/o/r", 2, "u2", "!room")
+        async def open_info(r, n): return {"state": "open", "merged": False, "head": {"ref": "claude/x", "sha": "s2"}}
+        async def reviews2(r, n): return [{"id": 10, "state": "REQUEST_CHANGES", "body": "改下 X", "user": {"login": "root"}}]
+        gitea.pr_info, gitea.pr_reviews = open_info, reviews2
+        asyncio.run(bot._followup_one([e for e in pr_ledger.active() if e["number"] == 2][0]))
+        assert spawned                                              # 派了跟进任务
+        e2 = [e for e in pr_ledger.active() if e["number"] == 2][0]
+        assert e2["seen_review"] == 10 and e2["review_fixes"] == 1 and e2["branch"] == "claude/x"
+    finally:
+        (bot.projects.get_project, bot.client, bot._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state) = orig
+        settings.store_path = orig_store
+        _reset_ledger()
+
+
 TESTS = [
     ("启动+群任务全链路", test_startup_and_task_flow),
     ("认 reply / 点名", test_reply_addressing),
@@ -1240,6 +1330,9 @@ TESTS = [
     ("会话落盘重启可恢复", test_sessions_persisted_across_restart),
     ("DM 一般性问题当通用助手答", test_dm_general_question),
     ("项目长期记忆 跨会话留存", test_project_memory),
+    ("PR 台账 登记/持久化/销账", test_pr_ledger),
+    ("从回复抽取本项目 PR 链接", test_extract_pr),
+    ("PR 跟进 合并销账/评审派活", test_pr_followup_actions),
 ]
 
 
