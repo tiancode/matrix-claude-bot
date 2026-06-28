@@ -13,20 +13,20 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出（容器内连本地 Gitea：试网关 / IP / host.docker.internal）
+      - name: 检出（容器内解析不了 pi.lan，直接连 Gitea 的 IP）
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
-          hosts="192.168.1.4:3000 host.docker.internal:3000 pi.lan:3000"
-          [ -n "$GW" ] && hosts="$GW:3000 $hosts"
+          for h in 192.168.1.4:3000 host.docker.internal:3000; do
+            curl -s -m 6 -o /dev/null -w "  probe $h -> %{http_code}\n" "http://$h/api/v1/version" || echo "  probe $h -> 不可达"
+          done
           ok=0
-          for h in $hosts; do
+          for h in 192.168.1.4:3000 host.docker.internal:3000 pi.lan:3000; do
             u="http://x-access-token:${GH_TOKEN}@${h}/${GITHUB_REPOSITORY}.git"
             if git clone "$u" . 2>/dev/null; then echo "✔ cloned via $h"; ok=1; break; fi
             find . -mindepth 1 -delete 2>/dev/null || true
           done
-          [ "$ok" = 1 ] || { echo "::error::所有候选地址都无法 clone 本地 Gitea（试过: $hosts）"; exit 1; }
+          [ "$ok" = 1 ] || { echo "::error::所有候选地址都无法 clone 本地 Gitea"; exit 1; }
           git checkout -q "$GITHUB_SHA" || echo "WARN: checkout $GITHUB_SHA 失败，用默认 HEAD"
           echo "HEAD=$(git rev-parse --short HEAD)"
 
