@@ -1,0 +1,290 @@
+"""在某项目上跑 Claude 任务并回发；以及元命令 /reset /summarize /cancel /backfill /bind。"""
+import logging
+import os
+import re
+import time
+
+from nio import MatrixRoom, RoomMessageText
+
+from config import settings
+import state
+from state import _context, _sess_key, _last_project_by_room, _save_last_projects, _project_last_active
+from matrix_io import send, _typing, _is_dm, _LiveReply, _emit_files, _thread_root_of, _FILE_SEND_HINT
+from fmt import _format_context, _safe_name
+from addressing import _strip_reply_fallback
+from dispatch import _dispatch
+from projects import projects
+from claude_runner import runner, ClaudeCancelled
+import memory
+import pr_ledger
+import transcript
+
+log = logging.getLogger("matrix-claude.tasks")
+
+
+RESET_CMDS = {"/reset", "/new", "重置", "新对话", "清空"}
+
+
+
+HELP_CMDS = {"/help", "/?", "帮助", "用法"}
+
+
+
+SUMMARY_CMDS = {"/summarize", "/catchup", "总结", "回顾", "小结"}   # 也认 "/summarize N" 前缀
+
+
+
+CANCEL_CMDS = {"/cancel", "/stop", "停止", "取消", "停"}            # 也认 "/cancel"/"/stop" 前缀
+
+
+
+_HELP_TEXT = (
+    "**我能干嘛**\n"
+    "我是接到 Matrix 的 Claude Code 工程师：群里 @我 或私聊我就能派活——写代码、查问题、做方案，"
+    "改代码会自动开 PR 并跟到合并。群里没点名时，遇到求助或明显错误我也可能主动插一句。\n\n"
+    "**怎么用**\n"
+    "• 群里先绑仓库：发 Gitea 仓库地址，或 `/bind <仓库URL>`\n"
+    "• 然后 @我 派活；刚 @过我的几分钟内不必每句都 @（对话延续窗口）\n"
+    "• 私聊直接说，我自动判断是哪个项目\n"
+    "• 长任务我会边干边把进度更新到同一条消息；要文件我用附件发回来\n\n"
+    "**命令**（群里不必 @ 也认）\n"
+    "• `/help` 看这个\n"
+    "• `/bind <URL>` 绑定本群到仓库\n"
+    "• `/summarize [N]` 小结最近 N 条对话（catch me up）\n"
+    "• `/cancel` 停掉我正在跑的任务\n"
+    "• `/reset` 开启新对话（清空多轮上下文）\n"
+    "• `/backfill [天]` 回灌更早的聊天历史以便回溯"
+)
+
+
+
+_WELCOME = (
+    "👋 我是 Claude Code 工程师 bot。@我（群里）或直接私聊就能派活：写代码、查问题、做方案，"
+    "改代码会自动开 PR。群里先发个 Gitea 仓库地址或 `/bind <URL>` 绑定本群。发 `/help` 看完整用法。"
+)
+
+
+
+def _employee_prompt(info: dict) -> str:
+    """把 Claude Code 当成负责该仓库的远程工程师的工作流说明。"""
+    base, host = info["base"], info["host"]
+    owner, repo = info["owner"], info["repo"]
+    return (
+        f"你是团队的一名远程工程师，通过 Matrix 群接收任务，负责仓库 {owner}/{repo}"
+        f"（Gitea: {host}）。当前工作目录就是该仓库的本地 checkout。像真实员工一样把活干完：\n"
+        f"1) 先理解任务；信息不足就在回复里直接提问，不要瞎猜。\n"
+        f"2) 改代码时：先 git fetch，从 origin/{base} 建分支 claude/<简短任务名>，改完 git add/commit，"
+        f"push 到 origin（remote 已配好鉴权）。\n"
+        f"3) 然后用 Gitea API 开 PR（token 在环境变量 GITEA_TOKEN）：\n"
+        f"   curl -sS -X POST {host}/api/v1/repos/{owner}/{repo}/pulls "
+        f"-H \"Authorization: token $GITEA_TOKEN\" -H 'Content-Type: application/json' "
+        f"-d '{{\"head\":\"<你的分支>\",\"base\":\"{base}\",\"title\":\"<标题>\",\"body\":\"<说明>\"}}'\n"
+        f"   从返回 JSON 取 html_url，并在最终回复里**附上 PR 链接**。\n"
+        f"4) 纯问答/查代码/无需改动：直接简洁中文回答，不用建分支或开 PR。\n"
+        f"用简洁中文回复，内容会直接发到群里。"
+        + (_FILE_SEND_HINT if settings.send_files_back else "")
+    )
+
+
+
+async def do_bind(room: MatrixRoom, repo: dict,
+                  event: RoomMessageText | None = None, task_text: str = ""):
+    rid = room.room_id
+    try:
+        await send(rid, f"⏳ 正在绑定并 clone {repo['owner']}/{repo['repo']} …")
+        rec = await projects.bind_room(rid, repo)
+        runner.reset(_sess_key(rec, rid))  # 换仓库 → 重置本房间在该项目上的会话
+        await send(rid, f"✅ 已绑定 {rec['owner']}/{rec['repo']}（base: {rec['base']}）。直接在群里派活就行。")
+    except Exception as e:
+        log.exception("绑定失败")
+        await send(rid, f"绑定失败：{e}")
+        return
+    if task_text and event is not None:   # 绑定后若还跟了任务，接着派下去
+        await handle_task(room, event, task_text)
+
+
+
+async def _backfill_cmd(room: MatrixRoom, body: str):
+    """/backfill [天数]：从 Matrix 时间线回灌本房间在"开启记录前"的历史。"""
+    rid = room.room_id
+    if not settings.transcript_enabled:
+        await send(rid, "聊天历史记录未开启（在 .env 设 TRANSCRIPT_ENABLED=1 再重启）。")
+        return
+    parts = body.split()
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else settings.transcript_backfill_days
+    await send(rid, f"📚 正在从 Matrix 回灌最近 {days} 天的聊天历史…")
+    try:
+        n = await transcript.backfill(state.client, rid, days)
+        await send(rid, f"✅ 回灌完成，新增 {n} 条历史。之后问我“前天/上次聊了什么”就能回溯了。"
+                        if n else "✅ 没有可回灌的更早历史（可能已灌过、或服务器/加密取不到更早的）。")
+    except Exception as e:
+        log.exception("回灌失败")
+        await send(rid, f"回灌出错：{e}")
+
+
+
+async def _auto_backfill(room_id: str):
+    """开启记录后首次启动时，对还没灌过的房间静默回灌一次历史（不在房间里刷消息）。"""
+    try:
+        n = await transcript.backfill(state.client, room_id)
+        if n:
+            log.info("[%s] 历史回灌 %d 条", room_id, n)
+    except Exception:
+        log.exception("历史回灌失败 %s", room_id)
+
+
+
+async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, rec: dict,
+                          skip_body: str | None = None, thread_root: str | None = None):
+    """在某项目上跑任务并回发。"正在输入"由调用方 handle_task 的 _typing 统一负责。
+    skip_body：当前这条消息在背景上下文里的原文，用于从背景里剔除它免得重复喂。
+    媒体走的是 "[文件]…" 那行，和 event.body（文件名/caption）不一样，必须由调用方显式传。
+    thread_root：群里把答复挂进该线程；流式时占位消息也挂这里。"""
+    rid = room.room_id
+    sender = room.user_name(event.sender) or event.sender
+    cur_body = (skip_body if skip_body is not None
+                else _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {})))
+    ctx = _format_context(rid, skip=(sender, cur_body), drop_sender=state.MY_NAME or None)
+    if ctx:
+        prompt = (
+            "【所在会话最近的对话，仅供背景参考；带时间，可能跨较长时间，自行判断哪些与当前任务相关】\n"
+            f"{ctx}\n\n"
+            f"【当前要你处理的任务】来自 {sender}：{text}"
+        )
+    else:
+        prompt = f"[来自 {sender}] {text}"
+    log.info("[%s] 任务@%s: %s", rid, rec["id"], text[:80])
+    if rec.get("general"):   # 通用助手：每房间独立 scratch 子目录（互不串文件）、无 employee/Gitea 指引、不碰 git
+        sp = settings.claude_system_prompt + (_FILE_SEND_HINT if settings.send_files_back else "")
+        cwd = os.path.join(settings.claude_workdir, _safe_name(rid, "dm"))
+        lock_key, prepare = None, None   # lock_key=None → 用会话 key（按房间），各房间可并行
+    else:
+        # 会话 key 带房间维度（互不串台）；lock_key 用 proj_id（同一 checkout 串行）；
+        # 跑任务前先把工作树拉回干净 base，免得上个任务的脏树/残留分支污染这次。
+        sp, cwd, lock_key = _employee_prompt(rec), rec["path"], rec["id"]
+        sp = memory.augment_system_prompt(sp, rec["id"])   # 注入项目长期记忆（跨会话留存）
+        prepare = lambda: projects.prepare_worktree(rec)
+        _project_last_active[rec["id"]] = time.time()      # 标记活跃：自驱心跳会避让最近在弄的项目
+    sp = transcript.augment_system_prompt(sp, rid)   # 指给它本房间历史日志，便于回溯更早对话
+    sess = _sess_key(rec, rid)
+    if settings.stream_replies:                      # 流式：边生成边编辑同一条占位消息
+        live = _LiveReply(rid, thread_root=thread_root)
+        try:
+            answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
+                                      lock_key=lock_key, prepare=prepare,
+                                      on_delta=live.on_delta, cancel_key=rid)
+        except ClaudeCancelled:
+            await live.finalize("🛑 已停止。", track=False)
+            return
+        answer = await _emit_files(room, answer, cwd, thread_root)
+        await live.finalize(answer, track=True)
+    else:
+        try:
+            answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
+                                      lock_key=lock_key, prepare=prepare, cancel_key=rid)
+        except ClaudeCancelled:
+            await send(rid, "🛑 已停止。", thread_root=thread_root)
+            return
+        answer = await _emit_files(room, answer, cwd, thread_root)
+        await send(rid, answer, track=True, thread_root=thread_root)
+    log.info("[%s] 完成 %d 字", rid, len(answer))
+    if not rec.get("general"):   # 回复里若开了本项目的 PR，记进台账，由跟进循环盯到合并
+        pr = _extract_pr(answer, rec)
+        if pr and pr_ledger.record(rec["id"], pr[0], pr[1], rid):
+            log.info("[%s] PR #%d 进台账，开始跟进", rid, pr[0])
+
+
+
+def _extract_pr(answer: str, rec: dict) -> tuple[int, str] | None:
+    """从回复里抽出本项目刚开的 PR 编号 + 链接（匹配 <host>/<owner>/<repo>/pulls/<n>）。"""
+    prefix = f"{(rec.get('host') or '').rstrip('/')}/{rec['owner']}/{rec['repo']}/pulls/"
+    m = re.search(re.escape(prefix) + r"(\d+)", answer or "")
+    return (int(m.group(1)), prefix + m.group(1)) if m else None
+
+
+
+async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
+                      skip_body: str | None = None):
+    rid = room.room_id
+    # 群里把答复挂进"提问那条"的线程；私聊不挂线程（1:1 无需分流，挂了反而碍眼）。
+    thr = _thread_root_of(event) if (settings.reply_in_thread and not _is_dm(room)) else None
+    try:
+        if not text.strip():
+            return
+        if text.strip() in RESET_CMDS:
+            if not _is_dm(room):
+                rec = projects.get_room(rid)
+            else:  # 私聊没有房间绑定，按这个 DM 最近一次路由到的项目来重置
+                pid = _last_project_by_room.get(rid)
+                rec = projects.get_project(pid) if pid else None
+            if rec:
+                runner.reset(_sess_key(rec, rid))   # 只重置本房间的会话，不动别处共用同一 repo 的会话
+                _context[rid].clear()   # 连背景一起清，别让旧对话漏进新会话
+                await send(rid, "已开启新对话 ✅", thread_root=thr)
+            else:
+                await send(rid, "还没有可重置的会话；先发个仓库地址或派个活吧。", thread_root=thr)
+            return
+
+        # 分诊/clone + 跑任务整段都开着"正在输入"，避免 DM 首次路由时房间静默
+        async with _typing(rid):
+            rec = await _dispatch(room, event, text)
+            if rec is None:
+                return
+            if not rec.get("general"):   # 通用助手不是项目，别记成"上次项目"
+                _last_project_by_room[rid] = rec["id"]
+                _save_last_projects()   # 落盘：重启后 DM 的 /reset 与多轮延续仍能定位项目
+            await _run_on_project(room, event, text, rec, skip_body=skip_body, thread_root=thr)
+    except ClaudeCancelled:
+        try:
+            await send(rid, "🛑 已停止。", thread_root=thr)
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception("处理失败")
+        try:
+            await send(rid, f"出错了：{e}", thread_root=thr)
+        except Exception:
+            pass
+
+
+
+async def handle_summarize(room: MatrixRoom, event: RoomMessageText, body: str):
+    """/summarize [N]：把最近 N 条对话让 Claude 做个 catch-up 小结（优先读逐字记录，否则用内存背景）。"""
+    rid = room.room_id
+    parts = body.split()
+    n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else settings.summary_lines
+    recs = transcript.tail(rid, n) if settings.transcript_enabled else []
+    if not recs:   # 没开/没历史记录就退回内存背景缓冲
+        recs = [{"ts": ts, "sender": s, "body": b} for ts, s, b in list(_context[rid])[-n:]]
+    # 去掉刚发的这条 /summarize 命令本身
+    recs = [r for r in recs if (r.get("body") or "").strip() not in SUMMARY_CMDS
+            and not (r.get("body") or "").strip().lower().startswith("/summarize")]
+    if not recs:
+        await send(rid, "还没有可总结的对话。")
+        return
+    convo = "\n".join(
+        f"[{time.strftime('%m-%d %H:%M', time.localtime(r.get('ts', 0)))}] "
+        f"{r.get('sender', '?')}: {(r.get('body') or '').strip()[:500]}" for r in recs)
+    prompt = (
+        "下面是一个群聊最近的对话记录。请用简洁中文做一个 catch-up（追更）小结：\n"
+        "- 讨论了哪些主题、有什么结论或决定\n"
+        "- 还有哪些待办 / 未决问题、各自在等谁\n"
+        "- 若提到具体任务或 bug，点出来\n"
+        "控制在十几行内、分点写，别逐条复述。\n\n对话：\n" + convo)
+    async with _typing(rid):
+        try:
+            ans = (await runner.quick(prompt)).strip()
+        except Exception as e:
+            log.exception("总结失败")
+            await send(rid, f"总结失败：{e}")
+            return
+    await send(rid, "📋 最近对话小结：\n" + ans)
+
+
+
+async def handle_cancel(room: MatrixRoom):
+    """/cancel：停掉本房间正在跑的任务。"""
+    rid = room.room_id
+    n = runner.cancel(rid)
+    await send(rid, "🛑 已停止当前任务。" if n else "现在没有正在运行的任务。")
+

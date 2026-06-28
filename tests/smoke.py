@@ -17,6 +17,8 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bot                                  # noqa: E402
+import state                                # noqa: E402
+import dispatch, proactive, tasks, heartbeat, media  # noqa: E402,E401
 import claude_runner                        # noqa: E402
 import projects                             # noqa: E402
 from config import settings, redact         # noqa: E402
@@ -62,7 +64,7 @@ def make_media_event(body="app.log", filename=None, mxc="mxc://ex.org/abc",
 
 
 def set_identity():
-    bot.MY_ID, bot.MY_NAME, bot.MY_LOCAL = "@claudebot:ex.org", "claude-bot", "claudebot"
+    state.MY_ID, state.MY_NAME, state.MY_LOCAL = "@claudebot:ex.org", "claude-bot", "claudebot"
 
 
 # ---------- 1) 启动 + 一条群任务的完整链路 ----------
@@ -141,7 +143,7 @@ def test_startup_and_task_flow():
         settings.pr_followup_enabled = orig_pf
         settings.proactive_heartbeat_enabled = orig_hb
 
-    assert bot.MY_ID == "@claudebot:ex.org" and bot.MY_NAME == "claude-bot"
+    assert state.MY_ID == "@claudebot:ex.org" and state.MY_NAME == "claude-bot"
     assert captured["key"] == "gitea.example.com/team/app|!g:ex.org"    # 会话按项目+房间（不串台）
     assert captured["lock_key"] == "gitea.example.com/team/app"         # checkout 仍按项目串行
     assert sent and "PR" in sent[0][1]                                  # 答复发回房间
@@ -193,7 +195,7 @@ def test_track_and_monotonic():
             sent.append(content["body"])
             return types.SimpleNamespace(event_id="$e%d" % len(sent))
 
-    bot.client = FC()
+    state.client = FC()
     rid = "!r:ex.org"
     bot._context[rid].clear()
     bot._context[rid].append((time.time() + 5, "Alice", "更晚的消息"))  # 制造钟差
@@ -211,18 +213,18 @@ def test_track_and_monotonic():
 # ---------- 5) 自己账号：手打入上下文但不派活 ----------
 def test_own_account_context():
     set_identity()
-    bot._synced = True                                        # 初始 sync 之后才处理消息
+    state._synced = True                                        # 初始 sync 之后才处理消息
     room = FakeRoom("!g:ex.org", 3)
     bot._context[room.room_id].clear()
-    orig_trigger, orig_spawn = settings.trigger_phrase, bot._spawn
+    orig_trigger, orig_spawn = settings.trigger_phrase, state._spawn
     settings.trigger_phrase = ""
     spawned = []
-    bot._spawn = lambda coro: (spawned.append(1), coro.close())
+    state._spawn = lambda coro: (spawned.append(1), coro.close())
     try:
         asyncio.run(bot.on_message(
             room, make_event("自言自语", sender="@claudebot:ex.org", event_id="$mine")))
     finally:
-        bot._spawn, settings.trigger_phrase = orig_spawn, orig_trigger
+        state._spawn, settings.trigger_phrase = orig_spawn, orig_trigger
     assert len(bot._context[room.room_id]) == 1               # 进了上下文
     assert not spawned                                        # 没派活
 
@@ -291,8 +293,8 @@ def test_no_access_control_invite_joins():
         async def join(self, rid):
             joined.append(rid)
 
-    orig_client = bot.client
-    bot.client = FC()
+    orig_client = state.client
+    state.client = FC()
     try:
         mk_inv = lambda s, m="invite": types.SimpleNamespace(
             state_key="@claudebot:ex.org", membership=m, sender=s)
@@ -303,7 +305,7 @@ def test_no_access_control_invite_joins():
         asyncio.run(bot.on_invite(room, mk_inv("@x:ex.org", "join")))  # 非 invite 成员事件不触发
         assert len(joined) == 2
     finally:
-        bot.client = orig_client
+        state.client = orig_client
 
 
 # ---------- 8b) 群"对话延续窗口"：点过名后免重复 @ 也算续话 ----------
@@ -363,7 +365,7 @@ def test_reset_clears_context():
     bot._context[rid].append((time.time(), "Alice", "上一轮的旧话题"))   # 预置背景
 
     rec = {"id": "p1", "owner": "o", "repo": "r", "path": "/tmp", "base": "main"}
-    orig_get_room, orig_reset, orig_client = bot.projects.get_room, bot.runner.reset, bot.client
+    orig_get_room, orig_reset, orig_client = bot.projects.get_room, bot.runner.reset, state.client
 
     class FC:
         async def room_send(self, r, mt, content, **k):
@@ -371,11 +373,11 @@ def test_reset_clears_context():
 
     bot.projects.get_room = lambda r: rec
     bot.runner.reset = lambda k: None
-    bot.client = FC()
+    state.client = FC()
     try:
         asyncio.run(bot.handle_task(room, make_event("/reset"), "/reset"))
     finally:
-        bot.projects.get_room, bot.runner.reset, bot.client = orig_get_room, orig_reset, orig_client
+        bot.projects.get_room, bot.runner.reset, state.client = orig_get_room, orig_reset, orig_client
     assert len(bot._context[rid]) == 0                        # 背景被清空，不会漏进新会话
 
 
@@ -436,16 +438,16 @@ def test_bind_carries_trailing_task():
         async def room_send(self, *a, **k):
             return types.SimpleNamespace(event_id="$x")
 
-    orig = (bot.projects.bind_room, bot.runner.reset, bot.handle_task, bot.client)
+    orig = (bot.projects.bind_room, bot.runner.reset, tasks.handle_task, state.client)
     bot.projects.bind_room = fake_bind_room
     bot.runner.reset = lambda k: None
-    bot.handle_task = fake_handle_task
-    bot.client = FC()
+    tasks.handle_task = fake_handle_task
+    state.client = FC()
     try:
         ev = make_event("/bind https://gitea.example.com/o/r 修复登录刷新")
         asyncio.run(bot.do_bind(room, repo, ev, "修复登录刷新"))
     finally:
-        (bot.projects.bind_room, bot.runner.reset, bot.handle_task, bot.client) = orig
+        (bot.projects.bind_room, bot.runner.reset, tasks.handle_task, state.client) = orig
     assert ran.get("text") == "修复登录刷新"                  # 绑定后任务被派下去，没被吞掉
 
 
@@ -510,14 +512,14 @@ def test_send_failure_logged():
     records = []
     h = logging.Handler()
     h.emit = lambda r: records.append(r.getMessage())
-    orig_client = bot.client
-    bot.client = FC()
+    orig_client = state.client
+    state.client = FC()
     bot.log.addHandler(h)
     try:
         asyncio.run(bot.send(rid, "答复内容", track=True))
     finally:
         bot.log.removeHandler(h)
-        bot.client = orig_client
+        state.client = orig_client
     assert any("失败" in m for m in records)                       # 失败留了日志
     assert "答复内容" not in [b for _, _, b in bot._context[rid]]  # 没发出去就不进上下文
 
@@ -547,15 +549,15 @@ def test_detect_base_prefers_existing_branch():
 # ---------- 17) 群里"纯仓库链接"才自动绑定，链接+闲聊不绑 ----------
 def test_just_url_autobind_only_for_bare_url():
     set_identity()
-    bot._synced = True
+    state._synced = True
     room = FakeRoom("!g:ex.org", 3)          # 群、未绑定
     orig_host = settings.gitea_host
-    orig = (bot.projects.get_room, bot.do_bind, bot._spawn)
+    orig = (bot.projects.get_room, bot.do_bind, state._spawn)
     settings.gitea_host = "https://gitea.example.com"
     bot.projects.get_room = lambda rid: None
     bound = []
     bot.do_bind = lambda *a, **k: bound.append(1)
-    bot._spawn = lambda coro: coro.close() if hasattr(coro, "close") else None
+    state._spawn = lambda coro: coro.close() if hasattr(coro, "close") else None
     try:
         bot._context[room.room_id].clear()
         asyncio.run(bot.on_message(room, make_event("https://gitea.example.com/o/r")))
@@ -565,7 +567,7 @@ def test_just_url_autobind_only_for_bare_url():
         n_with_task = len(bound) - n_bare
     finally:
         settings.gitea_host = orig_host
-        (bot.projects.get_room, bot.do_bind, bot._spawn) = orig
+        (bot.projects.get_room, bot.do_bind, state._spawn) = orig
     assert n_bare == 1                        # 纯链接 → 自动绑定
     assert n_with_task == 0                   # 链接+闲聊 → 不自动绑定
 
@@ -599,12 +601,12 @@ def test_media_download_and_dispatch():
     import tempfile
     import glob
     set_identity()
-    bot._synced = True
+    state._synced = True
     rid = "!md:ex.org"
     room = FakeRoom(rid, 2)                       # 2 人 → DM → 必回
     bot._context[rid].clear()
     tmp = tempfile.mkdtemp()
-    orig = (settings.media_root, settings.media_enabled, bot.client, bot.handle_task)
+    orig = (settings.media_root, settings.media_enabled, state.client, media.handle_task)
     settings.media_root, settings.media_enabled = tmp, True
     captured = {}
 
@@ -617,15 +619,15 @@ def test_media_download_and_dispatch():
                 f.write(b"hello-log-bytes")
             return types.SimpleNamespace(content_type="text/plain", filename="app.log")
 
-    bot.client = FC()
-    bot.handle_task = fake_handle
+    state.client = FC()
+    media.handle_task = fake_handle
     try:
         async def go():
             await bot._process_media(room, make_media_event(body="app.log", event_id="$md1"), False)
             await _drain_tasks()
         asyncio.run(go())
     finally:
-        (settings.media_root, settings.media_enabled, bot.client, bot.handle_task) = orig
+        (settings.media_root, settings.media_enabled, state.client, media.handle_task) = orig
 
     files = glob.glob(os.path.join(tmp, "*", "*"))
     assert files, "媒体没落盘"
@@ -639,11 +641,11 @@ def test_media_download_and_dispatch():
 def test_media_oversize_skipped():
     import tempfile
     set_identity()
-    bot._synced = True
+    state._synced = True
     rid = "!mo:ex.org"
     room = FakeRoom(rid, 2)
     bot._context[rid].clear()
-    orig = (settings.media_root, settings.media_max_mb, bot.client, bot.handle_task)
+    orig = (settings.media_root, settings.media_max_mb, state.client, media.handle_task)
     settings.media_root, settings.media_max_mb = tempfile.mkdtemp(), 1
     called = {"dl": 0}
 
@@ -655,7 +657,7 @@ def test_media_oversize_skipped():
     async def fake_handle(rm, ev, text):
         pass
 
-    bot.client, bot.handle_task = FC(), fake_handle
+    state.client, media.handle_task = FC(), fake_handle
     try:
         async def go():
             await bot._process_media(
@@ -663,7 +665,7 @@ def test_media_oversize_skipped():
             await _drain_tasks()
         asyncio.run(go())
     finally:
-        (settings.media_root, settings.media_max_mb, bot.client, bot.handle_task) = orig
+        (settings.media_root, settings.media_max_mb, state.client, media.handle_task) = orig
     assert called["dl"] == 0                                       # 超限不下载
     assert any("超过上限" in b for _, _, b in bot._context[rid])   # 上下文有标注
 
@@ -714,16 +716,16 @@ def test_dm_routing_ensures_checkout():
             return "h/o/app"
 
     orig = (bot.projects.list_projects, bot.projects.ensure_project,
-            bot.projects.get_project, bot.runner)
+            bot.projects.get_project, dispatch.runner)
     bot.projects.list_projects = lambda: [app]
     bot.projects.ensure_project = fake_ensure
     bot.projects.get_project = lambda pid: app if pid == "h/o/app" else None
-    bot.runner = R()
+    dispatch.runner = R()
     try:
         out = asyncio.run(bot._dispatch(room, make_event("帮我看看那个东西"), "帮我看看那个东西"))
     finally:
         (bot.projects.list_projects, bot.projects.ensure_project,
-         bot.projects.get_project, bot.runner) = orig
+         bot.projects.get_project, dispatch.runner) = orig
     assert out is app
     assert ensured == [app]              # 分诊路由也过了 ensure（丢了的 checkout 会被重 clone）
 
@@ -744,14 +746,14 @@ def test_dm_loose_name_after_triage():
         order.append("triage")
         return None
 
-    orig = (bot.projects.list_projects, bot.projects.ensure_project, bot._triage)
+    orig = (bot.projects.list_projects, bot.projects.ensure_project, dispatch._triage)
     bot.projects.list_projects = lambda: [app]
     bot.projects.ensure_project = fake_ensure
-    bot._triage = triage_none
+    dispatch._triage = triage_none
     try:
         out = asyncio.run(bot._dispatch(room, make_event("那个 app 跑不起来了"), "那个 app 跑不起来了"))
     finally:
-        (bot.projects.list_projects, bot.projects.ensure_project, bot._triage) = orig
+        (bot.projects.list_projects, bot.projects.ensure_project, dispatch._triage) = orig
     assert out is app                     # 裸仓库名兜底命中
     assert order == ["triage", "ensure"]  # 先分诊、放弃后才用裸名兜底
 
@@ -763,7 +765,7 @@ def test_proactive_pass_keeps_short_cooldown():
     room = FakeRoom(rid, 3)
     bot._context[rid].clear()
     bot._last_proactive[rid] = 0.0
-    orig = (bot.runner, bot.client, settings.proactive_cooldown)
+    orig = (proactive.runner, state.client, settings.proactive_cooldown)
     settings.proactive_cooldown = 600
 
     class R:
@@ -774,11 +776,11 @@ def test_proactive_pass_keeps_short_cooldown():
         async def room_send(self, *a, **k):
             return types.SimpleNamespace(event_id="$x")
 
-    bot.runner, bot.client = R(), FC()
+    proactive.runner, state.client = R(), FC()
     try:
         asyncio.run(bot.maybe_proactive(room, make_event("报错了帮我看看"), "报错了帮我看看"))
     finally:
-        (bot.runner, bot.client, settings.proactive_cooldown) = orig
+        (proactive.runner, state.client, settings.proactive_cooldown) = orig
     remaining = 600 - (time.time() - bot._last_proactive[rid])
     assert 0 < remaining <= bot._PROACTIVE_PASS_COOLDOWN + 2, remaining   # PASS 后很快能重判
 
@@ -803,10 +805,10 @@ def test_proactive_require_hint_toggle():
         async def room_send(self, r, mt, content, **k):
             return types.SimpleNamespace(event_id="$x")
 
-    orig = (bot.runner, bot.client, bot.projects.get_room,
+    orig = (proactive.runner, state.client, bot.projects.get_room,
             settings.proactive_require_hint, settings.proactive_cooldown,
             settings.transcript_enabled)
-    bot.runner, bot.client = R(), FC()
+    proactive.runner, state.client = R(), FC()
     bot.projects.get_room = lambda r: None     # 未绑库 → 走 quick 文本判断
     settings.proactive_cooldown = 600
     settings.transcript_enabled = False        # 别在测试里写 store/transcripts
@@ -821,7 +823,7 @@ def test_proactive_require_hint_toggle():
         asyncio.run(bot.maybe_proactive(room, make_event(msg), msg))
         assert len(calls) == 1, "require_hint=False 时应评估并纠正"
     finally:
-        (bot.runner, bot.client, bot.projects.get_room,
+        (proactive.runner, state.client, bot.projects.get_room,
          settings.proactive_require_hint, settings.proactive_cooldown,
          settings.transcript_enabled) = orig
 
@@ -829,13 +831,13 @@ def test_proactive_require_hint_toggle():
 # ---------- 26) 已绑定群里再发裸 URL：给换绑提示而非静默无反应 ----------
 def test_group_rebind_hint():
     set_identity()
-    bot._synced = True
+    state._synced = True
     rid = "!gb:ex.org"
     room = FakeRoom(rid, 3)
     bot._context[rid].clear()
     bound = {"id": "gitea.example.com/o/old", "owner": "o", "repo": "old"}
     msgs, pending = [], []
-    orig = (settings.gitea_host, bot.projects.get_room, bot.client, bot._spawn)
+    orig = (settings.gitea_host, bot.projects.get_room, state.client, state._spawn)
     settings.gitea_host = "https://gitea.example.com"
     bot.projects.get_room = lambda r: bound
 
@@ -844,8 +846,8 @@ def test_group_rebind_hint():
             msgs.append(content["body"])
             return types.SimpleNamespace(event_id="$x")
 
-    bot.client = FC()
-    bot._spawn = lambda coro: pending.append(coro)
+    state.client = FC()
+    state._spawn = lambda coro: pending.append(coro)
     try:
         async def go():
             await bot.on_message(room, make_event("https://gitea.example.com/o/new"))
@@ -853,7 +855,7 @@ def test_group_rebind_hint():
                 await c
         asyncio.run(go())
     finally:
-        (settings.gitea_host, bot.projects.get_room, bot.client, bot._spawn) = orig
+        (settings.gitea_host, bot.projects.get_room, state.client, state._spawn) = orig
     assert any("换绑" in m for m in msgs)        # 裸 URL 撞上已绑仓库 → 提示换绑
 
 
@@ -884,17 +886,17 @@ def test_dm_last_project_fallback():
         return None
 
     orig = (bot.projects.list_projects, bot.projects.ensure_project,
-            bot.projects.get_project, bot._triage)
+            bot.projects.get_project, dispatch._triage)
     bot.projects.list_projects = lambda: [appA]
     bot.projects.ensure_project = fake_ensure
     bot.projects.get_project = lambda pid: appA if pid == "h/o/appA" else None
-    bot._triage = triage_none
+    dispatch._triage = triage_none
     bot._last_project_by_room[rid] = "h/o/appA"           # 上一轮已路由到 appA
     try:                                                  # 延续消息没提任何项目名/链接
         out = asyncio.run(bot._dispatch(room, make_event("再补个单元测试吧"), "再补个单元测试吧"))
     finally:
         (bot.projects.list_projects, bot.projects.ensure_project,
-         bot.projects.get_project, bot._triage) = orig
+         bot.projects.get_project, dispatch._triage) = orig
         bot._last_project_by_room.pop(rid, None)
     assert out is appA and ensured == [appA]              # 沿用上次项目而不是反问
 
@@ -902,11 +904,11 @@ def test_dm_last_project_fallback():
 # ---------- 29) 群里"@bot 仓库URL 任务"一条消息：先绑再派，不再答非所问 ----------
 def test_group_url_with_task_binds():
     set_identity()
-    bot._synced = True
+    state._synced = True
     rid = "!gbind:ex.org"
     room = FakeRoom(rid, 3)                               # 群、未绑定
     orig_host = settings.gitea_host
-    orig = (bot.projects.get_room, bot.do_bind, bot._spawn)
+    orig = (bot.projects.get_room, bot.do_bind, state._spawn)
     settings.gitea_host = "https://gitea.example.com"
     bot.projects.get_room = lambda r: None
     captured = {}
@@ -916,7 +918,7 @@ def test_group_url_with_task_binds():
 
     bot.do_bind = fake_do_bind
     pend = []
-    bot._spawn = lambda coro: pend.append(coro)
+    state._spawn = lambda coro: pend.append(coro)
     try:
         async def go():
             await bot.on_message(room, make_event(
@@ -927,7 +929,7 @@ def test_group_url_with_task_binds():
         asyncio.run(go())
     finally:
         settings.gitea_host = orig_host
-        (bot.projects.get_room, bot.do_bind, bot._spawn) = orig
+        (bot.projects.get_room, bot.do_bind, state._spawn) = orig
         bot._context[rid].clear()
     assert captured.get("repo", {}).get("repo") == "app"  # 同条消息里的 URL 被识别并绑定
     assert captured.get("task") == "帮我修登录刷新"        # @bot 与 URL 都剥掉，只剩任务正文
@@ -975,12 +977,12 @@ def test_send_retries_on_rate_limit():
                     status_code="M_LIMIT_EXCEEDED", retry_after_ms=10, message="rate")
             return types.SimpleNamespace(event_id="$ok")
 
-    orig = bot.client
-    bot.client = FC()
+    orig = state.client
+    state.client = FC()
     try:
         asyncio.run(bot.send(rid, "答复", track=True))
     finally:
-        bot.client = orig
+        state.client = orig
     assert calls["n"] == 2                                # 重试后发出
     assert "答复" in [b for _, _, b in bot._context[rid]]  # 最终成功 → 入上下文
     bot._context[rid].clear()
@@ -1018,13 +1020,13 @@ def test_run_on_project_skips_media_line():
             return types.SimpleNamespace(event_id="$x")
 
     rec = {"id": "p", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
-    orig = (bot.runner, bot.client)
-    bot.runner, bot.client = R(), FC()
+    orig = (tasks.runner, state.client)
+    tasks.runner, state.client = R(), FC()
     try:
         ev = make_media_event(body="a.log", event_id="$mm")
         asyncio.run(bot._run_on_project(room, ev, "看看这个文件 /m/a.log", rec, skip_body=line))
     finally:
-        (bot.runner, bot.client) = orig
+        (tasks.runner, state.client) = orig
         bot._context[rid].clear()
     assert "[文件] a.log" not in captured["prompt"]        # 媒体行不再重复出现在 prompt
     assert "之前聊的别的事" in captured["prompt"]           # 其它背景仍照常带上
@@ -1034,12 +1036,12 @@ def test_run_on_project_skips_media_line():
 def test_media_oversize_undeclared_streamed():
     import tempfile
     set_identity()
-    bot._synced = True
+    state._synced = True
     rid = "!mbig:ex.org"
     room = FakeRoom(rid, 2)
     bot._context[rid].clear()
     orig = (settings.media_root, settings.media_max_mb, settings.media_enabled,
-            bot.client, bot.handle_task)
+            state.client, media.handle_task)
     settings.media_root = tempfile.mkdtemp()
     settings.media_max_mb, settings.media_enabled = 1, True
 
@@ -1052,7 +1054,7 @@ def test_media_oversize_undeclared_streamed():
     async def fake_handle(rm, ev, text, skip_body=None):
         pass
 
-    bot.client, bot.handle_task = FC(), fake_handle
+    state.client, media.handle_task = FC(), fake_handle
     try:
         async def go():
             await bot._process_media(room, make_media_event(body="big.bin", event_id="$ub"), False)
@@ -1060,7 +1062,7 @@ def test_media_oversize_undeclared_streamed():
         asyncio.run(go())
     finally:
         (settings.media_root, settings.media_max_mb, settings.media_enabled,
-         bot.client, bot.handle_task) = orig
+         state.client, bot.handle_task) = orig
     assert any("超过上限" in b for _, _, b in bot._context[rid])
     bot._context[rid].clear()
 
@@ -1193,14 +1195,14 @@ def test_dm_general_question():
             asked.append(content["body"])
             return types.SimpleNamespace(event_id="$x")
 
-    orig = (bot.projects.list_projects, bot._triage, bot.client)
+    orig = (bot.projects.list_projects, dispatch._triage, state.client)
     bot.projects.list_projects = lambda: [app]
-    bot._triage = triage_general
-    bot.client = FC()
+    dispatch._triage = triage_general
+    state.client = FC()
     try:
         out = asyncio.run(bot._dispatch(room, make_event("用 Python 写个快排"), "用 Python 写个快排"))
     finally:
-        (bot.projects.list_projects, bot._triage, bot.client) = orig
+        (bot.projects.list_projects, dispatch._triage, state.client) = orig
     assert out is not None and out.get("general") is True   # 返回通用助手 rec
     assert out["path"] == settings.claude_workdir            # 在隔离 scratch 目录答
     assert not any("哪个项目" in m for m in asked)           # 没有反问
@@ -1293,26 +1295,26 @@ def test_heartbeat_propose_and_autopilot():
         async def room_send(self, r, mt, content, **k):
             sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
 
-    orig = (bot.runner, bot.client, bot._spawn, settings.proactive_autopilot)
-    bot.client = FC()
-    bot._spawn = lambda coro: (spawned.append(1), coro.close())
+    orig = (heartbeat.runner, state.client, state._spawn, settings.proactive_autopilot)
+    state.client = FC()
+    state._spawn = lambda coro: (spawned.append(1), coro.close())
     try:
-        bot.runner = R("__PASS__")                       # 没值得做的 → 不发言、不派活
+        heartbeat.runner = R("__PASS__")                       # 没值得做的 → 不发言、不派活
         settings.proactive_autopilot = False
         asyncio.run(bot._heartbeat_one(rec, "!room"))
         assert not sent and not spawned
 
-        bot.runner = R("建议：给 X 补个单元测试")          # 有建议 + autopilot 关 → 只提议
+        heartbeat.runner = R("建议：给 X 补个单元测试")          # 有建议 + autopilot 关 → 只提议
         asyncio.run(bot._heartbeat_one(rec, "!room"))
         assert any("巡检建议" in m for m in sent) and not spawned
 
         sent.clear()
-        bot.runner = R("建议：给 X 补个单元测试")          # 有建议 + autopilot 开 → 宣布开干并派执行
+        heartbeat.runner = R("建议：给 X 补个单元测试")          # 有建议 + autopilot 开 → 宣布开干并派执行
         settings.proactive_autopilot = True
         asyncio.run(bot._heartbeat_one(rec, "!room"))
         assert spawned and any("自驱" in m for m in sent)
     finally:
-        (bot.runner, bot.client, bot._spawn, settings.proactive_autopilot) = orig
+        (heartbeat.runner, state.client, state._spawn, settings.proactive_autopilot) = orig
 
 
 # ---------- PR 台账：登记/去重/更新/销账 + 持久化 ----------
@@ -1364,11 +1366,11 @@ def test_pr_followup_actions():
         async def room_send(self, r, mt, content, **k):
             sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
 
-    orig = (bot.projects.get_project, bot.client, bot._spawn,
+    orig = (bot.projects.get_project, state.client, state._spawn,
             gitea.pr_info, gitea.pr_reviews, gitea.ci_state)
     bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
-    bot.client = FC()
-    bot._spawn = lambda coro: (spawned.append(1), coro.close())
+    state.client = FC()
+    state._spawn = lambda coro: (spawned.append(1), coro.close())
     try:
         # a) 已合并 → 销账 + 报"已合并"
         pr_ledger.record("h/o/r", 1, "u1", "!room")
@@ -1390,7 +1392,7 @@ def test_pr_followup_actions():
         e2 = [e for e in pr_ledger.active() if e["number"] == 2][0]
         assert e2["seen_review"] == 10 and e2["review_fixes"] == 1 and e2["branch"] == "claude/x"
     finally:
-        (bot.projects.get_project, bot.client, bot._spawn,
+        (bot.projects.get_project, state.client, state._spawn,
          gitea.pr_info, gitea.pr_reviews, gitea.ci_state) = orig
         settings.store_path = orig_store
         _reset_ledger()
@@ -1455,11 +1457,11 @@ def test_pr_automerge():
         async def room_send(self, r, mt, content, **k):
             sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
 
-    orig = (bot.projects.get_project, bot.client, bot._spawn,
+    orig = (bot.projects.get_project, state.client, state._spawn,
             gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge)
     bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
-    bot.client = FC()
-    bot._spawn = lambda coro: coro.close()
+    state.client = FC()
+    state._spawn = lambda coro: coro.close()
 
     async def open_mergeable(r, n):
         return {"state": "open", "merged": False, "mergeable": True,
@@ -1498,7 +1500,7 @@ def test_pr_automerge():
         asyncio.run(bot._followup_one([e for e in pr_ledger.active() if e["number"] == 3][0]))
         assert merged == [] and any(e["number"] == 3 for e in pr_ledger.active())
     finally:
-        (bot.projects.get_project, bot.client, bot._spawn,
+        (bot.projects.get_project, state.client, state._spawn,
          gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge) = orig
         settings.pr_automerge, settings.pr_merge_method = orig_am
         settings.store_path = orig_store
@@ -1552,7 +1554,7 @@ def test_thread_helpers_and_send():
     assert rel["m.in_reply_to"]["event_id"] == "$prev" and rel["is_falling_back"] is True
     assert bot._thread_rel(None) is None
 
-    c = _CapClient(); bot.client = c
+    c = _CapClient(); state.client = c
     asyncio.run(bot.send("!r:ex.org", "答复", thread_root="$root"))
     assert c.sent[0]["m.relates_to"]["rel_type"] == "m.thread"                      # 传了 root → 挂线程
     assert c.sent[0]["m.relates_to"]["event_id"] == "$root"
@@ -1563,7 +1565,7 @@ def test_thread_helpers_and_send():
 
 def test_group_task_reply_threaded():
     set_identity()
-    c = _CapClient(); bot.client = c
+    c = _CapClient(); state.client = c
     rec = {"id": "h/o/r", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
     bot.projects.get_room = lambda rid: rec
     async def fake_ensure(info):
@@ -1587,20 +1589,20 @@ def test_group_task_reply_threaded():
 
 # ---------- 新增能力 2) /help + 进房欢迎 ----------
 def test_help_and_welcome():
-    set_identity(); bot._synced = True
-    c = _CapClient(); bot.client = c
+    set_identity(); state._synced = True
+    c = _CapClient(); state.client = c
     _drain_and_run(bot.on_message(FakeRoom("!h:ex.org", 3), make_event("/help", event_id="$h")))
     assert any("我能干嘛" in (m.get("body") or "") for m in c.sent)
     c.sent.clear()
-    inv = types.SimpleNamespace(state_key=bot.MY_ID, membership="invite", sender="@x:ex.org")
+    inv = types.SimpleNamespace(state_key=state.MY_ID, membership="invite", sender="@x:ex.org")
     asyncio.run(bot.on_invite(FakeRoom("!inv:ex.org", 2), inv))
     assert any("/help" in (m.get("body") or "") for m in c.sent)                   # 进房打招呼指到 /help
 
 
 # ---------- 新增能力 3) /summarize ----------
 def test_summarize_command():
-    set_identity(); bot._synced = True
-    c = _CapClient(); bot.client = c
+    set_identity(); state._synced = True
+    c = _CapClient(); state.client = c
     cap = {}
     async def fake_quick(prompt):
         cap["p"] = prompt
@@ -1620,8 +1622,8 @@ def test_summarize_command():
 
 # ---------- 新增能力 4) /cancel ----------
 def test_cancel_command():
-    set_identity(); bot._synced = True
-    c = _CapClient(); bot.client = c
+    set_identity(); state._synced = True
+    c = _CapClient(); state.client = c
     calls = []
     bot.runner.cancel = lambda rid: (calls.append(rid) or 1)
     _drain_and_run(bot.on_message(FakeRoom("!c:ex.org", 3), make_event("/cancel", event_id="$cx")))
@@ -1640,7 +1642,7 @@ def test_emit_files_allowed_blocked_stripped():
     fp = os.path.join(d, "chart.png")
     with open(fp, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n")
-    c = _CapClient(); bot.client = c
+    c = _CapClient(); state.client = c
     room = FakeRoom("!f:ex.org", 2)
     orig = settings.send_files_back; settings.send_files_back = True
     try:
@@ -1659,7 +1661,7 @@ def test_emit_files_allowed_blocked_stripped():
 # ---------- 新增能力 6) 流式：占位→编辑→定稿 ----------
 def test_live_reply_streams_and_finalizes():
     set_identity()
-    c = _CapClient(); bot.client = c
+    c = _CapClient(); state.client = c
     live = bot._LiveReply("!lr:ex.org", thread_root="$root")
     async def go():
         await live.on_delta("正在看代码", None)        # 建占位（带线程）

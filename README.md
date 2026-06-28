@@ -120,8 +120,21 @@ journalctl --user -u matrix-claude -f
 
 ## 文件
 
-- `bot.py` — Matrix 客户端：登录/持久化、监听消息、触发判断、调 Claude、回发；PR 跟进与自驱心跳两个后台循环
-- `claude_runner.py` — 调 `claude -p`：`ask()` 带工具干活+多轮会话，`quick()` 一次性判断，`consult()` 只读查证
+按职责分模块（`bot.py` 原是单体，已拆开）。依赖方向单向无环：
+`state → fmt → matrix_io → addressing → dispatch → tasks → {pr_followup, heartbeat, proactive, media} → bot`。
+
+- `bot.py` — 入口：登录/持久化、注册事件回调（`on_message`/`on_invite`/`on_media`）、`main` 起两个后台循环。只做编排
+- `state.py` — 进程级共享运行态：Matrix client、本机身份、各房间上下文/历史缓冲、路由记忆、`_spawn`/会话 key
+- `fmt.py` — 纯文本/富文本/上下文格式化（分块、代码围栏自洽、markdown→消毒 HTML、背景渲染），无 Matrix 调用
+- `matrix_io.py` — 收发：分块发送、线程化(m.thread)、流式占位与编辑(m.replace)、正在输入、附件上传(`_LiveReply`/`send`/`_emit_files`)
+- `addressing.py` — 该不该应答：点名 / 回复 bot / 触发词 / 续话窗口 / 剥引用块与自我 @
+- `dispatch.py` — 把消息归到哪个项目：群按绑定、DM 按内容分诊（强信号 + 轻量 LLM + 兜底）
+- `tasks.py` — 在项目上跑任务并回发（流式/附件/线程）+ 元命令 `/reset` `/summarize` `/cancel` `/backfill` `/bind`
+- `pr_followup.py` — PR 台账跟进循环：处理评审/CI、满足条件自动合并、回报原房间
+- `heartbeat.py` — 自驱心跳循环：没人派活时巡检找事，autopilot 自己开 PR
+- `proactive.py` — 主动插话：不被 @ 也判断该不该就群消息开口（求助 / 有错可纠正）
+- `media.py` — 图片/文件/音视频：下载（加密房解密）落盘、并入上下文、被点名时交给 Claude 读取
+- `claude_runner.py` — 调 `claude -p`：`ask()` 带工具干活+多轮会话（支持 `on_delta` 流式 + `cancel`），`quick()` 一次性判断，`consult()` 只读查证
 - `memory.py` — 项目长期记忆：跨会话/跨重启留存的事实库，开新会话时注入系统提示
 - `transcript.py` — 按房间的聊天逐字记录：落盘 + 回溯更早对话 + 从 Matrix 回灌历史
 - `pr_ledger.py` — PR 台账：bot 开过的 PR 记账，跟到合并/关闭才销账（持久化到 `store/pr_ledger.json`）
