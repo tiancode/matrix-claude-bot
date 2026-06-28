@@ -55,6 +55,7 @@ _context: dict[str, deque] = defaultdict(lambda: deque(maxlen=max(4, settings.co
 _last_proactive: dict[str, float] = defaultdict(float)
 _sent_events: deque = deque(maxlen=4096)        # 自己发出的 event_id：防自激 + 识别"回复了 bot"（重启清空）
 _last_project_by_room: dict[str, str] = {}      # room_id -> proj_id，供 DM /reset 定位会话
+_project_last_active: dict[str, float] = defaultdict(float)   # proj_id -> 上次有人派活的时刻，自驱心跳据此避让
 
 client: AsyncClient | None = None
 MY_ID = ""
@@ -657,6 +658,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         sp, cwd, lock_key = _employee_prompt(rec), rec["path"], rec["id"]
         sp = memory.augment_system_prompt(sp, rec["id"])   # 注入项目长期记忆（跨会话留存）
         prepare = lambda: projects.prepare_worktree(rec)
+        _project_last_active[rec["id"]] = time.time()      # 标记活跃：自驱心跳会避让最近在弄的项目
     answer = await runner.ask(_sess_key(rec, rid), prompt, cwd=cwd,
                               system_prompt=sp, lock_key=lock_key, prepare=prepare)
     await send(rid, answer, track=True)
@@ -764,6 +766,97 @@ async def _pr_followup_loop():
             raise
         except Exception:
             log.exception("PR 跟进循环异常，继续")
+
+
+# ---- 主动性·自驱心跳：没人派活时也巡检各项目、主动找值得做的事 ----
+def _project_home_room(pid: str) -> str | None:
+    """自驱心跳的"汇报口"：优先群绑定房间，否则最近路由到该项目的 DM 房间。"""
+    room = projects.first_room_for(pid)
+    if room:
+        return room
+    for r, p in _last_project_by_room.items():
+        if p == pid:
+            return r
+    return None
+
+
+async def _heartbeat_execute(rec: dict, room: str, proposal: str):
+    """autopilot：把巡检挑中的事真正做完并开 PR，结果回报、PR 进台账（→由跟进循环盯到合并）。"""
+    prompt = (
+        f"你刚巡检后决定主动推进这件事：\n{proposal}\n\n"
+        "请像平常派活一样把它做完：从 origin/base 建分支、改代码、commit、push、开 PR，"
+        "最终回复附上 PR 链接。用简洁中文回复。"
+    )
+    sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
+    try:
+        async with _typing(room):
+            answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"], system_prompt=sp,
+                                      lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec))
+        _project_last_active[rec["id"]] = time.time()
+        await send(room, f"🤖 自驱完成：\n{answer}", track=True)
+        pr = _extract_pr(answer, rec)
+        if pr and pr_ledger.record(rec["id"], pr[0], pr[1], room):
+            log.info("[%s] 自驱开了 PR #%d，进台账", rec["id"], pr[0])
+    except Exception as e:
+        log.exception("自驱执行失败")
+        await send(room, f"自驱执行出错：{e}")
+
+
+async def _heartbeat_one(rec: dict, room: str):
+    """对一个项目只读巡检，挑一件值得主动做的事；autopilot 直接认领去做，否则只提议。"""
+    patrol = (
+        f"你是负责仓库 {rec['owner']}/{rec['repo']} 的工程师。现在没人给你派活——"
+        "主动巡检这个仓库，看有没有**值得现在主动推进、且改动可控**的事："
+        "明显的小 bug、缺失的关键测试、陈旧的 TODO/FIXME、文档与代码不符、能小步改进的点。\n"
+        "判断标准要高，别为找事而找事。\n"
+        "- 不值得打扰就只回一行：__PASS__\n"
+        "- 值得就挑**最值得的一件**，简短说清：是什么、为什么值得、打算怎么改（这是只读巡检，先别动手）。"
+    )
+    sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
+    try:
+        proposal = (await runner.consult(patrol, cwd=rec["path"], system_prompt=sp)).strip()
+    except Exception:
+        log.exception("[%s] 自驱巡检失败", rec["id"])
+        return
+    if not proposal or "__PASS__" in proposal:
+        return
+    label = f"{rec['owner']}/{rec['repo']}"
+    if settings.proactive_autopilot:
+        await send(room, f"🫀 [{label}] 自驱：没人派活，我巡检后打算主动做这件事，开干——\n{proposal}", track=True)
+        _spawn(_heartbeat_execute(rec, room, proposal))
+    else:
+        await send(room, f"🫀 [{label}] 巡检建议（没人派活时主动看的）：\n{proposal}\n\n"
+                         "要做就回我一句；想让我自己认领就开 PROACTIVE_AUTOPILOT。", track=True)
+
+
+async def _heartbeat_loop():
+    """周期巡检有"汇报口"的项目；避让最近在弄的项目，免得打断正在派的活、也别为巡检而 clone。"""
+    if not settings.proactive_heartbeat_enabled:
+        return
+    log.info("自驱心跳已启动（每 %ds 巡检一次，autopilot=%s）",
+             settings.proactive_heartbeat_interval, settings.proactive_autopilot)
+    while True:
+        try:
+            await asyncio.sleep(settings.proactive_heartbeat_interval)
+            now = time.time()
+            for rec in projects.list_projects():
+                pid = rec["id"]
+                room = _project_home_room(pid)
+                if not room:
+                    continue
+                if now - _project_last_active.get(pid, 0) < settings.proactive_heartbeat_interval:
+                    continue   # 最近有人在弄 / 刚巡检过：别打扰
+                if not os.path.isdir(os.path.join(rec.get("path", ""), ".git")):
+                    continue
+                _project_last_active[pid] = now   # 占住，避免与真任务/下一轮重叠
+                try:
+                    await _heartbeat_one(rec, room)
+                except Exception:
+                    log.exception("[%s] 自驱心跳失败", pid)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("自驱心跳循环异常，继续")
 
 
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
@@ -1143,6 +1236,7 @@ async def main():
     await client.sync(timeout=30000, full_state=True)
     _synced = True
     _spawn(_pr_followup_loop())   # 后台盯台账里的 PR，跟到合并
+    _spawn(_heartbeat_loop())     # 后台自驱心跳：没人派活时也巡检找事
     await client.sync_forever(timeout=30000, full_state=False)
 
 
