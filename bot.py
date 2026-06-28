@@ -57,6 +57,7 @@ _last_proactive: dict[str, float] = defaultdict(float)
 _sent_events: deque = deque(maxlen=4096)        # 自己发出的 event_id：防自激 + 识别"回复了 bot"（重启清空）
 _last_project_by_room: dict[str, str] = {}      # room_id -> proj_id，供 DM /reset 定位会话
 _project_last_active: dict[str, float] = defaultdict(float)   # proj_id -> 上次有人派活的时刻，自驱心跳据此避让
+_group_engaged: dict[tuple[str, str], float] = {}   # (room_id, user) -> 上次点名/续话时刻：群里"对话延续窗口"用
 
 client: AsyncClient | None = None
 MY_ID = ""
@@ -70,9 +71,30 @@ def _spawn(coro):
     t.add_done_callback(_tasks.discard)
 
 
-def _authorized(user_id: str) -> bool:
-    """谁能驱动机器人及邀请它进房。ALLOW_USERS 空=所有人；非空则须在名单内。"""
-    return not settings.allow_users or user_id in settings.allow_users
+def _addresses_other_user(content: dict) -> bool:
+    """这条消息是否 @ 了 bot 以外的人（@别人 → 在跟别人说话，不当成对 bot 的续话）。"""
+    ids = content.get("m.mentions", {}).get("user_ids", []) or []
+    return any(u and u != MY_ID for u in ids)
+
+
+def _in_followup_window(rid: str, sender: str, content: dict) -> bool:
+    """群里"对话延续窗口"：sender 在 group_followup_window 秒内点过名/续过话，且这条没 @ 别人 →
+    免重复 @ 也当成接着说，直接进任务流程（不是只读的主动插话判断）。"""
+    if settings.group_followup_window <= 0:
+        return False
+    ts = _group_engaged.get((rid, sender), 0.0)
+    if time.time() - ts > settings.group_followup_window:
+        return False
+    return not _addresses_other_user(content)
+
+
+def _mark_engaged(rid: str, sender: str) -> None:
+    """记下"这个人刚和 bot 聊过"，并顺手清掉过期项防字典无限增长。"""
+    now = time.time()
+    _group_engaged[(rid, sender)] = now
+    cutoff = now - max(settings.group_followup_window, 1)
+    for k in [k for k, v in _group_engaged.items() if v < cutoff]:
+        del _group_engaged[k]
 
 
 def _has_trigger(text: str) -> bool:
@@ -342,6 +364,11 @@ def _is_addressed(room: MatrixRoom, event: RoomMessageText) -> tuple[bool, str]:
     if mentioned or replied_to_bot:
         return True, _strip_self_mentions(task_text).strip()
 
+    # 对话延续窗口：刚和 bot 聊过的人，短时间内免重复 @ 接着说也当成点名（多轮不必每句点名）。
+    # 但若这条是【回复别人的消息】（in_reply_to 非 bot），说明在跟别人说，不算续话。
+    if not in_reply_to and _in_followup_window(room.room_id, event.sender, content):
+        return True, task_text.strip()
+
     return False, task_text.strip()
 
 
@@ -461,15 +488,9 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
         return
     if event.event_id in _sent_events:  # 防自激
         return
-    if settings.room_allowlist and room.room_id not in settings.room_allowlist:
-        return
 
-    # 权限闸（在入上下文前）：未授权用户内容既不派活也不进 _context，否则会被当"最近对话"做间接 prompt 注入。
+    # 无访问控制：用这个 bot 的都是可信的人，所有用户的消息都进上下文、都可派活。
     is_self = event.sender == MY_ID
-    if not is_self and not _authorized(event.sender):
-        log.debug("忽略无权限用户消息: %s", event.sender)
-        return
-
     body = _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {}))
     sender_name = room.user_name(event.sender) or event.sender
     # 用本地接收时刻而非 event.server_timestamp：与 send() 里 bot 回复同一时钟，
@@ -510,6 +531,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
             return
 
     if addressed:
+        if not is_self and not _is_dm(room):   # 群里被点名/续话 → 开/续"对话延续窗口"，下条免重复 @
+            _mark_engaged(room.room_id, event.sender)
         _spawn(handle_task(room, event, cleaned))
     elif body.strip() in RESET_CMDS:   # 群里不点名也认重置（重置是元命令，不必 @ 机器人）
         _spawn(handle_task(room, event, body.strip()))
@@ -1186,27 +1209,16 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
 
 
 async def on_media(room: MatrixRoom, event):
-    # 与 on_message 同样的前置闸：积压门 / 房间白名单 / 用户授权
-    if not settings.process_backlog and not _synced:
-        return
-    if settings.room_allowlist and room.room_id not in settings.room_allowlist:
+    if not settings.process_backlog and not _synced:   # 跳过历史/离线积压
         return
     is_self = event.sender == MY_ID
-    if not is_self and not _authorized(event.sender):
-        return
     _spawn(_process_media(room, event, is_self))
 
 
 async def on_invite(room: MatrixRoom, event: InviteMemberEvent):
     if event.state_key != MY_ID or event.membership != "invite":
         return
-    # 只接受授权用户、白名单房间的邀请，否则陌生人能把 bot 拉进房间驱使 Claude。
-    if settings.room_allowlist and room.room_id not in settings.room_allowlist:
-        log.warning("拒绝非白名单房间的邀请 %s（邀请人 %s）", room.room_id, event.sender)
-        return
-    if not _authorized(event.sender):
-        log.warning("拒绝未授权用户 %s 的房间邀请 %s", event.sender, room.room_id)
-        return
+    # 无访问控制：用的人都可信，谁邀请都加入。
     await client.join(room.room_id)
     log.info("已加入房间 %s（邀请人 %s）", room.room_id, event.sender)
 
@@ -1294,8 +1306,6 @@ async def main():
     if settings.enable_e2e and not OLM_OK:
         log.warning("MATRIX_ENABLE_E2E=1 但未检测到 olm，已降级为明文模式。"
                     "请先安装 libolm 并 pip install 'matrix-nio[e2e]'。")
-    if not settings.allow_users:
-        log.info("ALLOW_USERS 未设置：默认所有人都可驱动 Claude（如需收紧在 .env 配置）。")
     os.makedirs(settings.claude_workdir, exist_ok=True)
     _load_last_projects()   # 恢复重启前各房间的项目路由（DM /reset、多轮延续要用）
     log.info("启动: 身份=%s (%s) E2EE=%s 工作目录=%s 主动模式=%s",

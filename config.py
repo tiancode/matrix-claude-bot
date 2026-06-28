@@ -38,8 +38,6 @@ class Settings:
     enable_e2e   = _b("MATRIX_ENABLE_E2E", False)
 
     # 行为
-    room_allowlist = _list("ROOM_ALLOWLIST")       # 只在这些房间工作；空=全部
-    allow_users    = _list("ALLOW_USERS")          # 只响应这些人；空=所有人
     reply_in_dm    = _b("REPLY_IN_DM_ALWAYS", True)
     proactive      = _b("PROACTIVE", True)
     proactive_cooldown = _i("PROACTIVE_COOLDOWN", 120)
@@ -49,6 +47,9 @@ class Settings:
     # False=对群里每条消息都让 Claude 判断该不该插话——能抓到"没人求助但话里有错"的情形
     # （同事聊错了你纠正），代价是判断调用更多，靠冷却 + 强 __PASS__ 倾向兜底防刷屏。默认 False。
     proactive_require_hint = _b("PROACTIVE_REQUIRE_HINT", False)
+    # 群里"对话延续窗口"（秒）：你 @ 过 bot 后，这段时间内你的后续消息**免重复 @** 也当成续话
+    # 直接接着干（多轮里不用每句都点名）。@了别人则不算续话。0=关。默认 180。
+    group_followup_window = _i("GROUP_FOLLOWUP_WINDOW", 180)
     trigger_phrase = _s("TRIGGER_PHRASE")
     context_lines  = _i("CONTEXT_LINES", 20)
     process_backlog = _b("PROCESS_BACKLOG", False)

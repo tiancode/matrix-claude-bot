@@ -129,17 +129,14 @@ def test_startup_and_task_flow():
     bot.projects.ensure_project = fake_ensure
     bot.runner.ask = fake_ask
 
-    orig_allow = settings.allow_users
     orig_pf = settings.pr_followup_enabled               # 关掉守护循环（PR 跟进 / 自驱心跳），否则会 sleep 住任务回收
     orig_hb = settings.proactive_heartbeat_enabled
-    settings.allow_users = ["@alice:ex.org"]            # fail-closed：须显式授权派活人
     settings.pr_followup_enabled = False
     settings.proactive_heartbeat_enabled = False
     bot._context["!g:ex.org"].clear()
     try:
         asyncio.run(bot.main())
     finally:
-        settings.allow_users = orig_allow
         settings.pr_followup_enabled = orig_pf
         settings.proactive_heartbeat_enabled = orig_hb
 
@@ -284,37 +281,76 @@ def test_security_bits():
         settings.gitea_host, settings.gitea_token = orig_host, orig_tok
 
 
-# ---------- 8) 访问控制：授权判定 + 邀请闸 ----------
-def test_authorization_and_invite():
+# ---------- 8) 无访问控制：谁邀请都进房、只有真正的 invite 才触发 join ----------
+def test_no_access_control_invite_joins():
     set_identity()
-    orig_allow, orig_rooms = settings.allow_users, settings.room_allowlist
+    joined = []
+
+    class FC:
+        async def join(self, rid):
+            joined.append(rid)
+
+    orig_client = bot.client
+    bot.client = FC()
     try:
-        settings.room_allowlist = []
-        settings.allow_users = ["@alice:ex.org"]               # 配了名单 → 只认名单内
-        assert bot._authorized("@alice:ex.org")
-        assert not bot._authorized("@eve:ex.org")
-
-        settings.allow_users = []                              # 留空 → 默认所有人可操作
-        assert bot._authorized("@eve:ex.org")
-        assert bot._authorized("@boss:ex.org")
-
-        # 邀请闸：只接受授权用户的邀请
-        joined = []
-
-        class FC:
-            async def join(self, rid):
-                joined.append(rid)
-
-        bot.client = FC()
-        settings.allow_users = ["@alice:ex.org"]
-        mk_inv = lambda s: types.SimpleNamespace(
-            state_key="@claudebot:ex.org", membership="invite", sender=s)
+        mk_inv = lambda s, m="invite": types.SimpleNamespace(
+            state_key="@claudebot:ex.org", membership=m, sender=s)
         room = FakeRoom("!r:ex.org", 2)
-        asyncio.run(bot.on_invite(room, mk_inv("@eve:ex.org")))    # 未授权 → 不加入
-        asyncio.run(bot.on_invite(room, mk_inv("@alice:ex.org")))  # 授权 → 加入
-        assert joined == ["!r:ex.org"]
+        asyncio.run(bot.on_invite(room, mk_inv("@eve:ex.org")))     # 陌生人邀请也加入
+        asyncio.run(bot.on_invite(room, mk_inv("@alice:ex.org")))
+        assert joined == ["!r:ex.org", "!r:ex.org"]
+        asyncio.run(bot.on_invite(room, mk_inv("@x:ex.org", "join")))  # 非 invite 成员事件不触发
+        assert len(joined) == 2
     finally:
-        settings.allow_users, settings.room_allowlist = orig_allow, orig_rooms
+        bot.client = orig_client
+
+
+# ---------- 8b) 群"对话延续窗口"：点过名后免重复 @ 也算续话 ----------
+def test_group_followup_window():
+    set_identity()
+    rid = "!fw:ex.org"
+    room = FakeRoom(rid, 3)                       # 群（非 DM）
+    orig_win = settings.group_followup_window
+    settings.group_followup_window = 180
+    bot._group_engaged.clear()
+    try:
+        # 没点过名 → 普通消息不算点名
+        ok, _ = bot._is_addressed(room, make_event("接着把它改一下", sender="@alice:ex.org"))
+        assert not ok
+
+        bot._mark_engaged(rid, "@alice:ex.org")   # alice 点了名
+
+        # 窗口内 alice 的后续消息（没@）→ 算续话
+        ok, _ = bot._is_addressed(room, make_event("接着把它改一下", sender="@alice:ex.org"))
+        assert ok
+
+        # 窗口内但 @ 了别人 → 不算（在跟别人说话）
+        ok, _ = bot._is_addressed(room, make_event(
+            "@bob 你看呢", sender="@alice:ex.org", mentions=["@bob:ex.org"]))
+        assert not ok
+
+        # 窗口内但这条是回复别人的消息 → 不算续话
+        ok, _ = bot._is_addressed(room, make_event(
+            "说得对", sender="@alice:ex.org", in_reply_to="$someoneelse"))
+        assert not ok
+
+        # 没点过名的 bob → 不算续话
+        ok, _ = bot._is_addressed(room, make_event("我也要", sender="@bob:ex.org"))
+        assert not ok
+
+        # 窗口过期 → 不再续话
+        bot._group_engaged[(rid, "@alice:ex.org")] = time.time() - 1000
+        ok, _ = bot._is_addressed(room, make_event("还在吗", sender="@alice:ex.org"))
+        assert not ok
+
+        # 开关关掉 → 不续话
+        settings.group_followup_window = 0
+        bot._mark_engaged(rid, "@alice:ex.org")
+        ok, _ = bot._is_addressed(room, make_event("接着改", sender="@alice:ex.org"))
+        assert not ok
+    finally:
+        settings.group_followup_window = orig_win
+        bot._group_engaged.clear()
 
 
 # ---------- 9) /reset 连背景对话一起清空 ----------
@@ -513,10 +549,8 @@ def test_just_url_autobind_only_for_bare_url():
     bot._synced = True
     room = FakeRoom("!g:ex.org", 3)          # 群、未绑定
     orig_host = settings.gitea_host
-    orig_allow = settings.allow_users        # 真实 .env 可能配了 ALLOW_USERS，这里清空免得把 @alice 挡在门外
     orig = (bot.projects.get_room, bot.do_bind, bot._spawn)
     settings.gitea_host = "https://gitea.example.com"
-    settings.allow_users = []
     bot.projects.get_room = lambda rid: None
     bound = []
     bot.do_bind = lambda *a, **k: bound.append(1)
@@ -530,7 +564,6 @@ def test_just_url_autobind_only_for_bare_url():
         n_with_task = len(bound) - n_bare
     finally:
         settings.gitea_host = orig_host
-        settings.allow_users = orig_allow
         (bot.projects.get_room, bot.do_bind, bot._spawn) = orig
     assert n_bare == 1                        # 纯链接 → 自动绑定
     assert n_with_task == 0                   # 链接+闲聊 → 不自动绑定
@@ -801,10 +834,8 @@ def test_group_rebind_hint():
     bot._context[rid].clear()
     bound = {"id": "gitea.example.com/o/old", "owner": "o", "repo": "old"}
     msgs, pending = [], []
-    orig = (settings.gitea_host, settings.allow_users, settings.room_allowlist,
-            bot.projects.get_room, bot.client, bot._spawn)
+    orig = (settings.gitea_host, bot.projects.get_room, bot.client, bot._spawn)
     settings.gitea_host = "https://gitea.example.com"
-    settings.allow_users, settings.room_allowlist = [], []
     bot.projects.get_room = lambda r: bound
 
     class FC:
@@ -821,8 +852,7 @@ def test_group_rebind_hint():
                 await c
         asyncio.run(go())
     finally:
-        (settings.gitea_host, settings.allow_users, settings.room_allowlist,
-         bot.projects.get_room, bot.client, bot._spawn) = orig
+        (settings.gitea_host, bot.projects.get_room, bot.client, bot._spawn) = orig
     assert any("换绑" in m for m in msgs)        # 裸 URL 撞上已绑仓库 → 提示换绑
 
 
@@ -875,10 +905,8 @@ def test_group_url_with_task_binds():
     rid = "!gbind:ex.org"
     room = FakeRoom(rid, 3)                               # 群、未绑定
     orig_host = settings.gitea_host
-    orig = (settings.allow_users, settings.room_allowlist,
-            bot.projects.get_room, bot.do_bind, bot._spawn)
+    orig = (bot.projects.get_room, bot.do_bind, bot._spawn)
     settings.gitea_host = "https://gitea.example.com"
-    settings.allow_users, settings.room_allowlist = [], []
     bot.projects.get_room = lambda r: None
     captured = {}
 
@@ -898,8 +926,7 @@ def test_group_url_with_task_binds():
         asyncio.run(go())
     finally:
         settings.gitea_host = orig_host
-        (settings.allow_users, settings.room_allowlist,
-         bot.projects.get_room, bot.do_bind, bot._spawn) = orig
+        (bot.projects.get_room, bot.do_bind, bot._spawn) = orig
         bot._context[rid].clear()
     assert captured.get("repo", {}).get("repo") == "app"  # 同条消息里的 URL 被识别并绑定
     assert captured.get("task") == "帮我修登录刷新"        # @bot 与 URL 都剥掉，只剩任务正文
@@ -1484,7 +1511,8 @@ TESTS = [
     ("自己账号入上下文不派活", test_own_account_context),
     ("TTL 过期提示", test_ttl_notice),
     ("token 受信主机 + redact", test_security_bits),
-    ("访问控制：授权 + 邀请闸", test_authorization_and_invite),
+    ("无访问控制：谁邀请都进房", test_no_access_control_invite_joins),
+    ("群对话延续窗口", test_group_followup_window),
     ("/reset 清空背景上下文", test_reset_clears_context),
     ("重试仅限会话失效", test_retry_only_on_session_error),
     ("分块代码围栏自洽", test_fence_balance_on_split),
