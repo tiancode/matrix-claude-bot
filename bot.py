@@ -129,10 +129,22 @@ async def on_invite(room: MatrixRoom, event: InviteMemberEvent):
     # 无访问控制：用的人都可信，谁邀请都加入。
     await state.client.join(room.room_id)
     log.info("已加入房间 %s（邀请人 %s）", room.room_id, event.sender)
+    # join() 后 nio 还没把房间放进 client.rooms（要等下一次 sync 把 join 消化掉），
+    # 立刻 room_send 会 LocalProtocolError("No such room")。后台等房间出现再发欢迎语，
+    # 也别阻塞本次 sync 的事件分发。
+    state._spawn(_welcome_when_ready(room.room_id))
+
+
+async def _welcome_when_ready(rid: str):
+    """等房间被 sync 收进 client.rooms 后再发欢迎语（长轮询 sync 通常几秒内返回）。"""
+    for _ in range(40):
+        if rid in state.client.rooms:
+            break
+        await asyncio.sleep(0.5)
     try:                              # 进房先打个招呼 + 指到 /help，省得新人不知道怎么用
-        await send(room.room_id, _WELCOME)
+        await send(rid, _WELCOME)
     except Exception:
-        log.exception("发送欢迎语失败 %s", room.room_id)
+        log.exception("发送欢迎语失败 %s", rid)
 
 
 def _new_client() -> AsyncClient:

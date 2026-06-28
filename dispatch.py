@@ -109,9 +109,8 @@ async def _dispatch(room: MatrixRoom, event: RoomMessageText, text: str) -> dict
     exact = _match_project_exact(text, known)    # 2) 强信号：owner/repo 或完整 id
     if exact:
         return await projects.ensure_project(exact)
-    if not known:                                # 3) 还没有任何已知项目
-        await send(rid, "我还不知道你指的是哪个项目，发个 Gitea 仓库地址给我吧。")
-        return None
+    if not known:                                # 3) 还没有任何已知项目：当通用助手答一般性问题
+        return _general_rec()                     #    （要做某仓库的活，欢迎语已指引发 Gitea 地址来绑定）
     pid = await _triage(text, known, _format_context(rid))   # 4) 轻量分诊（带最近对话）
     if pid == TRIAGE_GENERAL:                  # 一般性问题：直接当通用助手答，不必非得挂到某个项目
         return _general_rec()

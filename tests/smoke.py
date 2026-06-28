@@ -290,6 +290,7 @@ def test_no_access_control_invite_joins():
     joined = []
 
     class FC:
+        rooms = {}                       # 欢迎语后台任务会探 client.rooms，给个空的即可
         async def join(self, rid):
             joined.append(rid)
 
@@ -1524,11 +1525,13 @@ class _CapClient:
     def __init__(self):
         self.sent = []
         self.uploaded = []
+        self.rooms = {}
 
     async def room_typing(self, *a, **k):
         return None
 
     async def join(self, rid):
+        self.rooms[rid] = types.SimpleNamespace(room_id=rid)   # 模拟 join 后房间进入 client.rooms
         return None
 
     async def room_send(self, rid, mt, content, **k):
@@ -1595,7 +1598,7 @@ def test_help_and_welcome():
     assert any("我能干嘛" in (m.get("body") or "") for m in c.sent)
     c.sent.clear()
     inv = types.SimpleNamespace(state_key=state.MY_ID, membership="invite", sender="@x:ex.org")
-    asyncio.run(bot.on_invite(FakeRoom("!inv:ex.org", 2), inv))
+    _drain_and_run(bot.on_invite(FakeRoom("!inv:ex.org", 2), inv))   # 欢迎语现为后台任务，收割它
     assert any("/help" in (m.get("body") or "") for m in c.sent)                   # 进房打招呼指到 /help
 
 
@@ -1672,8 +1675,31 @@ def test_live_reply_streams_and_finalizes():
     assert edits and edits[-1]["m.new_content"]["body"] == "最终答复"             # 编辑成最终答复
 
 
+def test_dm_no_projects_falls_to_general():
+    """还没有任何已知项目时，DM 的一般性问题也该落到通用助手答，而不是反问"发个仓库地址"。"""
+    set_identity()
+    room = FakeRoom("!dmnone:ex.org", 2)                   # 2 人 → DM
+    sent = []
+
+    async def cap_send(rid, text, *a, **k):
+        sent.append(text)
+
+    orig = (bot.projects.list_projects, dispatch.send)
+    bot.projects.list_projects = lambda: []                # 零项目
+    dispatch.send = cap_send
+    try:
+        out = asyncio.run(bot._dispatch(room, make_event("怎么用 python 写快速排序"),
+                                        "怎么用 python 写快速排序"))
+    finally:
+        (bot.projects.list_projects, dispatch.send) = orig
+    assert out and out.get("general") is True              # 当通用助手答
+    assert out["id"] == dispatch._GENERAL_ID
+    assert not sent                                        # 不再反问"发个 Gitea 仓库地址"
+
+
 TESTS = [
     ("启动+群任务全链路", test_startup_and_task_flow),
+    ("零项目DM落通用助手", test_dm_no_projects_falls_to_general),
     ("线程化回复 helper+send", test_thread_helpers_and_send),
     ("群任务答复挂线程", test_group_task_reply_threaded),
     ("/help + 进房欢迎", test_help_and_welcome),
