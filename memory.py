@@ -29,8 +29,10 @@ _INDEX = "MEMORY.md"
 
 
 def _root() -> str:
-    # 跟随 settings.store_path：自检会把它指到临时目录，真实 store 不被污染
-    return os.path.join(settings.store_path, "memory")
+    # 跟随 settings.store_path（自检会把它指到临时目录，真实 store 不被污染）；
+    # 必须取绝对路径——bot 进程 cwd 是 live dir，Claude 子进程 cwd 是 clone dir，
+    # 相对路径会让 Claude 把记忆写进 clone 的 store、bot 却从 live 的 store 读，永远对不上。
+    return os.path.abspath(os.path.join(settings.store_path, "memory"))
 
 
 def _safe(seg: str, fallback: str = "_") -> str:

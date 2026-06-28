@@ -1175,6 +1175,17 @@ def test_project_memory():
     assert memory.recall("pi.lan:3000/team/other") == ""   # 别的项目读不到（不串台）
     assert ".." not in os.path.basename(memory.proj_dir("../../etc/passwd"))  # 路径穿越被消毒
 
+    # 关键：store_path 即便是相对的，记忆目录也必须解析成绝对路径——
+    # bot 进程 cwd 是 live dir、Claude 子进程 cwd 是 clone dir，相对路径会让两边读写到不同目录，
+    # 跨会话留存直接失效（注入提示里给 Claude 的路径同理）。
+    orig_store = settings.store_path
+    try:
+        settings.store_path = "./store"
+        assert os.path.isabs(memory.proj_dir("pi.lan:3000/team/app"))
+        assert os.path.isabs(memory._root())
+    finally:
+        settings.store_path = orig_store
+
     # 关掉开关时不注入
     orig = settings.memory_enabled
     try:
