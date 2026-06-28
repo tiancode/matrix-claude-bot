@@ -41,14 +41,14 @@ class Settings:
     room_allowlist = _list("ROOM_ALLOWLIST")       # 只在这些房间工作；空=全部
     allow_users    = _list("ALLOW_USERS")          # 只响应这些人；空=所有人
     reply_in_dm    = _b("REPLY_IN_DM_ALWAYS", True)
-    proactive      = _b("PROACTIVE", False)
+    proactive      = _b("PROACTIVE", True)
     proactive_cooldown = _i("PROACTIVE_COOLDOWN", 120)
     # 判定"不插话"后占用的短冷却（秒）：太小会让活跃群里几乎每条疑问都起一次 Claude 判断
     proactive_pass_cooldown = _i("PROACTIVE_PASS_COOLDOWN", 60)
-    # 主动插话是否仍需"像求助"的关键词预筛。True=只评估含求助/报错词的消息（省判断调用，默认）；
+    # 主动插话是否仍需"像求助"的关键词预筛。True=只评估含求助/报错词的消息（省判断调用）；
     # False=对群里每条消息都让 Claude 判断该不该插话——能抓到"没人求助但话里有错"的情形
-    # （同事聊错了你纠正），代价是判断调用更多，靠冷却 + 强 __PASS__ 倾向兜底防刷屏。
-    proactive_require_hint = _b("PROACTIVE_REQUIRE_HINT", True)
+    # （同事聊错了你纠正），代价是判断调用更多，靠冷却 + 强 __PASS__ 倾向兜底防刷屏。默认 False。
+    proactive_require_hint = _b("PROACTIVE_REQUIRE_HINT", False)
     trigger_phrase = _s("TRIGGER_PHRASE")
     context_lines  = _i("CONTEXT_LINES", 20)
     process_backlog = _b("PROCESS_BACKLOG", False)
@@ -76,12 +76,13 @@ class Settings:
     claude_permission_mode = _s("CLAUDE_PERMISSION_MODE", "acceptEdits")
     claude_dangerous = _b("CLAUDE_DANGEROUS", True)
     claude_extra_args = _s("CLAUDE_EXTRA_ARGS")
-    session_ttl    = _i("SESSION_TTL", 7200)
+    session_ttl    = _i("SESSION_TTL", 86400)   # 多轮上下文空闲过期：默认 24 小时
     max_concurrency = _i("MAX_CONCURRENCY", 2)
 
     # 聊天逐字记录：按房间把对话明文落盘（store/transcripts/<房间>.jsonl），让 Claude 能回溯
-    # 更早的对话（"前天我们聊了什么"）。补会话 TTL / 背景缓冲都够不着的"远期对话"短板。默认关。
-    transcript_enabled       = _b("TRANSCRIPT_ENABLED", False)
+    # 更早的对话（"前天我们聊了什么"）。补会话 TTL / 背景缓冲都够不着的"远期对话"短板。
+    # 默认开（会持久留存对话明文，仅授权用户、store/ 0700、受保留天数约束）。
+    transcript_enabled       = _b("TRANSCRIPT_ENABLED", True)
     transcript_keep_days     = _i("TRANSCRIPT_KEEP_DAYS", 30)     # 保留天数，超期滚动删旧
     transcript_max_lines     = _i("TRANSCRIPT_MAX_LINES", 5000)   # 每房间行数硬上限，兜底防膨胀
     transcript_backfill_days = _i("TRANSCRIPT_BACKFILL_DAYS", 30) # 回灌（从 Matrix 拉历史）默认往回多少天
@@ -104,8 +105,8 @@ class Settings:
     # 主动性·自驱心跳：没人派活时也巡检各项目、主动找值得做的事
     proactive_heartbeat_enabled  = _b("PROACTIVE_HEARTBEAT_ENABLED", True)
     proactive_heartbeat_interval = _i("PROACTIVE_HEARTBEAT_INTERVAL", 3600)  # 巡检间隔（秒），别太密以免烧钱/打扰
-    # 0=只读巡检 + 提议（默认，安全）；1=autopilot：直接认领、开 PR（无人值守自主行动，慎开）
-    proactive_autopilot          = _b("PROACTIVE_AUTOPILOT", False)
+    # 0=只读巡检 + 提议（安全）；1=autopilot：直接认领、开 PR（无人值守自主行动）。默认开
+    proactive_autopilot          = _b("PROACTIVE_AUTOPILOT", True)
 
     # 媒体（图片 / 文件 / 音视频）
     media_enabled  = _b("MEDIA_ENABLED", True)

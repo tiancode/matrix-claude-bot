@@ -7,13 +7,13 @@
 ## 能力
 
 - **被 @ / 单聊 / 触发词** → 调用 Claude Code 干活后回复
-- **PROACTIVE 模式**（默认关）→ 不被 @ 时也对群消息先让 Claude 判断该不该插话——既包括**有人求助**，也包括**对话里出现明显错误/有风险的做法值得纠正**（同事聊错了你能开口指正），带冷却 + 强 `__PASS__` 倾向防刷屏；群已绑仓库时用**只读**方式看着真实代码作答（不会改代码/开 PR）。`PROACTIVE_REQUIRE_HINT=0` 让它对每条群消息都判断（抓"没人求助但话里有错"），=1 则只看含求助/报错词的消息（更省）
+- **PROACTIVE 模式**（默认开）→ 不被 @ 时也对群消息先让 Claude 判断该不该插话——既包括**有人求助**，也包括**对话里出现明显错误/有风险的做法值得纠正**（同事聊错了你能开口指正），带冷却 + 强 `__PASS__` 倾向防刷屏；群已绑仓库时用**只读**方式看着真实代码作答（不会改代码/开 PR）。默认 `PROACTIVE_REQUIRE_HINT=0`：对每条群消息都判断（抓"没人求助但话里有错"）；设 =1 则只看含求助/报错词的消息（更省判断调用）。要收敛打扰：用 `ROOM_ALLOWLIST` 限定房间、调大 `PROACTIVE_COOLDOWN`，或 `PROACTIVE=0` 关掉
 - **图片 / 文件 / 多媒体** → 自动下载（加密房间会解密）存到本地并在上下文标注；被 @ 时把文件路径交给 Claude 读取/分析
 - 每个**房间 × 项目**维护**多轮上下文**（Claude Code 会话，不同房间/私聊互不串台），发 `重置` / `/reset` 清空
 - **项目长期记忆**（跨会话/跨重启留存）→ 会话有 TTL，但「当初为什么这么设计、项目约定、长期目标、踩过的坑」这类**值得跨周记住**的事实落在 `store/memory/<项目>/`（一事一文件 + 索引，工作树之外不会被误 commit）；开新会话时按预算注入系统提示，会话被 TTL 清掉也"记得住事"。补「无长程记忆」短板的第一步（详见 `memory.py`）
 - **PR 台账（对结果负责）**→ bot 开了 PR 不撒手：后台轮询该 PR，收到**评审意见**或 **CI 失败**就自动在原分支上处理并推送、把进展回报到当初派活的房间，**合并/关闭才销账**（带自动处理次数上限防空转）。补「fire-and-forget、不跟进」短板（详见 `pr_ledger.py` / `gitea.py`）
-- **主动性·自驱心跳**→ 没人派活时也按 `PROACTIVE_HEARTBEAT_INTERVAL` 巡检各项目（只读），挑一件值得主动推进的事（陈旧 PR、TODO/FIXME、缺测试、小 bug）。默认**只提议**到项目房间等你点头；开 `PROACTIVE_AUTOPILOT=1` 则自己认领、开 PR（开的 PR 自动进台账→被 PR 跟进盯到合并）。补「永远被动、无自驱」短板
-- **聊天历史回溯**（`TRANSCRIPT_ENABLED=1`，默认关）→ 会话有 24h 滑动 TTL、背景缓冲只有最近十几条且重启即清，都答不了「前天我们聊了什么」。开启后按房间把对话**明文**落到 `store/transcripts/<房间>.jsonl`（一行一条 + 保留天数/行数上限滚动删旧），派活时把日志**路径**注入系统提示，让 Claude 被问到更早对话时**自己去读/grep**（与项目记忆同一套"告诉它存哪、按需取"的玩法，不把整段历史塞进每次 prompt）。`/backfill [天数]` 可从 Matrix 时间线回灌开启前的历史；首次启用还会对各房间自动回灌一次。E2EE 下落盘的是收到时的明文，回溯可靠
+- **主动性·自驱心跳**→ 没人派活时也按 `PROACTIVE_HEARTBEAT_INTERVAL` 巡检各项目（只读），挑一件值得主动推进的事（陈旧 PR、TODO/FIXME、缺测试、小 bug）。**默认 autopilot**（`PROACTIVE_AUTOPILOT=1`）：自己认领、开 PR（开的 PR 自动进台账→被 PR 跟进盯到合并）；设 `PROACTIVE_AUTOPILOT=0` 则只提议到项目房间等你点头（更安全、不自动改）。补「永远被动、无自驱」短板
+- **聊天历史回溯**（`TRANSCRIPT_ENABLED`，默认开）→ 会话有 24h 滑动 TTL、背景缓冲只有最近十几条且重启即清，都答不了「前天我们聊了什么」。开启后按房间把对话**明文**落到 `store/transcripts/<房间>.jsonl`（一行一条 + 保留天数/行数上限滚动删旧），派活时把日志**路径**注入系统提示，让 Claude 被问到更早对话时**自己去读/grep**（与项目记忆同一套"告诉它存哪、按需取"的玩法，不把整段历史塞进每次 prompt）。`/backfill [天数]` 可从 Matrix 时间线回灌开启前的历史；首次启用还会对各房间自动回灌一次。E2EE 下落盘的是收到时的明文，回溯可靠
 - **白名单**（房间 / 用户）、登录态与 E2EE 密钥**持久化**；Claude 会话 id（`store/sessions.json`）与房间→项目路由（`store/last_projects.json`）也落盘，重启后多轮上下文与 `/reset` 仍可用（群聊背景对话与"回复了 bot"识别不持久，重启后清空）
 
 ## 任务分配：一个项目 = 一个 Claude Code worker
@@ -53,7 +53,7 @@ cp .env.example .env        # 然后填好账号
 | `CLAUDE_DANGEROUS` | `1`=无人值守全自动（跳过工具授权）；`0` 更安全 |
 | `ALLOW_USERS` | 只让这些人能派活（会跑命令/改文件，**强烈建议设**） |
 | `ROOM_ALLOWLIST` | 只在指定房间工作 |
-| `PROACTIVE` | `1` 开启主动插话（实验性） |
+| `PROACTIVE` | 主动插话：群里没 @ 也会判断该不该插话/纠错（**默认开**）；`0` 关。`ROOM_ALLOWLIST` 可限定房间 |
 
 ## 运行
 
@@ -106,6 +106,7 @@ journalctl --user -u matrix-claude -f
 - **工作目录隔离**：兜底目录是 `PROJECTS_ROOT/_scratch`，别把 `CLAUDE_WORKDIR` 指到含 `.env` / `store/` 的目录。
 - **出口脱敏**：外发文本自动抹掉 `GITEA_TOKEN`、登录密码与 Matrix access token（兜底，非主防线）。
 - **媒体**：只下载授权用户、白名单房间里的文件，单文件受 `MEDIA_MAX_MB` 限制、每房间按 `MEDIA_KEEP` 滚动删旧；文件名经消毒（挡 `../` 穿越）。存到 `PROJECTS_ROOT/_media`（已 gitignore），不放进仓库工作树以免被误 commit。Claude 用绝对路径读取，`CLAUDE_DANGEROUS=0` 时可能读不到 cwd 之外的文件。
+- **默认偏"积极自主"**：开箱默认 `PROACTIVE=1`（群里没 @ 也会判断要不要插话/纠错）、`PROACTIVE_AUTOPILOT=1`（巡检到事自己开 PR）、`TRANSCRIPT_ENABLED=1`（对话明文落盘）。想要安静/被动：`PROACTIVE=0`、`PROACTIVE_AUTOPILOT=0`、`TRANSCRIPT_ENABLED=0`，或用 `ROOM_ALLOWLIST` 把它圈在指定房间。
 
 > **DM 默认开放（有意为之）**：不设 `ALLOW_USERS` 时陌生人也能私聊驱动 Claude。因 bot 持有 `GITEA_TOKEN`，等于让它能 clone 并读走 token 可访问的任意私有库。多人 / 公开 / 联邦可达的部署务必设 `ALLOW_USERS`。
 >
