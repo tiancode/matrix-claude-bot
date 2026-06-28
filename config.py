@@ -45,6 +45,10 @@ class Settings:
     proactive_cooldown = _i("PROACTIVE_COOLDOWN", 120)
     # 判定"不插话"后占用的短冷却（秒）：太小会让活跃群里几乎每条疑问都起一次 Claude 判断
     proactive_pass_cooldown = _i("PROACTIVE_PASS_COOLDOWN", 60)
+    # 主动插话是否仍需"像求助"的关键词预筛。True=只评估含求助/报错词的消息（省判断调用，默认）；
+    # False=对群里每条消息都让 Claude 判断该不该插话——能抓到"没人求助但话里有错"的情形
+    # （同事聊错了你纠正），代价是判断调用更多，靠冷却 + 强 __PASS__ 倾向兜底防刷屏。
+    proactive_require_hint = _b("PROACTIVE_REQUIRE_HINT", True)
     trigger_phrase = _s("TRIGGER_PHRASE")
     context_lines  = _i("CONTEXT_LINES", 20)
     process_backlog = _b("PROCESS_BACKLOG", False)

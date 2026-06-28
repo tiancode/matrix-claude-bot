@@ -749,6 +749,49 @@ def test_proactive_pass_keeps_short_cooldown():
     assert 0 < remaining <= bot._PROACTIVE_PASS_COOLDOWN + 2, remaining   # PASS 后很快能重判
 
 
+# ---------- 25b) PROACTIVE_REQUIRE_HINT：关掉后能评估"没人求助但话里有错"的陈述句 ----------
+def test_proactive_require_hint_toggle():
+    set_identity()
+    rid = "!ph:ex.org"
+    room = FakeRoom(rid, 3)
+    bot._context[rid].clear()
+    # 纯陈述句、无任何求助/报错词，但内容是技术错误 → 关键词预筛会拦它
+    msg = "这个 list 多线程 append 完全安全，随便并发写都没问题"
+    assert not bot._looks_actionable(msg)
+    calls = []
+
+    class R:
+        async def quick(self, prompt):
+            calls.append(prompt)
+            return "其实 list 并发写不是线程安全的，高并发 append 可能丢元素，建议加锁或用 queue。"
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.runner, bot.client, bot.projects.get_room,
+            settings.proactive_require_hint, settings.proactive_cooldown,
+            settings.transcript_enabled)
+    bot.runner, bot.client = R(), FC()
+    bot.projects.get_room = lambda r: None     # 未绑库 → 走 quick 文本判断
+    settings.proactive_cooldown = 600
+    settings.transcript_enabled = False        # 别在测试里写 store/transcripts
+    try:
+        settings.proactive_require_hint = True   # 预筛开：非求助句被挡下，不评估
+        bot._last_proactive[rid] = 0.0
+        asyncio.run(bot.maybe_proactive(room, make_event(msg), msg))
+        assert calls == [], "require_hint=True 时不该评估非求助消息"
+
+        settings.proactive_require_hint = False  # 预筛关：每条都评估，judge 纠错 → 会插话
+        bot._last_proactive[rid] = 0.0
+        asyncio.run(bot.maybe_proactive(room, make_event(msg), msg))
+        assert len(calls) == 1, "require_hint=False 时应评估并纠正"
+    finally:
+        (bot.runner, bot.client, bot.projects.get_room,
+         settings.proactive_require_hint, settings.proactive_cooldown,
+         settings.transcript_enabled) = orig
+
+
 # ---------- 26) 已绑定群里再发裸 URL：给换绑提示而非静默无反应 ----------
 def test_group_rebind_hint():
     set_identity()
@@ -1459,6 +1502,7 @@ TESTS = [
     ("DM 分诊路由过 ensure", test_dm_routing_ensures_checkout),
     ("裸仓库名兜底在分诊之后", test_dm_loose_name_after_triage),
     ("主动 PASS 只占短冷却", test_proactive_pass_keeps_short_cooldown),
+    ("主动插话预筛开关", test_proactive_require_hint_toggle),
     ("已绑群裸 URL 给换绑提示", test_group_rebind_hint),
     ("分块续块保留语言标记", test_fence_language_preserved),
     ("DM 分诊失败沿用上次项目", test_dm_last_project_fallback),
