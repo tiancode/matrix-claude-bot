@@ -1,9 +1,9 @@
 name: CI
 
 # 离线冒烟自检(59) + pyflakes。绿了 PR 才会被自动合并（配合 PR_AUTOMERGE）。
-# 注意：这台 runner（pi-runner）所在网络墙了 github.com 与（很可能）pypi.org，
-# 所以这里【不用任何 uses: 动作】（会去 github 拉取而失败），改为从本地 Gitea clone；
-# 依赖走清华 pip 镜像绕开 pypi 封锁。
+# 这台 runner(pi-runner) 所在网络墙了 github.com / pypi.org，且容器内解析不了 pi.lan：
+#   - 不用任何 uses: 动作（会去 github 拉取而失败），改从本地 Gitea 的 IP/网关 clone；
+#   - pip 走清华镜像绕开 pypi 封锁。
 on:
   push:
     branches: [main]
@@ -13,42 +13,33 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - name: 网络诊断（一眼看清容器能连到谁）
-        run: |
-          echo "server=$GITHUB_SERVER_URL repo=$GITHUB_REPOSITORY sha=$GITHUB_SHA ref=$GITHUB_REF"
-          command -v python3 && python3 --version || echo "no python3 in image"
-          for u in "$GITHUB_SERVER_URL" https://pypi.org/simple/ https://pypi.tuna.tsinghua.edu.cn/simple/ https://github.com; do
-            code=$(curl -s -m 8 -o /dev/null -w "%{http_code}" "$u" 2>/dev/null || echo FAIL)
-            echo "  $u -> $code"
-          done
-
-      - name: 检出（从本地 Gitea clone，避开被墙的 github）
+      - name: 检出（容器内连本地 Gitea：试网关 / IP / host.docker.internal）
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          url="${GITHUB_SERVER_URL%/}/${GITHUB_REPOSITORY}.git"
-          auth=$(printf '%s' "$url" | sed -E "s#^(https?://)#\1x-access-token:${GH_TOKEN}@#")
-          git clone "$auth" . || git clone "$url" .
+          GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+          hosts="192.168.1.4:3000 host.docker.internal:3000 pi.lan:3000"
+          [ -n "$GW" ] && hosts="$GW:3000 $hosts"
+          ok=0
+          for h in $hosts; do
+            u="http://x-access-token:${GH_TOKEN}@${h}/${GITHUB_REPOSITORY}.git"
+            if git clone "$u" . 2>/dev/null; then echo "✔ cloned via $h"; ok=1; break; fi
+            find . -mindepth 1 -delete 2>/dev/null || true
+          done
+          [ "$ok" = 1 ] || { echo "::error::所有候选地址都无法 clone 本地 Gitea（试过: $hosts）"; exit 1; }
           git checkout -q "$GITHUB_SHA" || echo "WARN: checkout $GITHUB_SHA 失败，用默认 HEAD"
-          echo "checked out: $(git rev-parse --short HEAD)"; ls -1 *.py | head
+          echo "HEAD=$(git rev-parse --short HEAD)"
 
-      - name: Python 环境 + 依赖（pip 走清华镜像绕开 pypi 封锁）
+      - name: 依赖 + lint + 冒烟（pip 走清华镜像）
         run: |
-          command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3 python3-venv; }
-          python3 -m venv .venv-ci 2>/dev/null || { apt-get update -qq && apt-get install -y -qq python3-venv && python3 -m venv .venv-ci; }
-          MIRROR="-i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 60 --retries 2"
-          .venv-ci/bin/python -m pip install -q --upgrade $MIRROR pip || .venv-ci/bin/python -m pip install -q --upgrade pip
-          .venv-ci/bin/pip install -q $MIRROR -r requirements.txt pyflakes || .venv-ci/bin/pip install -q -r requirements.txt pyflakes
-          .venv-ci/bin/python --version
-
-      - name: Lint（pyflakes：只在出现 undefined name 时失败；re-export 的未用导入不算）
-        run: |
-          out=$(.venv-ci/bin/python -m pyflakes *.py || true)
-          echo "$out"
-          if echo "$out" | grep -qi "undefined name"; then
-            echo "::error::pyflakes 发现 undefined name"
-            exit 1
-          fi
-
-      - name: 冒烟自检（59 项，离线、不连 Matrix/不调 claude）
-        run: .venv-ci/bin/python tests/smoke.py
+          MIRROR="-i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 60 --retries 3"
+          if python3 -m venv .venv-ci 2>/dev/null; then PY=.venv-ci/bin/python; else PY=python3; fi
+          $PY -m pip install -q --upgrade $MIRROR pip || true
+          $PY -m pip install -q $MIRROR -r requirements.txt pyflakes \
+            || $PY -m pip install -q --break-system-packages $MIRROR -r requirements.txt pyflakes
+          $PY --version
+          echo "--- pyflakes（只在 undefined name 时失败；re-export 的未用导入不算）---"
+          out=$($PY -m pyflakes *.py || true); echo "$out"
+          if echo "$out" | grep -qi "undefined name"; then echo "::error::pyflakes 发现 undefined name"; exit 1; fi
+          echo "--- 冒烟自检（59 项，离线，不连 Matrix/不调 claude）---"
+          $PY tests/smoke.py
