@@ -1324,6 +1324,46 @@ def test_pr_followup_actions():
         _reset_ledger()
 
 
+# ---------- 聊天逐字记录：落盘/回溯指引/保留删旧/开关 ----------
+def test_transcript_log_and_recall():
+    import tempfile
+    import transcript
+    orig = (settings.store_path, settings.transcript_enabled,
+            settings.transcript_keep_days, settings.transcript_max_lines)
+    settings.store_path = tempfile.mkdtemp()
+    settings.transcript_enabled = True
+    settings.transcript_keep_days = 30
+    settings.transcript_max_lines = 5000
+    rid = "!room:ex.org"
+    try:
+        transcript.append(rid, "alice", "前天聊了部署", event_id="$1", ts=time.time() - 2 * 86400)
+        transcript.append(rid, "bot", "对，部署到 pi.lan", ts=time.time() - 2 * 86400 + 1)
+        transcript.append(rid, "alice", "今天的进展", event_id="$2")
+        recs = transcript._read_all(rid)
+        assert [r["body"] for r in recs] == ["前天聊了部署", "对，部署到 pi.lan", "今天的进展"]
+
+        # 派活系统提示里要指向真实日志文件，让 Claude 按需读
+        sp = transcript.augment_system_prompt("BASE", rid)
+        assert sp.startswith("BASE") and transcript.path_for(rid) in sp
+
+        # 保留删旧：超 keep_days 的行被 prune 丢弃，近的留着
+        settings.transcript_keep_days = 1
+        transcript.append(rid, "old", "很久以前", event_id="$old", ts=time.time() - 5 * 86400)
+        transcript._prune(rid)
+        bodies = [r["body"] for r in transcript._read_all(rid)]
+        assert "很久以前" not in bodies and "今天的进展" in bodies
+
+        # 关闭开关：不再落盘、也不注入指引
+        settings.transcript_enabled = False
+        before = len(transcript._read_all(rid))
+        transcript.append(rid, "alice", "关了不该记", event_id="$3")
+        assert len(transcript._read_all(rid)) == before
+        assert transcript.augment_system_prompt("BASE", rid) == "BASE"
+    finally:
+        (settings.store_path, settings.transcript_enabled,
+         settings.transcript_keep_days, settings.transcript_max_lines) = orig
+
+
 # ---------- PR 自动合并：可合并+CI通过(或无CI)+无未决改动 → 合并销账；否则不动 ----------
 def test_pr_automerge():
     import tempfile
@@ -1441,6 +1481,7 @@ TESTS = [
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),
     ("PR 跟进 合并销账/评审派活", test_pr_followup_actions),
+    ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
     ("PR 自动合并 条件满足才合并", test_pr_automerge),
     ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),
 ]

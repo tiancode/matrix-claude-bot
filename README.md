@@ -13,6 +13,7 @@
 - **项目长期记忆**（跨会话/跨重启留存）→ 会话有 TTL，但「当初为什么这么设计、项目约定、长期目标、踩过的坑」这类**值得跨周记住**的事实落在 `store/memory/<项目>/`（一事一文件 + 索引，工作树之外不会被误 commit）；开新会话时按预算注入系统提示，会话被 TTL 清掉也"记得住事"。补「无长程记忆」短板的第一步（详见 `memory.py`）
 - **PR 台账（对结果负责）**→ bot 开了 PR 不撒手：后台轮询该 PR，收到**评审意见**或 **CI 失败**就自动在原分支上处理并推送、把进展回报到当初派活的房间，**合并/关闭才销账**（带自动处理次数上限防空转）。补「fire-and-forget、不跟进」短板（详见 `pr_ledger.py` / `gitea.py`）
 - **主动性·自驱心跳**→ 没人派活时也按 `PROACTIVE_HEARTBEAT_INTERVAL` 巡检各项目（只读），挑一件值得主动推进的事（陈旧 PR、TODO/FIXME、缺测试、小 bug）。默认**只提议**到项目房间等你点头；开 `PROACTIVE_AUTOPILOT=1` 则自己认领、开 PR（开的 PR 自动进台账→被 PR 跟进盯到合并）。补「永远被动、无自驱」短板
+- **聊天历史回溯**（`TRANSCRIPT_ENABLED=1`，默认关）→ 会话有 24h 滑动 TTL、背景缓冲只有最近十几条且重启即清，都答不了「前天我们聊了什么」。开启后按房间把对话**明文**落到 `store/transcripts/<房间>.jsonl`（一行一条 + 保留天数/行数上限滚动删旧），派活时把日志**路径**注入系统提示，让 Claude 被问到更早对话时**自己去读/grep**（与项目记忆同一套"告诉它存哪、按需取"的玩法，不把整段历史塞进每次 prompt）。`/backfill [天数]` 可从 Matrix 时间线回灌开启前的历史；首次启用还会对各房间自动回灌一次。E2EE 下落盘的是收到时的明文，回溯可靠
 - **白名单**（房间 / 用户）、登录态与 E2EE 密钥**持久化**；Claude 会话 id（`store/sessions.json`）与房间→项目路由（`store/last_projects.json`）也落盘，重启后多轮上下文与 `/reset` 仍可用（群聊背景对话与"回复了 bot"识别不持久，重启后清空）
 
 ## 任务分配：一个项目 = 一个 Claude Code worker
@@ -115,6 +116,7 @@ journalctl --user -u matrix-claude -f
 - `bot.py` — Matrix 客户端：登录/持久化、监听消息、触发判断、调 Claude、回发；PR 跟进与自驱心跳两个后台循环
 - `claude_runner.py` — 调 `claude -p`：`ask()` 带工具干活+多轮会话，`quick()` 一次性判断，`consult()` 只读查证
 - `memory.py` — 项目长期记忆：跨会话/跨重启留存的事实库，开新会话时注入系统提示
+- `transcript.py` — 按房间的聊天逐字记录：落盘 + 回溯更早对话 + 从 Matrix 回灌历史
 - `pr_ledger.py` — PR 台账：bot 开过的 PR 记账，跟到合并/关闭才销账（持久化到 `store/pr_ledger.json`）
 - `gitea.py` — Gitea REST 只读小客户端：bot 自己轮询 PR 状态 / 评审 / CI
 - `projects.py` — 房间↔Gitea 仓库的解析/绑定/clone 与路由

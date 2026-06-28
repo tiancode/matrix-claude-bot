@@ -75,6 +75,13 @@ class Settings:
     session_ttl    = _i("SESSION_TTL", 7200)
     max_concurrency = _i("MAX_CONCURRENCY", 2)
 
+    # 聊天逐字记录：按房间把对话明文落盘（store/transcripts/<房间>.jsonl），让 Claude 能回溯
+    # 更早的对话（"前天我们聊了什么"）。补会话 TTL / 背景缓冲都够不着的"远期对话"短板。默认关。
+    transcript_enabled       = _b("TRANSCRIPT_ENABLED", False)
+    transcript_keep_days     = _i("TRANSCRIPT_KEEP_DAYS", 30)     # 保留天数，超期滚动删旧
+    transcript_max_lines     = _i("TRANSCRIPT_MAX_LINES", 5000)   # 每房间行数硬上限，兜底防膨胀
+    transcript_backfill_days = _i("TRANSCRIPT_BACKFILL_DAYS", 30) # 回灌（从 Matrix 拉历史）默认往回多少天
+
     # 项目长期记忆（跨会话 / 跨重启留存，补会话 TTL 之外的"长程记忆"短板）
     memory_enabled       = _b("MEMORY_ENABLED", True)
     memory_recall_budget = _i("MEMORY_RECALL_BUDGET", 6000)   # 注入系统提示的事实正文字符预算

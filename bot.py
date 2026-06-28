@@ -32,6 +32,7 @@ from projects import projects, parse_repo_url, proj_id
 import memory
 import gitea
 import pr_ledger
+import transcript
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("matrix-claude")
@@ -262,6 +263,7 @@ async def send(room_id: str, text: str, track: bool = False):
         if dq:
             ts = max(ts, dq[-1][0])  # 防钟差让回复显示得比刚收到的消息还早
         dq.append((ts, MY_NAME or "bot", text))
+        transcript.append(room_id, MY_NAME or "bot", text, ts=ts)  # bot 自己的回复也进历史
 
 
 def _is_dm(room: MatrixRoom) -> bool:
@@ -426,6 +428,34 @@ async def do_bind(room: MatrixRoom, repo: dict,
         await handle_task(room, event, task_text)
 
 
+async def _backfill_cmd(room: MatrixRoom, body: str):
+    """/backfill [天数]：从 Matrix 时间线回灌本房间在"开启记录前"的历史。"""
+    rid = room.room_id
+    if not settings.transcript_enabled:
+        await send(rid, "聊天历史记录未开启（在 .env 设 TRANSCRIPT_ENABLED=1 再重启）。")
+        return
+    parts = body.split()
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else settings.transcript_backfill_days
+    await send(rid, f"📚 正在从 Matrix 回灌最近 {days} 天的聊天历史…")
+    try:
+        n = await transcript.backfill(client, rid, days)
+        await send(rid, f"✅ 回灌完成，新增 {n} 条历史。之后问我“前天/上次聊了什么”就能回溯了。"
+                        if n else "✅ 没有可回灌的更早历史（可能已灌过、或服务器/加密取不到更早的）。")
+    except Exception as e:
+        log.exception("回灌失败")
+        await send(rid, f"回灌出错：{e}")
+
+
+async def _auto_backfill(room_id: str):
+    """开启记录后首次启动时，对还没灌过的房间静默回灌一次历史（不在房间里刷消息）。"""
+    try:
+        n = await transcript.backfill(client, room_id)
+        if n:
+            log.info("[%s] 历史回灌 %d 条", room_id, n)
+    except Exception:
+        log.exception("历史回灌失败 %s", room_id)
+
+
 async def on_message(room: MatrixRoom, event: RoomMessageText):
     if not settings.process_backlog and not _synced:  # 跳过历史/离线积压
         return
@@ -441,14 +471,18 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
         return
 
     body = _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {}))
+    sender_name = room.user_name(event.sender) or event.sender
     # 用本地接收时刻而非 event.server_timestamp：与 send() 里 bot 回复同一时钟，
     # _format_context 的"间隔"提示才不会因收/发两端时钟偏差算错。
-    _context[room.room_id].append(
-        (time.time(), room.user_name(event.sender) or event.sender, body)
-    )
+    _context[room.room_id].append((time.time(), sender_name, body))
+    transcript.append(room.room_id, sender_name, body, event_id=event.event_id)  # 落盘逐字记录，供回溯
 
     # 用自己账号跑时：消息照进上下文，但无触发词不当派活（否则会去回你发给别人的话）。
     if is_self and not _has_trigger(event.body or ""):
+        return
+
+    if body.strip().lower().startswith("/backfill"):   # 元命令：从 Matrix 回灌本房间历史
+        _spawn(_backfill_cmd(room, body.strip()))
         return
 
     addressed, cleaned = _is_addressed(room, event)
@@ -659,6 +693,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         sp = memory.augment_system_prompt(sp, rec["id"])   # 注入项目长期记忆（跨会话留存）
         prepare = lambda: projects.prepare_worktree(rec)
         _project_last_active[rec["id"]] = time.time()      # 标记活跃：自驱心跳会避让最近在弄的项目
+    sp = transcript.augment_system_prompt(sp, rid)   # 指给它本房间历史日志，便于回溯更早对话
     answer = await runner.ask(_sess_key(rec, rid), prompt, cwd=cwd,
                               system_prompt=sp, lock_key=lock_key, prepare=prepare)
     await send(rid, answer, track=True)
@@ -1120,6 +1155,7 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
         if caption:
             line += f"\n说明：{caption}"
         _context[rid].append((time.time(), sender, line))   # 本地时钟，与文本消息一致
+        transcript.append(rid, sender, line, event_id=getattr(event, "event_id", ""))
 
         # 与文本相同的派活闸：自己账号无触发词不派活
         if is_self and not _has_trigger(event.body or ""):
@@ -1268,6 +1304,10 @@ async def main():
     # 初始同步消化积压（此时 _synced 仍 False，被 on_message 挡掉），之后才处理新消息
     await client.sync(timeout=30000, full_state=True)
     _synced = True
+    if settings.transcript_enabled:   # 首次启用记录：对没灌过的房间各回灌一次历史（一次性，有标记不重复）
+        for rid in list(client.rooms):
+            if not transcript.is_backfilled(rid):
+                _spawn(_auto_backfill(rid))
     _spawn(_pr_followup_loop())   # 后台盯台账里的 PR，跟到合并
     _spawn(_heartbeat_loop())     # 后台自驱心跳：没人派活时也巡检找事
     await client.sync_forever(timeout=30000, full_state=False)
