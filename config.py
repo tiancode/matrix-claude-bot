@@ -75,6 +75,10 @@ class Settings:
     session_ttl    = _i("SESSION_TTL", 7200)
     max_concurrency = _i("MAX_CONCURRENCY", 2)
 
+    # 项目长期记忆（跨会话 / 跨重启留存，补会话 TTL 之外的"长程记忆"短板）
+    memory_enabled       = _b("MEMORY_ENABLED", True)
+    memory_recall_budget = _i("MEMORY_RECALL_BUDGET", 6000)   # 注入系统提示的事实正文字符预算
+
     # 媒体（图片 / 文件 / 音视频）
     media_enabled  = _b("MEDIA_ENABLED", True)
     media_root     = _s("MEDIA_ROOT") or os.path.join(os.path.abspath(projects_root), "_media")

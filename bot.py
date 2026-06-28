@@ -29,6 +29,7 @@ from nio import (
 from config import settings, redact, register_secret
 from claude_runner import runner
 from projects import projects, parse_repo_url, proj_id
+import memory
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("matrix-claude")
@@ -652,6 +653,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         # 会话 key 带房间维度（互不串台）；lock_key 用 proj_id（同一 checkout 串行）；
         # 跑任务前先把工作树拉回干净 base，免得上个任务的脏树/残留分支污染这次。
         sp, cwd, lock_key = _employee_prompt(rec), rec["path"], rec["id"]
+        sp = memory.augment_system_prompt(sp, rec["id"])   # 注入项目长期记忆（跨会话留存）
         prepare = lambda: projects.prepare_worktree(rec)
     answer = await runner.ask(_sess_key(rec, rid), prompt, cwd=cwd,
                               system_prompt=sp, lock_key=lock_key, prepare=prepare)

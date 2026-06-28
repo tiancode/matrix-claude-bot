@@ -1145,6 +1145,45 @@ def test_sessions_persisted_across_restart():
         settings.store_path = orig
 
 
+def test_project_memory():
+    """项目长期记忆：写入→索引→召回→注入系统提示，且按项目隔离、跨"会话"留存、防穿越。"""
+    import memory
+    pid = "pi.lan:3000/team/app"
+    assert memory.recall(pid) == ""                       # 初始无记忆
+
+    p = memory.remember(pid, "基线分支约定",
+                        "本项目以 main 为基线分支，发布走 tag，不直接往 main push。",
+                        description="基线/发布约定")
+    assert p and os.path.exists(p)                         # 事实落了文件
+
+    d = memory.proj_dir(pid)
+    idx = open(os.path.join(d, "MEMORY.md")).read()
+    assert "基线分支约定.md" in idx                         # 索引登记了
+
+    r = memory.recall(pid)
+    assert "以 main 为基线分支" in r                        # 召回带正文
+
+    # 注入系统提示：原文保留 + 目录路径 + 召回内容都在；重复调用（模拟开新会话）仍拿得到 → 不随 TTL 蒸发
+    sp = memory.augment_system_prompt("原始系统提示", pid)
+    assert "原始系统提示" in sp and d in sp and "以 main 为基线分支" in sp
+    assert "原始系统提示" in memory.augment_system_prompt("原始系统提示", pid)
+
+    # 同一事实再写一次：索引不重复加（订正而非堆叠）
+    memory.remember(pid, "基线分支约定", "改：基线分支仍是 main，补充 hotfix 从 tag 拉。")
+    assert open(os.path.join(d, "MEMORY.md")).read().count("基线分支约定.md") == 1
+
+    assert memory.recall("pi.lan:3000/team/other") == ""   # 别的项目读不到（不串台）
+    assert ".." not in os.path.basename(memory.proj_dir("../../etc/passwd"))  # 路径穿越被消毒
+
+    # 关掉开关时不注入
+    orig = settings.memory_enabled
+    try:
+        settings.memory_enabled = False
+        assert memory.augment_system_prompt("X", pid) == "X"
+    finally:
+        settings.memory_enabled = orig
+
+
 TESTS = [
     ("启动+群任务全链路", test_startup_and_task_flow),
     ("认 reply / 点名", test_reply_addressing),
@@ -1189,6 +1228,7 @@ TESTS = [
     ("触发词按词边界匹配", test_trigger_word_boundary),
     ("会话落盘重启可恢复", test_sessions_persisted_across_restart),
     ("DM 一般性问题当通用助手答", test_dm_general_question),
+    ("项目长期记忆 跨会话留存", test_project_memory),
 ]
 
 
