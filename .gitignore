@@ -1,0 +1,12 @@
+# 凭证与本地状态——绝不能进版本库
+# 注意：.gitignore 不支持行内注释（`store/ # 说明` 会被当成字面路径名而失效），注释必须单独成行。
+.env
+# store/：credentials.json（Matrix token）、bindings.json、sessions.json、E2EE 密钥(.db)
+store/
+# projects/：clone 下来的仓库，其 .git/config 内嵌了 GITEA_TOKEN；还有 _scratch / _media
+projects/
+
+# Python
+.venv/
+__pycache__/
+*.pyc

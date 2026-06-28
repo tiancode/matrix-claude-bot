@@ -1,0 +1,5 @@
+matrix-nio>=0.25
+python-dotenv>=1.0
+markdown>=3.5
+bleach>=6.0          # 消毒外发富文本 HTML；缺它则退回纯文本
+# E2EE（加密房间）：先装系统 libolm，再 pip install "matrix-nio[e2e]"，并设 MATRIX_ENABLE_E2E=1
