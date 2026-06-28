@@ -111,7 +111,8 @@ def test_startup_and_task_flow():
                     break
                 await asyncio.gather(*pending, return_exceptions=True)
 
-    async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None):
+    async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
+                       on_delta=None, cancel_key=None):
         captured["prompt"], captured["key"], captured["lock_key"] = prompt, key, lock_key
         return "已改好并提了 PR：https://gitea.example.com/team/app/pulls/7"
 
@@ -231,7 +232,7 @@ def test_ttl_notice():
     async def run():
         r = claude_runner.ClaudeRunner()
 
-        async def fake_run(cmd, cwd=None):
+        async def fake_run(cmd, cwd=None, on_proc=None):
             return 0, json.dumps({"result": "ok", "session_id": "s",
                                   "is_error": False}).encode(), b""
 
@@ -385,7 +386,7 @@ def test_retry_only_on_session_error():
             r = claude_runner.ClaudeRunner()
             calls = {"n": 0}
 
-            async def fake_run(cmd, cwd=None):
+            async def fake_run(cmd, cwd=None, on_proc=None):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     return 1, b"", err_text                   # 第一次失败
@@ -1007,7 +1008,8 @@ def test_run_on_project_skips_media_line():
     captured = {}
 
     class R:
-        async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None):
+        async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
+                      on_delta=None, cancel_key=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -1503,8 +1505,180 @@ def test_pr_automerge():
         _reset_ledger()
 
 
+def _drain_and_run(coro):
+    """跑一个协程，并把它 _spawn 出的后台任务收割干净（命令类走 _spawn）。"""
+    async def go():
+        await coro
+        for _ in range(50):
+            pending = [t for t in bot._tasks if not t.done()]
+            if not pending:
+                break
+            await asyncio.gather(*pending, return_exceptions=True)
+    asyncio.run(go())
+
+
+class _CapClient:
+    """记下所有 room_send 的完整 content（不只 body），供线程/编辑/附件断言。"""
+    def __init__(self):
+        self.sent = []
+        self.uploaded = []
+
+    async def room_typing(self, *a, **k):
+        return None
+
+    async def join(self, rid):
+        return None
+
+    async def room_send(self, rid, mt, content, **k):
+        self.sent.append(content)
+        return types.SimpleNamespace(event_id="$e%d" % len(self.sent))
+
+    async def upload(self, provider, content_type="application/octet-stream",
+                     filename=None, encrypt=False, filesize=None):
+        f = provider(0, 0); f.read(); f.close()      # 确认文件真被读取
+        self.uploaded.append((filename, content_type, encrypt))
+        return types.SimpleNamespace(content_uri="mxc://ex.org/up%d" % len(self.uploaded)), None
+
+
+# ---------- 新增能力 1) 线程化回复 ----------
+def test_thread_helpers_and_send():
+    set_identity()
+    assert bot._thread_root_of(make_event("hi", event_id="$root1")) == "$root1"     # 不在线程→自身作根
+    in_thread = types.SimpleNamespace(event_id="$x", source={"content": {
+        "m.relates_to": {"rel_type": "m.thread", "event_id": "$realroot"}}})
+    assert bot._thread_root_of(in_thread) == "$realroot"                            # 已在线程→沿用根
+    rel = bot._thread_rel("$r", "$prev")
+    assert rel["rel_type"] == "m.thread" and rel["event_id"] == "$r"
+    assert rel["m.in_reply_to"]["event_id"] == "$prev" and rel["is_falling_back"] is True
+    assert bot._thread_rel(None) is None
+
+    c = _CapClient(); bot.client = c
+    asyncio.run(bot.send("!r:ex.org", "答复", thread_root="$root"))
+    assert c.sent[0]["m.relates_to"]["rel_type"] == "m.thread"                      # 传了 root → 挂线程
+    assert c.sent[0]["m.relates_to"]["event_id"] == "$root"
+    c.sent.clear()
+    asyncio.run(bot.send("!r:ex.org", "答复"))
+    assert "m.relates_to" not in c.sent[0]                                          # 不传 → 顶层
+
+
+def test_group_task_reply_threaded():
+    set_identity()
+    c = _CapClient(); bot.client = c
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
+    bot.projects.get_room = lambda rid: rec
+    async def fake_ensure(info):
+        return rec
+    bot.projects.ensure_project = fake_ensure
+    async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
+                       on_delta=None, cancel_key=None):
+        return "搞定"
+    bot.runner.ask = fake_ask
+    room = FakeRoom("!g2:ex.org", 3)
+    ev = make_event("@claude-bot 干活", mentions=["@claudebot:ex.org"], event_id="$Q")
+    orig = settings.stream_replies; settings.stream_replies = False
+    try:
+        asyncio.run(bot.handle_task(room, ev, "干活"))
+    finally:
+        settings.stream_replies = orig
+    ans = [m for m in c.sent if m.get("body") == "搞定"]
+    assert ans and ans[0]["m.relates_to"]["rel_type"] == "m.thread"
+    assert ans[0]["m.relates_to"]["event_id"] == "$Q"                              # 群里挂到提问那条
+
+
+# ---------- 新增能力 2) /help + 进房欢迎 ----------
+def test_help_and_welcome():
+    set_identity(); bot._synced = True
+    c = _CapClient(); bot.client = c
+    _drain_and_run(bot.on_message(FakeRoom("!h:ex.org", 3), make_event("/help", event_id="$h")))
+    assert any("我能干嘛" in (m.get("body") or "") for m in c.sent)
+    c.sent.clear()
+    inv = types.SimpleNamespace(state_key=bot.MY_ID, membership="invite", sender="@x:ex.org")
+    asyncio.run(bot.on_invite(FakeRoom("!inv:ex.org", 2), inv))
+    assert any("/help" in (m.get("body") or "") for m in c.sent)                   # 进房打招呼指到 /help
+
+
+# ---------- 新增能力 3) /summarize ----------
+def test_summarize_command():
+    set_identity(); bot._synced = True
+    c = _CapClient(); bot.client = c
+    cap = {}
+    async def fake_quick(prompt):
+        cap["p"] = prompt
+        return "• 聊了登录\n• 待办：修 token"
+    bot.runner.quick = fake_quick
+    bot._context["!s:ex.org"].clear()
+    bot._context["!s:ex.org"].append((time.time(), "Alice", "登录会掉线"))
+    bot._context["!s:ex.org"].append((time.time(), "Bob", "明天修"))
+    orig = settings.transcript_enabled; settings.transcript_enabled = False
+    try:
+        _drain_and_run(bot.on_message(FakeRoom("!s:ex.org", 3), make_event("/summarize 10", event_id="$sm")))
+    finally:
+        settings.transcript_enabled = orig
+    assert any("最近对话小结" in (m.get("body") or "") for m in c.sent)
+    assert "登录会掉线" in cap["p"] and "/summarize" not in cap["p"]               # 带上下文、且不含命令本身
+
+
+# ---------- 新增能力 4) /cancel ----------
+def test_cancel_command():
+    set_identity(); bot._synced = True
+    c = _CapClient(); bot.client = c
+    calls = []
+    bot.runner.cancel = lambda rid: (calls.append(rid) or 1)
+    _drain_and_run(bot.on_message(FakeRoom("!c:ex.org", 3), make_event("/cancel", event_id="$cx")))
+    assert calls == ["!c:ex.org"] and any("已停止" in (m.get("body") or "") for m in c.sent)
+    calls.clear(); c.sent.clear()
+    bot.runner.cancel = lambda rid: 0
+    _drain_and_run(bot.on_message(FakeRoom("!c:ex.org", 3), make_event("/cancel", event_id="$cx2")))
+    assert any("没有正在运行" in (m.get("body") or "") for m in c.sent)
+
+
+# ---------- 新增能力 5) 附件回传 ----------
+def test_emit_files_allowed_blocked_stripped():
+    set_identity()
+    import tempfile
+    d = tempfile.mkdtemp(prefix="mxbot-files-")
+    fp = os.path.join(d, "chart.png")
+    with open(fp, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+    c = _CapClient(); bot.client = c
+    room = FakeRoom("!f:ex.org", 2)
+    orig = settings.send_files_back; settings.send_files_back = True
+    try:
+        ans = asyncio.run(bot._emit_files(
+            room, f"做好了\n[[send-file: {fp}]]\n外部 [[send-file: /etc/hostname]]", d, "$root"))
+    finally:
+        settings.send_files_back = orig
+    assert "send-file" not in ans                                                  # 标记被抹掉
+    assert c.uploaded and c.uploaded[0][0] == "chart.png" and c.uploaded[0][1].startswith("image/")
+    imgs = [m for m in c.sent if m.get("msgtype") == "m.image"]
+    assert imgs and imgs[0]["m.relates_to"]["rel_type"] == "m.thread"              # 附件也挂线程
+    assert "不在允许目录内" in ans                                                 # /etc/... 被拦
+    assert bot._within_allowed(fp, d) and not bot._within_allowed("/etc/hostname", d)
+
+
+# ---------- 新增能力 6) 流式：占位→编辑→定稿 ----------
+def test_live_reply_streams_and_finalizes():
+    set_identity()
+    c = _CapClient(); bot.client = c
+    live = bot._LiveReply("!lr:ex.org", thread_root="$root")
+    async def go():
+        await live.on_delta("正在看代码", None)        # 建占位（带线程）
+        await live.finalize("最终答复", track=False)    # 定稿成 m.replace 编辑
+    asyncio.run(go())
+    assert c.sent[0]["m.relates_to"]["rel_type"] == "m.thread"                     # 占位挂线程
+    edits = [m for m in c.sent if m.get("m.relates_to", {}).get("rel_type") == "m.replace"]
+    assert edits and edits[-1]["m.new_content"]["body"] == "最终答复"             # 编辑成最终答复
+
+
 TESTS = [
     ("启动+群任务全链路", test_startup_and_task_flow),
+    ("线程化回复 helper+send", test_thread_helpers_and_send),
+    ("群任务答复挂线程", test_group_task_reply_threaded),
+    ("/help + 进房欢迎", test_help_and_welcome),
+    ("/summarize 小结最近对话", test_summarize_command),
+    ("/cancel 停当前任务", test_cancel_command),
+    ("附件回传 允许/拦截/抹标记", test_emit_files_allowed_blocked_stripped),
+    ("流式 占位→编辑→定稿", test_live_reply_streams_and_finalizes),
     ("认 reply / 点名", test_reply_addressing),
     ("引用回退块剥离", test_reply_fallback_strip),
     ("track 门控 + 时间单调", test_track_and_monotonic),

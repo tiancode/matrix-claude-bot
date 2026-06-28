@@ -50,6 +50,14 @@ class Settings:
     # 群里"对话延续窗口"（秒）：你 @ 过 bot 后，这段时间内你的后续消息**免重复 @** 也当成续话
     # 直接接着干（多轮里不用每句都点名）。@了别人则不算续话。0=关。默认 180。
     group_followup_window = _i("GROUP_FOLLOWUP_WINDOW", 180)
+    # 群里把回复挂到提问那条消息的【线程(m.thread)】里，多话题并行时答复不串台。私聊不挂线程。默认开。
+    reply_in_thread = _b("REPLY_IN_THREAD", True)
+    # 流式：发占位消息后随 Claude 产出**边生成边编辑**同一条消息，长任务不再全程静默。默认开。
+    stream_replies = _b("STREAM_REPLIES", True)
+    # 允许把【工作目录内】的文件作为附件回传（Claude 在回复里写 [[send-file: 路径]] 标记触发）。默认开。
+    send_files_back = _b("SEND_FILES_BACK", True)
+    # /summarize 不带参数时默认回看多少条对话。
+    summary_lines = _i("SUMMARY_LINES", 60)
     trigger_phrase = _s("TRIGGER_PHRASE")
     context_lines  = _i("CONTEXT_LINES", 20)
     process_backlog = _b("PROCESS_BACKLOG", False)

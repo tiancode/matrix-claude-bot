@@ -136,6 +136,12 @@ def append(room: str, sender: str, body: str,
     _maybe_prune(room)
 
 
+def tail(room: str, n: int) -> list[dict]:
+    """返回本房间最近 n 条记录（按时间先后），供 /summarize 追更小结用。无记录返回空表。"""
+    recs = _read_all(room)
+    return recs[-max(1, n):] if recs else []
+
+
 def _dedup_sort(records: list[dict]) -> list[dict]:
     records.sort(key=lambda r: r.get("ts", 0))
     seen, out = set(), []
