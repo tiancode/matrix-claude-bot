@@ -130,15 +130,18 @@ def test_startup_and_task_flow():
     bot.runner.ask = fake_ask
 
     orig_allow = settings.allow_users
-    orig_pf = settings.pr_followup_enabled               # 关掉 PR 跟进守护循环，否则它会 sleep 住任务回收
+    orig_pf = settings.pr_followup_enabled               # 关掉守护循环（PR 跟进 / 自驱心跳），否则会 sleep 住任务回收
+    orig_hb = settings.proactive_heartbeat_enabled
     settings.allow_users = ["@alice:ex.org"]            # fail-closed：须显式授权派活人
     settings.pr_followup_enabled = False
+    settings.proactive_heartbeat_enabled = False
     bot._context["!g:ex.org"].clear()
     try:
         asyncio.run(bot.main())
     finally:
         settings.allow_users = orig_allow
         settings.pr_followup_enabled = orig_pf
+        settings.proactive_heartbeat_enabled = orig_hb
 
     assert bot.MY_ID == "@claudebot:ex.org" and bot.MY_NAME == "claude-bot"
     assert captured["key"] == "gitea.example.com/team/app|!g:ex.org"    # 会话按项目+房间（不串台）
@@ -1204,6 +1207,42 @@ def _reset_ledger():
     pr_ledger._loaded = False
 
 
+# ---------- 自驱心跳：PASS 不打扰；有建议→提议；autopilot→派执行 ----------
+def test_heartbeat_propose_and_autopilot():
+    set_identity()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent, spawned = [], []
+
+    class R:
+        def __init__(self, reply): self.reply = reply
+        async def consult(self, prompt, cwd=None, system_prompt=None): return self.reply
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.runner, bot.client, bot._spawn, settings.proactive_autopilot)
+    bot.client = FC()
+    bot._spawn = lambda coro: (spawned.append(1), coro.close())
+    try:
+        bot.runner = R("__PASS__")                       # 没值得做的 → 不发言、不派活
+        settings.proactive_autopilot = False
+        asyncio.run(bot._heartbeat_one(rec, "!room"))
+        assert not sent and not spawned
+
+        bot.runner = R("建议：给 X 补个单元测试")          # 有建议 + autopilot 关 → 只提议
+        asyncio.run(bot._heartbeat_one(rec, "!room"))
+        assert any("巡检建议" in m for m in sent) and not spawned
+
+        sent.clear()
+        bot.runner = R("建议：给 X 补个单元测试")          # 有建议 + autopilot 开 → 宣布开干并派执行
+        settings.proactive_autopilot = True
+        asyncio.run(bot._heartbeat_one(rec, "!room"))
+        assert spawned and any("自驱" in m for m in sent)
+    finally:
+        (bot.runner, bot.client, bot._spawn, settings.proactive_autopilot) = orig
+
+
 # ---------- PR 台账：登记/去重/更新/销账 + 持久化 ----------
 def test_pr_ledger():
     import tempfile
@@ -1333,6 +1372,7 @@ TESTS = [
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),
     ("PR 跟进 合并销账/评审派活", test_pr_followup_actions),
+    ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),
 ]
 
 

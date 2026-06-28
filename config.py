@@ -84,6 +84,12 @@ class Settings:
     pr_followup_interval = _i("PR_FOLLOWUP_INTERVAL", 180)   # 轮询间隔（秒）
     pr_autofix_max       = _i("PR_AUTOFIX_MAX", 3)           # 每个 PR 自动改评审/CI 的次数上限，防反复失败空转
 
+    # 主动性·自驱心跳：没人派活时也巡检各项目、主动找值得做的事
+    proactive_heartbeat_enabled  = _b("PROACTIVE_HEARTBEAT_ENABLED", True)
+    proactive_heartbeat_interval = _i("PROACTIVE_HEARTBEAT_INTERVAL", 3600)  # 巡检间隔（秒），别太密以免烧钱/打扰
+    # 0=只读巡检 + 提议（默认，安全）；1=autopilot：直接认领、开 PR（无人值守自主行动，慎开）
+    proactive_autopilot          = _b("PROACTIVE_AUTOPILOT", False)
+
     # 媒体（图片 / 文件 / 音视频）
     media_enabled  = _b("MEDIA_ENABLED", True)
     media_root     = _s("MEDIA_ROOT") or os.path.join(os.path.abspath(projects_root), "_media")

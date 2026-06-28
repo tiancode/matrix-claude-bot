@@ -209,6 +209,13 @@ class Projects:
         pid = self._rooms.get(room_id)
         return self._projects.get(pid) if pid else None
 
+    def first_room_for(self, pid: str) -> str | None:
+        """绑定到该项目的第一个群房间（给自驱心跳找个"汇报口"）；没有返回 None。"""
+        for room, p in self._rooms.items():
+            if p == pid:
+                return room
+        return None
+
     # ---- 登记 / 绑定 ----
     def _pid_lock(self, pid: str) -> asyncio.Lock:
         return self._pid_locks.setdefault(pid, asyncio.Lock())
