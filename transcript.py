@@ -19,6 +19,7 @@ import re
 import time
 
 from config import settings
+from storage import atomic_write_text
 
 log = logging.getLogger("matrix-claude.transcript")
 
@@ -83,13 +84,9 @@ def _read_all(room: str) -> list[dict]:
 
 def _write_all(room: str, records: list[dict]) -> None:
     path = path_for(room)
-    tmp = path + ".tmp"
     try:
-        os.makedirs(_root(), exist_ok=True)
-        with open(tmp, "w") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        os.replace(tmp, path)
+        atomic_write_text(
+            path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records))
     except OSError as e:
         log.warning("聊天记录落盘失败 %s: %s", path, e)
 

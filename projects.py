@@ -9,6 +9,7 @@ import signal
 from urllib.parse import urlparse, urlsplit
 
 from config import settings, redact
+from storage import atomic_write_json
 
 log = logging.getLogger("matrix-claude.projects")
 
@@ -188,15 +189,10 @@ class Projects:
             return {}
 
     def _save(self):
-        os.makedirs(os.path.dirname(self.bindings_path), exist_ok=True)
-        # 原子写：临时文件 + fsync + rename
-        tmp = self.bindings_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"projects": self._projects, "rooms": self._rooms},
-                      f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.bindings_path)
+        # 原子写 + fsync：绑定是重启后定位项目的底账，值得多一道刷盘
+        atomic_write_json(self.bindings_path,
+                          {"projects": self._projects, "rooms": self._rooms},
+                          indent=2, fsync=True)
 
     # ---- 查询 ----
     def list_projects(self) -> list[dict]:

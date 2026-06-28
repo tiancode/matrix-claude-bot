@@ -10,6 +10,7 @@ import os
 import time
 
 from config import settings
+from storage import atomic_write_json
 
 log = logging.getLogger("matrix-claude.pr_ledger")
 
@@ -39,11 +40,7 @@ def _load() -> None:
 
 def _save() -> None:
     try:
-        os.makedirs(settings.store_path, exist_ok=True)
-        tmp = _path() + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(_data, f, ensure_ascii=False)
-        os.replace(tmp, _path())
+        atomic_write_json(_path(), _data)
     except OSError as e:
         log.warning("PR 台账落盘失败: %s", e)
 

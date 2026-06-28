@@ -13,6 +13,7 @@ import signal
 import time
 
 from config import settings, redact
+from storage import atomic_write_json
 
 log = logging.getLogger("matrix-claude.runner")
 
@@ -89,11 +90,8 @@ class ClaudeRunner:
         # 原子写；调用点都在事件循环里且无 await，对其它协程是原子的，不会丢更新
         path = self._sessions_file()
         try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({k: [sid, ts] for k, (sid, ts) in self._sessions.items()}, f)
-            os.replace(tmp, path)
+            atomic_write_json(
+                path, {k: [sid, ts] for k, (sid, ts) in self._sessions.items()})
         except OSError as e:
             log.warning("会话持久化失败 %s: %s", path, e)
 
@@ -369,17 +367,20 @@ class ClaudeRunner:
                         self._active.pop(ckey, None)
                 self._cancel_req.discard(ckey)
 
-    async def quick(self, prompt: str) -> str:
-        """一次性纯文本判断，不带危险权限、不复用会话。"""
-        rc, out, err = await self._run(self._cmd(prompt, None, agentic=False),
-                                       sema=self._quick_sema, env=_quick_env(),
-                                       timeout=settings.quick_timeout)
+    async def _oneshot(self, cmd: list[str], cwd: str | None = None) -> str:
+        """跑一次性纯文本判断（quick / consult 共用）：短超时、独立并发池、剔密钥环境，不复用会话。"""
+        rc, out, err = await self._run(cmd, cwd=cwd, sema=self._quick_sema,
+                                       env=_quick_env(), timeout=settings.quick_timeout)
         if rc != 0:
             raise RuntimeError(f"claude 退出码 {rc}: {redact(err.decode(errors='ignore'))[:300]}")
         result, _, is_err = self._parse(out)
         if is_err:
             raise RuntimeError(f"claude: {redact(result)}")
         return result
+
+    async def quick(self, prompt: str) -> str:
+        """一次性纯文本判断，不带危险权限、不复用会话。"""
+        return await self._oneshot(self._cmd(prompt, None, agentic=False))
 
     def _cmd_ro(self, prompt: str, system_prompt: str | None = None) -> list[str]:
         """只读 agentic 命令：plan 模式能读代码但不会改/提交，用于主动插话在仓库里查证。"""
@@ -396,15 +397,7 @@ class ClaudeRunner:
                       system_prompt: str | None = None) -> str:
         """在仓库里【只读】地判断/回答（主动插话用）：plan 模式不会改动代码，不复用会话、剔密钥。
         让主动插话在绑了仓库的群里也能看着真实代码作答，而不是凭空瞎猜。"""
-        rc, out, err = await self._run(self._cmd_ro(prompt, system_prompt), cwd=cwd,
-                                       sema=self._quick_sema, env=_quick_env(),
-                                       timeout=settings.quick_timeout)
-        if rc != 0:
-            raise RuntimeError(f"claude 退出码 {rc}: {redact(err.decode(errors='ignore'))[:300]}")
-        result, _, is_err = self._parse(out)
-        if is_err:
-            raise RuntimeError(f"claude: {redact(result)}")
-        return result
+        return await self._oneshot(self._cmd_ro(prompt, system_prompt), cwd=cwd)
 
 
 runner = ClaudeRunner()

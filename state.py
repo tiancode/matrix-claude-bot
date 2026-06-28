@@ -12,6 +12,7 @@ from collections import deque, defaultdict
 from nio import AsyncClient
 
 from config import settings
+from storage import atomic_write_json
 
 # E2EE 是否可用（需系统 libolm + matrix-nio[e2e]）
 try:
@@ -69,10 +70,6 @@ def _load_last_projects() -> None:
 
 def _save_last_projects() -> None:
     try:
-        os.makedirs(settings.store_path, exist_ok=True)
-        tmp = _last_proj_file() + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(_last_project_by_room, f, ensure_ascii=False)
-        os.replace(tmp, _last_proj_file())
+        atomic_write_json(_last_proj_file(), _last_project_by_room)
     except OSError:
         pass

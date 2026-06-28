@@ -141,4 +141,5 @@ journalctl --user -u matrix-claude -f
 - `gitea.py` — Gitea REST 只读小客户端：bot 自己轮询 PR 状态 / 评审 / CI
 - `projects.py` — 房间↔Gitea 仓库的解析/绑定/clone 与路由
 - `config.py` — 读取 `.env` 的全部开关
+- `storage.py` — 原子落盘小工具（写 `.tmp` + `os.replace`）；纯 stdlib 叶子，被 `projects` / `pr_ledger` / `state` / `claude_runner` / `transcript` / `memory` 共用
 - `tests/smoke.py` — 离线冒烟自检

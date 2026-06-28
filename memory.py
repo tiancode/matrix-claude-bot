@@ -18,6 +18,7 @@ import re
 import time
 
 from config import settings
+from storage import atomic_write_text
 
 log = logging.getLogger("matrix-claude.memory")
 
@@ -88,10 +89,7 @@ def remember(project_id: str, name: str, body: str,
         path = os.path.join(d, f"{slug}.md")
         fm = (f"---\nname: {slug}\ndescription: {description or name}\n"
               f"type: {mtype}\ncreated: {time.strftime('%Y-%m-%d')}\n---\n\n")
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(fm + body.rstrip() + "\n")
-        os.replace(tmp, path)
+        atomic_write_text(path, fm + body.rstrip() + "\n")
         _append_index(d, slug, description or name)
         return path
     except OSError as e:
