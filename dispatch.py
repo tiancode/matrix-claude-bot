@@ -7,6 +7,7 @@ from config import settings
 from state import _last_project_by_room
 from matrix_io import send, _is_dm
 from fmt import _format_context
+from addressing import _strip_reply_fallback
 from projects import projects, parse_repo_url
 from claude_runner import runner
 
@@ -88,9 +89,12 @@ def _general_rec() -> dict:
 
 
 
-async def _dispatch(room: MatrixRoom, event: RoomMessageText, text: str) -> dict | None:
+async def _dispatch(room: MatrixRoom, event: RoomMessageText, text: str,
+                    skip_body: str | None = None) -> dict | None:
     """决定这条消息归到哪个项目。返回项目记录（general=True 表示当通用助手答）；
-    None=已就地回复/提问，不再继续。"""
+    None=已就地回复/提问，不再继续。
+    skip_body：当前消息在背景上下文里的原文（媒体与 event.body 不同，由调用方传），
+    分诊带背景时把它剔掉，别让 _triage 把同一条消息看两遍。"""
     rid = room.room_id
 
     if not _is_dm(room):  # 群：用房间绑定
@@ -111,7 +115,10 @@ async def _dispatch(room: MatrixRoom, event: RoomMessageText, text: str) -> dict
         return await projects.ensure_project(exact)
     if not known:                                # 3) 还没有任何已知项目：当通用助手答一般性问题
         return _general_rec()                     #    （要做某仓库的活，欢迎语已指引发 Gitea 地址来绑定）
-    pid = await _triage(text, known, _format_context(rid))   # 4) 轻量分诊（带最近对话）
+    sender = room.user_name(event.sender) or event.sender    # 4) 轻量分诊（带最近对话，剔除当前这条）
+    cur = (skip_body if skip_body is not None
+           else _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {})))
+    pid = await _triage(text, known, _format_context(rid, skip=(sender, cur)))
     if pid == TRIAGE_GENERAL:                  # 一般性问题：直接当通用助手答，不必非得挂到某个项目
         return _general_rec()
     if pid:

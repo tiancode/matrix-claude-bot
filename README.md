@@ -11,7 +11,8 @@
 - **流式·渐进输出**（`STREAM_REPLIES`，默认开）→ 走 `claude --output-format stream-json`，发一条占位消息后随产出**边生成边编辑**它（节流），长任务不再全程静默；定稿时替换为完整答复，超长再分块续接
 - **附件回传**（`SEND_FILES_BACK`，默认开）→ Claude 在回复里写一行 `[[send-file: 路径]]`，bot 就把对应文件作为附件（图片/文件/音视频）上传发回（加密房间走加密上传），并从文字里抹掉标记；**仅限工作目录/媒体/scratch/projects 之内**的文件，挡掉越权外泄
 - **catch-up 小结** → `/summarize [N]` 让 Claude 把最近 N 条对话（默认 `SUMMARY_LINES=60`，优先读逐字记录）做个分点小结：聊了啥、有何结论、还有哪些待办
-- **随时叫停** → `/cancel`（`/stop`/`停止`/`取消`）杀掉本房间正在跑的任务（连子进程一起），回报"已停止"而非"出错"
+- **随时叫停** → `/cancel`（`/stop`/`停止`/`取消`）杀掉本房间正在跑的任务（连子进程一起，含自驱/PR 跟进任务），回报"已停止"而非"出错"
+- **状态一屏可见** → `/status`（`状态`）看本房间视角的运行状态：绑到哪个项目、有没有任务在跑、在跟哪些 PR（各自动处理了几次）、多轮会话多久前活跃、主动插话/自驱心跳开关
 - **上手引导** → 进房自动打招呼并指到 `/help`；`/help` 列出能力 + 命令（群里不必 @ 也认这些元命令）
 - **PROACTIVE 模式**（默认开）→ 不被 @ 时也对群消息先让 Claude 判断该不该插话——既包括**有人求助**，也包括**对话里出现明显错误/有风险的做法值得纠正**（同事聊错了你能开口指正），带冷却 + 强 `__PASS__` 倾向防刷屏；群已绑仓库时用**只读**方式看着真实代码作答（不会改代码/开 PR）。默认 `PROACTIVE_REQUIRE_HINT=0`：对每条群消息都判断（抓"没人求助但话里有错"）；设 =1 则只看含求助/报错词的消息（更省判断调用）。要收敛打扰：调大 `PROACTIVE_COOLDOWN`，或 `PROACTIVE=0` 关掉
 - **图片 / 文件 / 多媒体** → 自动下载（加密房间会解密）存到本地并在上下文标注；被 @ 时把文件路径交给 Claude 读取/分析
@@ -21,7 +22,7 @@
 - **主动性·自驱心跳**→ 没人派活时也按 `PROACTIVE_HEARTBEAT_INTERVAL` 巡检各项目（只读），挑一件值得主动推进的事（陈旧 PR、TODO/FIXME、缺测试、小 bug）。**默认 autopilot**（`PROACTIVE_AUTOPILOT=1`）：自己认领、开 PR（开的 PR 自动进台账→被 PR 跟进盯到合并）；设 `PROACTIVE_AUTOPILOT=0` 则只提议到项目房间等你点头（更安全、不自动改）。补「永远被动、无自驱」短板
 - **聊天历史回溯**（`TRANSCRIPT_ENABLED`，默认开）→ 会话有 24h 滑动 TTL、背景缓冲只有最近十几条且重启即清，都答不了「前天我们聊了什么」。开启后按房间把对话**明文**落到 `store/transcripts/<房间>.jsonl`（一行一条 + 保留天数/行数上限滚动删旧），派活时把日志**路径**注入系统提示，让 Claude 被问到更早对话时**自己去读/grep**（与项目记忆同一套"告诉它存哪、按需取"的玩法，不把整段历史塞进每次 prompt）。`/backfill [天数]` 可从 Matrix 时间线回灌开启前的历史；首次启用还会对各房间自动回灌一次。E2EE 下落盘的是收到时的明文，回溯可靠
 - **多轮·对话延续**→ 单聊每条必回；群里被 @ / 回复 bot / 命中触发词触发，且 `GROUP_FOLLOWUP_WINDOW` 秒内你的后续消息**免重复 @**也接着处理（@ 别人则不算，避免插话到你和别人的对话）
-- 登录态与 E2EE 密钥**持久化**；Claude 会话 id（`store/sessions.json`）与房间→项目路由（`store/last_projects.json`）也落盘，重启后多轮上下文与 `/reset` 仍可用（群聊背景对话、"回复了 bot"识别、对话延续窗口不持久，重启后清空）
+- 登录态与 E2EE 密钥**持久化**；Claude 会话 id（`store/sessions.json`）与房间→项目路由（`store/last_projects.json`）也落盘，重启后多轮上下文与 `/reset` 仍可用；"回复了 bot"识别重启后会向服务器**补认**被回复消息的发送者（回复 bot 的旧消息照样算点名）。群聊背景对话、对话延续窗口不持久，重启后清空
 
 ## 任务分配：一个项目 = 一个 Claude Code worker
 
@@ -129,7 +130,7 @@ journalctl --user -u matrix-claude -f
 - `matrix_io.py` — 收发：分块发送、线程化(m.thread)、流式占位与编辑(m.replace)、正在输入、附件上传(`_LiveReply`/`send`/`_emit_files`)
 - `addressing.py` — 该不该应答：点名 / 回复 bot / 触发词 / 续话窗口 / 剥引用块与自我 @
 - `dispatch.py` — 把消息归到哪个项目：群按绑定、DM 按内容分诊（强信号 + 轻量 LLM + 兜底）
-- `tasks.py` — 在项目上跑任务并回发（流式/附件/线程）+ 元命令 `/reset` `/summarize` `/cancel` `/backfill` `/bind`
+- `tasks.py` — 在项目上跑任务并回发（流式/附件/线程）+ 元命令 `/reset` `/summarize` `/cancel` `/status` `/backfill` `/bind`
 - `pr_followup.py` — PR 台账跟进循环：处理评审/CI、满足条件自动合并、回报原房间
 - `heartbeat.py` — 自驱心跳循环：没人派活时巡检找事，autopilot 自己开 PR
 - `proactive.py` — 主动插话：不被 @ 也判断该不该就群消息开口（求助 / 有错可纠正）

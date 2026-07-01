@@ -10,7 +10,8 @@ from config import settings
 import state
 from state import _context
 from fmt import _safe_name, _human_bytes
-from addressing import _has_trigger, _is_addressed
+from matrix_io import _is_dm, _resolve_reply_author
+from addressing import _has_trigger, _is_addressed, _mark_engaged
 from tasks import handle_task
 import transcript
 
@@ -152,9 +153,13 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
         # 与文本相同的派活闸：自己账号无触发词不派活
         if is_self and not _has_trigger(event.body or ""):
             return
+        # 与文本一致：回复的若是 bot 重启前的旧消息，先补认；点名后开/续"对话延续窗口"
+        await _resolve_reply_author(rid, (event.source or {}).get("content", {}))
         addressed, cleaned = _is_addressed(room, event)
         if not addressed:   # 没点名就只记上下文，不打扰（媒体不走 proactive）
             return
+        if not is_self and not _is_dm(room):
+            _mark_engaged(rid, event.sender)
         have_file = bool(saved.get("path"))
         have_caption = bool(cleaned and cleaned != fname)   # 无 caption 时 cleaned 就是文件名
         if not have_file and not have_caption:   # 既没文件又没正文，没什么可干

@@ -64,6 +64,23 @@ class ClaudeRunner:
             _kill_group(p)
         return len(live)
 
+    # ---- 只读查询（/status 用）----
+    def running(self, cancel_key: str) -> int:
+        """该取消维度（房间）下正在跑的子进程数。"""
+        return len([p for p in self._active.get(cancel_key, []) if p.returncode is None])
+
+    def busy(self, lock_key: str) -> bool:
+        """该串行维度（项目 checkout）是否被占用（有任务在跑或在排队）。"""
+        lock = self._locks.get(lock_key)
+        return bool(lock and lock.locked())
+
+    def session_ts(self, key: str) -> float | None:
+        """该会话最近一次活跃的时刻；无有效会话（不存在/已过 TTL）返回 None。不产生副作用。"""
+        item = self._sessions.get(key)
+        if not item or time.time() - item[1] > settings.session_ttl:
+            return None
+        return item[1]
+
     # ---- 会话持久化：重启后恢复 session_id，多轮上下文不至于每次重启全断 ----
     def _sessions_file(self) -> str:
         return os.path.join(settings.store_path, "sessions.json")

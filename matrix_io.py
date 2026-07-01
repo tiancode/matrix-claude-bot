@@ -11,7 +11,7 @@ from nio import MatrixRoom
 
 from config import settings, redact
 import state
-from state import _context, _sent_events, E2E
+from state import _context, _sent_events, _foreign_events, E2E
 from fmt import _split, _to_html, _human_bytes
 import transcript
 
@@ -204,16 +204,44 @@ class _LiveReply:
             await send(self.rid, final_text, track=track, thread_root=self.thread_root)
             return
         chunks = _split(redact(final_text))
-        await _edit_message(self.rid, self.eid, chunks[0])   # 占位消息定稿成第一块
-        prev = self.eid
+        if not await _edit_message(self.rid, self.eid, chunks[0]):   # 占位消息定稿成第一块
+            # 定稿编辑失败（限流重试耗尽/服务器错误）：占位消息会永远停在"正在干活"，
+            # 答案不能就此吞掉——退回整条新发（send 自带丢块提示）。
+            await send(self.rid, final_text, track=track, thread_root=self.thread_root)
+            return
+        prev, all_ok = self.eid, True
         for c in chunks[1:]:                                  # 超长的余下分块作为线程内续接
             eid = await _send_and_register(self.rid, _text_content(redact(c)),
                                            _thread_rel(self.thread_root, prev))
             if eid:
                 prev = eid
-        if track:
+            else:
+                all_ok = False
+        if not all_ok:   # 与 send() 同规矩：有分块丢了要提示，别让读者当成完整回复
+            await _send_and_register(self.rid, {"msgtype": "m.text",
+                                                "body": "（部分内容发送失败，上面的回复可能不完整）"},
+                                     _thread_rel(self.thread_root, prev))
+        if track and all_ok:
             _track_reply(self.rid, redact(final_text))
 
+
+
+async def _resolve_reply_author(rid: str, content: dict) -> None:
+    """这条消息若回复了一条本地不认识的消息，向服务器查一次它是谁发的：是 bot 自己的旧消息
+    就补登记进 _sent_events——否则重启后（_sent_events 清空）"回复 bot"就不再被当成点名。
+    别人的消息记入 _foreign_events，同一条不重复拉取。"""
+    eid = ((content.get("m.relates_to") or {}).get("m.in_reply_to") or {}).get("event_id")
+    if not eid or eid in _sent_events or eid in _foreign_events:
+        return
+    try:
+        resp = await state.client.room_get_event(rid, eid)
+    except Exception:
+        return
+    sender = getattr(getattr(resp, "event", None), "sender", "") or ""
+    if sender == state.MY_ID:
+        _sent_events.append(eid)
+    elif sender:
+        _foreign_events.append(eid)
 
 
 def _is_dm(room: MatrixRoom) -> bool:

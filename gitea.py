@@ -39,6 +39,23 @@ async def _aget(url: str):
         return 0, None
 
 
+_own_user: dict = {}   # GITEA_TOKEN 对应用户的缓存（查到过才缓存，失败下次再试）
+
+
+async def own_user_id() -> int | None:
+    """GITEA_TOKEN 对应的 Gitea 用户 id（bot 自己）。查不到返回 None（调用方按"不过滤"处理）。
+    用途：PR 跟进时把 bot 自己发的评审/评论从"新评审意见"里剔掉，免得自己触发自己。"""
+    if "id" not in _own_user:
+        if not settings.gitea_host:
+            return None
+        st, d = await _aget(f"{settings.gitea_host.rstrip('/')}/api/v1/user")
+        if st == 200 and isinstance(d, dict) and isinstance(d.get("id"), int):
+            _own_user["id"] = d["id"]
+        else:
+            return None
+    return _own_user["id"]
+
+
 async def pr_info(rec: dict, number: int) -> dict | None:
     """单个 PR 的状态：含 state(open/closed)、merged、mergeable、head.sha/ref。"""
     st, d = await _aget(f"{_repo_api(rec)}/pulls/{number}")

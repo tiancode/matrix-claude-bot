@@ -38,13 +38,14 @@ import transcript
 # re-export：保持 `bot.X` 可用（测试按这些名字访问内部实现）
 from fmt import (_split, _to_html, _format_context, _human_gap, _safe_name)  # noqa: F401
 from matrix_io import (send, _is_dm, _LiveReply, _emit_files, _within_allowed,  # noqa: F401
-                       _thread_root_of, _thread_rel)
+                       _thread_root_of, _thread_rel, _resolve_reply_author)
 from addressing import (_is_addressed, _has_trigger, _strip_trigger, _strip_reply_fallback,  # noqa: F401
                         _strip_self_mentions, _mark_engaged, _looks_actionable)
 from dispatch import _dispatch, _triage, TRIAGE_GENERAL  # noqa: F401
-from tasks import (handle_task, handle_summarize, handle_cancel, do_bind, _backfill_cmd,  # noqa: F401
-                   _auto_backfill, _run_on_project, _extract_pr,
-                   RESET_CMDS, HELP_CMDS, SUMMARY_CMDS, CANCEL_CMDS, _HELP_TEXT, _WELCOME)
+from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, do_bind,  # noqa: F401
+                   _backfill_cmd, _auto_backfill, _run_on_project, _extract_pr,
+                   RESET_CMDS, HELP_CMDS, SUMMARY_CMDS, CANCEL_CMDS, STATUS_CMDS,
+                   _HELP_TEXT, _WELCOME)
 from pr_followup import _followup_one, _pr_followup_loop  # noqa: F401
 from heartbeat import _heartbeat_one, _heartbeat_loop  # noqa: F401
 from proactive import maybe_proactive, _PROACTIVE_PASS_COOLDOWN  # noqa: F401
@@ -62,7 +63,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
 
     # 无访问控制：用这个 bot 的都是可信的人，所有用户的消息都进上下文、都可派活。
     is_self = event.sender == state.MY_ID
-    body = _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {}))
+    content = (event.source or {}).get("content", {})
+    body = _strip_reply_fallback(event.body or "", content)
     sender_name = room.user_name(event.sender) or event.sender
     # 用本地接收时刻而非 event.server_timestamp：与 send() 里 bot 回复同一时钟，
     # _format_context 的"间隔"提示才不会因收/发两端时钟偏差算错。
@@ -88,7 +90,12 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     if low.startswith("/cancel") or low.startswith("/stop") or stripped in CANCEL_CMDS:
         state._spawn(handle_cancel(room))
         return
+    if low.startswith("/status") or stripped in STATUS_CMDS:
+        state._spawn(handle_status(room))
+        return
 
+    # 重启后 _sent_events 已清空：被回复的若是 bot 的旧消息，先向服务器补认，寻址才认得出
+    await _resolve_reply_author(room.room_id, content)
     addressed, cleaned = _is_addressed(room, event)
 
     # 绑定仓库：仅群聊；/bind 显式，或未绑定群里"仅一条仓库 URL"。DM 交给 handle_task 自动分诊。

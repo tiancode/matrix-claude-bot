@@ -10,7 +10,7 @@ from state import _sess_key, _last_project_by_room, _project_last_active
 from matrix_io import send, _typing
 from tasks import _employee_prompt, _extract_pr
 from projects import projects
-from claude_runner import runner
+from claude_runner import runner, ClaudeCancelled
 import pr_ledger
 import memory
 
@@ -39,13 +39,17 @@ async def _heartbeat_execute(rec: dict, room: str, proposal: str):
     sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
     try:
         async with _typing(room):
+            # cancel_key=汇报房间：让房间里的 /cancel 也能停掉自驱任务（不然只能干看着它跑）
             answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"], system_prompt=sp,
-                                      lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec))
+                                      lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec),
+                                      cancel_key=room)
         _project_last_active[rec["id"]] = time.time()
         await send(room, f"🤖 自驱完成：\n{answer}", track=True)
         pr = _extract_pr(answer, rec)
         if pr and pr_ledger.record(rec["id"], pr[0], pr[1], room):
             log.info("[%s] 自驱开了 PR #%d，进台账", rec["id"], pr[0])
+    except ClaudeCancelled:
+        await send(room, "🛑 已停止这次自驱任务。")
     except Exception as e:
         log.exception("自驱执行失败")
         await send(room, f"自驱执行出错：{e}")

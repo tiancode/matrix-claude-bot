@@ -1697,6 +1697,229 @@ def test_dm_no_projects_falls_to_general():
     assert not sent                                        # 不再反问"发个 Gitea 仓库地址"
 
 
+# ---------- /status：项目 / 任务 / 在跟 PR / 主动性一屏可见 ----------
+def test_status_command():
+    import tempfile
+    import pr_ledger
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_room, state.client)
+    bot.projects.get_room = lambda rid: rec
+    state.client = FC()
+    try:
+        pr_ledger.record("h/o/r", 7, "http://h/o/r/pulls/7", "!g:ex.org")
+        asyncio.run(bot.handle_status(FakeRoom("!g:ex.org", 3)))
+        out = "\n".join(sent)
+        assert "o/r" in out and "PR #7" in out            # 项目 + 在跟的 PR
+        assert "没有正在跑的任务" in out and "自驱心跳" in out
+    finally:
+        bot.projects.get_room, state.client = orig
+        settings.store_path = orig_store
+        _reset_ledger()
+
+
+# ---------- 流式定稿：编辑失败不吞答案，退回整条新发 ----------
+def test_livereply_finalize_edit_fallback():
+    set_identity()
+    sent = []
+
+    class FC:
+        async def room_send(self, rid, mt, content, **k):
+            if (content.get("m.relates_to") or {}).get("rel_type") == "m.replace":
+                return types.SimpleNamespace(event_id=None, status_code="M_UNKNOWN")  # 编辑一律失败
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$e%d" % len(sent))
+
+    state.client = FC()
+    rid = "!lr:ex.org"
+    bot._context[rid].clear()
+    live = bot._LiveReply(rid)
+    asyncio.run(live.on_delta("part", "Bash"))            # 生成占位消息
+    asyncio.run(live.finalize("最终答案", track=True))
+    assert any("最终答案" in b for b in sent)              # 占位编辑失败 → 答案作为新消息发出
+    assert any(b == "最终答案" for _, s, b in bot._context[rid])   # 且照常入上下文
+
+
+# ---------- 自驱 / PR 跟进任务的取消维度是房间：/cancel 才停得下来 ----------
+def test_autonomous_tasks_cancellable_by_room():
+    import pr_followup
+    set_identity()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    seen, sent = [], []
+
+    class FC:
+        async def room_typing(self, *a, **k): return None
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    class R:
+        async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
+                      prepare=None, on_delta=None, cancel_key=None):
+            seen.append(cancel_key); return "干完了，没开 PR"
+
+    orig = (heartbeat.runner, pr_followup.runner, state.client)
+    heartbeat.runner = pr_followup.runner = R()
+    state.client = FC()
+    try:
+        asyncio.run(heartbeat._heartbeat_execute(rec, "!room", "修个小 bug"))
+        asyncio.run(pr_followup._followup_dispatch(
+            rec, {"pid": "h/o/r", "number": 3, "room": "!room", "branch": "claude/x"}, "有评审"))
+        assert seen == ["!room", "!room"]                  # 取消维度=汇报房间，/cancel(按房间) 能命中
+    finally:
+        heartbeat.runner, pr_followup.runner, state.client = orig
+
+
+# ---------- 重启后回复 bot 旧消息仍算点名（向服务器补认发送者） ----------
+def test_reply_to_bot_after_restart():
+    set_identity()
+    calls = []
+
+    def make_client(sender):
+        class FC:
+            async def room_get_event(self, rid, eid):
+                calls.append(eid)
+                return types.SimpleNamespace(event=types.SimpleNamespace(sender=sender))
+        return FC()
+
+    bot._sent_events.clear()
+    state._foreign_events.clear()
+    room = FakeRoom("!g:ex.org", 3)
+
+    state.client = make_client("@claudebot:ex.org")       # 被回复的是 bot 自己的旧消息
+    ev = make_event("> <@claudebot:ex.org> 旧\n\n继续弄", in_reply_to="$old1")
+    asyncio.run(bot._resolve_reply_author(room.room_id, ev.source["content"]))
+    a, t = bot._is_addressed(room, ev)
+    assert a and t == "继续弄"                             # 重启（_sent_events 清空）后仍认得
+
+    state.client = make_client("@bob:ex.org")             # 被回复的是别人 → 不误当点名，且只查一次
+    ev2 = make_event("> <@bob:ex.org> x\n\n哈哈", in_reply_to="$old2")
+    asyncio.run(bot._resolve_reply_author(room.room_id, ev2.source["content"]))
+    asyncio.run(bot._resolve_reply_author(room.room_id, ev2.source["content"]))
+    a2, _ = bot._is_addressed(room, ev2)
+    assert a2 is False and calls.count("$old2") == 1
+
+
+# ---------- PR 跟进：bot 自己（同 token）的评论不当新评审，别人的照常派活 ----------
+def test_followup_ignores_own_reviews():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store, orig_am = settings.store_path, settings.pr_automerge
+    settings.store_path = tempfile.mkdtemp()
+    settings.pr_automerge = False
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    spawned = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state)
+    own_backup = dict(gitea._own_user)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: (spawned.append(1), coro.close())
+    gitea._own_user.clear(); gitea._own_user["id"] = 42
+
+    async def open_info(r, n):
+        return {"state": "open", "merged": False, "mergeable": True,
+                "head": {"ref": "claude/x", "sha": "s"}}
+    async def own_review(r, n):
+        return [{"id": 11, "state": "COMMENT", "body": "我自己的回应", "user": {"id": 42}}]
+    async def other_review(r, n):
+        return [{"id": 12, "state": "COMMENT", "body": "别人提的意见", "user": {"id": 7}}]
+    async def no_ci(r, s): return ""
+    try:
+        gitea.pr_info, gitea.pr_reviews, gitea.ci_state = open_info, own_review, no_ci
+        pr_ledger.record("h/o/r", 4, "u4", "!room")
+        entry = [e for e in pr_ledger.active() if e["number"] == 4][0]
+        asyncio.run(bot._followup_one(entry))
+        e4 = [e for e in pr_ledger.active() if e["number"] == 4][0]
+        assert not spawned and e4["review_fixes"] == 0    # 自己的评论：不派活、不烧自动处理次数
+        assert e4["seen_review"] == 11                    # 但水位照常推进，下一轮不再重看
+        gitea.pr_reviews = other_review                   # 混进别人的新评论 → 照常派跟进
+        asyncio.run(bot._followup_one(e4))
+        assert spawned
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state) = orig
+        gitea._own_user.clear(); gitea._own_user.update(own_backup)
+        settings.store_path, settings.pr_automerge = orig_store, orig_am
+        _reset_ledger()
+
+
+# ---------- DM 分诊：当前这条不重复出现在分诊背景里 ----------
+def test_dispatch_triage_skips_current():
+    set_identity()
+    room = FakeRoom("!dm2:ex.org", 2)
+    rid = room.room_id
+    bot._context[rid].clear()
+    known = [{"id": "h/o/app", "owner": "o", "repo": "app", "host": "http://h", "path": "/x", "base": "main"},
+             {"id": "h/o/web", "owner": "o", "repo": "web", "host": "http://h", "path": "/y", "base": "main"}]
+    captured = {}
+
+    async def fake_triage(text, kn, context=""):
+        captured["ctx"] = context
+        return dispatch.TRIAGE_GENERAL
+
+    orig = (dispatch._triage, bot.projects.list_projects)
+    dispatch._triage = fake_triage
+    bot.projects.list_projects = lambda: known
+    try:
+        body = "这个流程整体该怎么设计比较好"
+        bot._context[rid].append((time.time(), "Alice", "早些的消息"))
+        bot._context[rid].append((time.time(), "Alice", body))    # on_message 已把当前消息垫进背景
+        rec = asyncio.run(bot._dispatch(room, make_event(body), body))
+        assert rec and rec.get("general")
+        assert "早些的消息" in captured["ctx"]                    # 背景还在
+        assert body not in captured["ctx"]                        # 但当前这条被剔掉，不喂两遍
+    finally:
+        dispatch._triage, bot.projects.list_projects = orig
+
+
+# ---------- /summarize、/catchup（含带参数形式）不混进小结素材 ----------
+def test_summarize_excludes_command_variants():
+    import tasks
+    set_identity()
+    rid = "!sum:ex.org"
+    room = FakeRoom(rid, 3)
+    sent, captured = [], {}
+
+    class FC:
+        async def room_typing(self, *a, **k): return None
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    async def fake_quick(prompt):
+        captured["p"] = prompt; return "小结好了"
+
+    orig = (state.client, tasks.runner.quick, settings.transcript_enabled)
+    state.client = FC()
+    tasks.runner.quick = fake_quick
+    settings.transcript_enabled = False                   # 走内存背景缓冲
+    bot._context[rid].clear()
+    bot._context[rid].append((time.time(), "Alice", "昨天讨论了部署方案"))
+    bot._context[rid].append((time.time(), "Alice", "/catchup 30"))
+    try:
+        asyncio.run(bot.handle_summarize(room, make_event("/catchup 30"), "/catchup 30"))
+        assert "昨天讨论了部署方案" in captured["p"]
+        assert "/catchup" not in captured["p"]            # 命令本身（含带参数形式）不进素材
+        assert any("小结" in b for b in sent)
+    finally:
+        state.client, tasks.runner.quick, settings.transcript_enabled = orig
+
+
 TESTS = [
     ("启动+群任务全链路", test_startup_and_task_flow),
     ("零项目DM落通用助手", test_dm_no_projects_falls_to_general),
@@ -1758,14 +1981,24 @@ TESTS = [
     ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
     ("PR 自动合并 条件满足才合并", test_pr_automerge),
     ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),
+    ("/status 状态一屏可见", test_status_command),
+    ("流式定稿 编辑失败退回新发", test_livereply_finalize_edit_fallback),
+    ("自驱/跟进任务可被 /cancel", test_autonomous_tasks_cancellable_by_room),
+    ("重启后回复 bot 仍算点名", test_reply_to_bot_after_restart),
+    ("PR 跟进忽略自己的评论", test_followup_ignores_own_reviews),
+    ("分诊背景剔除当前消息", test_dispatch_triage_skips_current),
+    ("/summarize 剔除命令变体", test_summarize_excludes_command_variants),
 ]
 
 
 def main():
     import traceback
     import tempfile
+    import gitea
     # 把状态目录指到临时目录，别让自检把 sessions.json / last_projects.json 写进真实 store
     settings.store_path = tempfile.mkdtemp(prefix="mxbot-smoke-store-")
+    # 预置"bot 自己的 Gitea 用户 id"缓存：自检必须离线，不许真去查 /api/v1/user
+    gitea._own_user["id"] = -1
     failed = 0
     for name, fn in TESTS:
         try:

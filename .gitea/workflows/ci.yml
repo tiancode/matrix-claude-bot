@@ -1,6 +1,6 @@
 name: CI
 
-# 离线冒烟自检(59) + pyflakes。绿了 PR 才会被自动合并（配合 PR_AUTOMERGE）。
+# 离线冒烟自检 + pyflakes。绿了 PR 才会被自动合并（配合 PR_AUTOMERGE）。
 # 这台 runner(pi-runner) 所在网络墙了 github.com / pypi.org，且容器内解析不了 pi.lan：
 #   - 不用任何 uses: 动作（会去 github 拉取而失败），改从本地 Gitea 的 IP/网关 clone；
 #   - pip 走清华镜像绕开 pypi 封锁。
@@ -41,5 +41,5 @@ jobs:
           echo "--- pyflakes（只在 undefined name 时失败；re-export 的未用导入不算）---"
           out=$($PY -m pyflakes *.py || true); echo "$out"
           if echo "$out" | grep -qi "undefined name"; then echo "::error::pyflakes 发现 undefined name"; exit 1; fi
-          echo "--- 冒烟自检（59 项，离线，不连 Matrix/不调 claude）---"
+          echo "--- 冒烟自检（离线，不连 Matrix/不调 claude）---"
           $PY tests/smoke.py

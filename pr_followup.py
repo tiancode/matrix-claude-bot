@@ -9,7 +9,7 @@ from state import _sess_key
 from matrix_io import send, _typing
 from tasks import _employee_prompt
 from projects import projects
-from claude_runner import runner
+from claude_runner import runner, ClaudeCancelled
 import gitea
 import pr_ledger
 import memory
@@ -29,10 +29,14 @@ async def _followup_dispatch(rec: dict, entry: dict, detail: str):
     sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
     try:
         async with _typing(room):
+            # cancel_key=原房间：让房间里的 /cancel 也能停掉跟进任务
             answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"],
                                       system_prompt=sp, lock_key=rec["id"],
-                                      prepare=lambda: projects.prepare_worktree(rec))
+                                      prepare=lambda: projects.prepare_worktree(rec),
+                                      cancel_key=room)
         await send(room, f"🔁 PR #{n} 跟进结果：\n{answer}", track=True)
+    except ClaudeCancelled:
+        await send(room, f"🛑 已停止 PR #{n} 的跟进任务。")
     except Exception as e:
         log.exception("PR #%s 跟进任务失败", n)
         await send(room, f"PR #{n} 跟进出错：{e}")
@@ -62,12 +66,16 @@ async def _followup_one(entry: dict):
         pr_ledger.update(pid, n, branch=branch)
     cap = settings.pr_autofix_max
 
-    # 1) 新的评审意见（请求改动 / 评论）—— 评审优先于 CI
+    # 1) 新的评审意见（请求改动 / 评论）—— 评审优先于 CI。
+    #    bot 自己（同 token）发的评论不算新意见：水位照常推进但不派活，免得它回应评审时自己触发自己。
     reviews = await gitea.pr_reviews(rec, n)
-    fresh = [r for r in reviews if isinstance(r.get("id"), int) and r["id"] > entry.get("seen_review", 0)
-             and r.get("state") in ("REQUEST_CHANGES", "COMMENT")]
+    own = await gitea.own_user_id()
+    fresh_all = [r for r in reviews if isinstance(r.get("id"), int) and r["id"] > entry.get("seen_review", 0)
+                 and r.get("state") in ("REQUEST_CHANGES", "COMMENT")]
+    fresh = [r for r in fresh_all if own is None or (r.get("user") or {}).get("id") != own]
+    if fresh_all:
+        pr_ledger.update(pid, n, seen_review=max(r["id"] for r in fresh_all))
     if fresh:
-        pr_ledger.update(pid, n, seen_review=max(r["id"] for r in fresh))
         if entry.get("review_fixes", 0) < cap:
             pr_ledger.update(pid, n, review_fixes=entry.get("review_fixes", 0) + 1)
             bodies = "\n".join(f"- [{r.get('state')}] {(r.get('body') or '(见行内评论)').strip()[:300]}"
