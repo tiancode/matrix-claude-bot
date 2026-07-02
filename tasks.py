@@ -174,6 +174,13 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         _project_last_active[rec["id"]] = time.time()      # 标记活跃：自驱心跳会避让最近在弄的项目
     sp = transcript.augment_system_prompt(sp, rid)   # 指给它本房间历史日志，便于回溯更早对话
     sess = _sess_key(rec, rid)
+    # 排队回执：串行锁被占（同项目已有任务在跑）时立即知会，别让用户对着 typing 猜消息丢没丢。
+    # 尽力而为——与对方拿锁存在竞态，漏发只影响提示不影响排队本身。
+    if runner.busy(lock_key or sess):
+        note = "⏳ 上一个任务还在跑，这条已排队，轮到会自动开始"
+        note += ("；等不及可发 /cancel 停掉当前任务。" if runner.running(rid)
+                 else "（正忙的是其它房间或自驱/工单任务，本房间 /cancel 停不了它）。")
+        await send(rid, note, thread_root=thread_root)
     if settings.stream_replies:                      # 流式：边生成边编辑同一条占位消息
         live = _LiveReply(rid, thread_root=thread_root)
         try:
