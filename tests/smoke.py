@@ -1014,6 +1014,8 @@ def test_run_on_project_skips_media_line():
     captured = {}
 
     class R:
+        def busy(self, k): return False
+        def running(self, k): return 0
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
                       on_delta=None, cancel_key=None):
             captured["prompt"] = prompt
@@ -1034,6 +1036,49 @@ def test_run_on_project_skips_media_line():
         bot._context[rid].clear()
     assert "[文件] a.log" not in captured["prompt"]        # 媒体行不再重复出现在 prompt
     assert "之前聊的别的事" in captured["prompt"]           # 其它背景仍照常带上
+
+
+# ---------- 35b) 排队回执：项目锁被占时立即知会"已排队"，空闲时不发 ----------
+def test_queue_receipt_when_busy():
+    set_identity()
+    rid = "!queue:ex.org"
+    room = FakeRoom(rid, 2)
+    bot._context[rid].clear()
+    sent = []
+
+    class R:
+        def __init__(self): self.is_busy = False; self.n_running = 0
+        def busy(self, k): return self.is_busy
+        def running(self, k): return self.n_running
+        async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
+                      on_delta=None, cancel_key=None):
+            return "ok"
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    rec = {"id": "p", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
+    orig = (tasks.runner, state.client, settings.stream_replies)
+    r = R()
+    tasks.runner, state.client = r, FC()
+    settings.stream_replies = False
+    try:
+        ev = make_event("先干个活")
+        asyncio.run(bot._run_on_project(room, ev, "先干个活", rec))
+        assert not any("已排队" in m for m in sent)            # 空闲：不发回执
+
+        r.is_busy, r.n_running = True, 1                       # 忙且本房间在跑 → 回执 + /cancel 提示
+        asyncio.run(bot._run_on_project(room, ev, "再来一个", rec))
+        assert any("已排队" in m and "/cancel" in m for m in sent)
+
+        sent.clear()
+        r.n_running = 0                                        # 忙但占用来自别处 → 说明 /cancel 停不了
+        asyncio.run(bot._run_on_project(room, ev, "第三个", rec))
+        assert any("已排队" in m and "停不了" in m for m in sent)
+    finally:
+        (tasks.runner, state.client, settings.stream_replies) = orig
+        bot._context[rid].clear()
 
 
 # ---------- 36) 未声明 size 的大文件：流式落盘后按真实大小拦下，不静默吃内存 ----------
@@ -2099,6 +2144,7 @@ TESTS = [
     ("工单台账 登记/持久化/销账", test_issue_ledger),
     ("工单接活 认领/宣布/派执行/防重", test_issue_intake_flow),
     ("工单执行 开PR进台账/贴链接/关单销账", test_issue_execute_and_sweep),
+    ("排队回执 忙时知会/空闲不发", test_queue_receipt_when_busy),
     ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
     ("PR 自动合并 条件满足才合并", test_pr_automerge),
     ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),
