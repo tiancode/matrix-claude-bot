@@ -16,6 +16,7 @@ from dispatch import _dispatch
 from projects import projects
 from claude_runner import runner, ClaudeCancelled
 import memory
+import issue_ledger
 import pr_ledger
 import transcript
 
@@ -50,6 +51,7 @@ _HELP_TEXT = (
     "• 群里先绑仓库：发 Gitea 仓库地址，或 `/bind <仓库URL>`\n"
     "• 然后 @我 派活；刚 @过我的几分钟内不必每句都 @（对话延续窗口）\n"
     "• 私聊直接说，我自动判断是哪个项目\n"
+    "• 也可以不进 Matrix：在 Gitea 上把 issue **指派给我**，我会接单、开 PR（合并自动关单）并回报进展\n"
     "• 长任务我会边干边把进度更新到同一条消息；要文件我用附件发回来\n\n"
     "**命令**（群里不必 @ 也认）\n"
     "• `/help` 看这个\n"
@@ -329,6 +331,11 @@ async def handle_status(room: MatrixRoom):
                      f"CI 已自动修 {e.get('ci_fixes', 0)}/{cap} 次）")
     if not prs:
         lines.append("• 没有在跟的 PR")
+    issues = [e for e in issue_ledger.active()
+              if e.get("room") == rid or (rec and e.get("pid") == rec["id"])]
+    for e in issues[:10]:
+        lines.append(f"• 在办工单 #{e.get('number')}：{e.get('url', '')}"
+                     + (f"（已开 PR #{e['pr']}）" if e.get("pr") else "（处理中）"))
     if rec:
         ts = runner.session_ts(_sess_key(rec, rid))
         lines.append(f"• 多轮会话：{_human_gap(max(0.0, time.time() - ts))}前活跃（/reset 可重开）"
@@ -336,6 +343,7 @@ async def handle_status(room: MatrixRoom):
     hb = (f"开（每 {settings.proactive_heartbeat_interval // 60} 分钟，"
           f"autopilot={'开' if settings.proactive_autopilot else '关'}）"
           if settings.proactive_heartbeat_enabled else "关")
-    lines.append(f"• 主动插话={'开' if settings.proactive else '关'} · 自驱心跳={hb}")
+    lines.append(f"• 主动插话={'开' if settings.proactive else '关'} · 自驱心跳={hb}"
+                 f" · 工单接活={'开' if settings.issue_intake_enabled else '关'}")
     await send(rid, "\n".join(lines))
 

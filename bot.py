@@ -48,6 +48,7 @@ from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, 
                    _HELP_TEXT, _WELCOME)
 from pr_followup import _followup_one, _pr_followup_loop  # noqa: F401
 from heartbeat import _heartbeat_one, _heartbeat_loop  # noqa: F401
+from issue_intake import _intake_one, _issue_execute, _issue_intake_loop  # noqa: F401
 from proactive import maybe_proactive, _PROACTIVE_PASS_COOLDOWN  # noqa: F401
 from media import on_media, _process_media, _prune_dir  # noqa: F401
 
@@ -253,6 +254,7 @@ async def main():
                 state._spawn(_auto_backfill(rid))
     state._spawn(_pr_followup_loop())   # 后台盯台账里的 PR，跟到合并
     state._spawn(_heartbeat_loop())     # 后台自驱心跳：没人派活时也巡检找事
+    state._spawn(_issue_intake_loop())  # 后台工单接活：Gitea 上指派给 bot 的 issue = 派活
     await state.client.sync_forever(timeout=30000, full_state=False)
 
 
