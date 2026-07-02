@@ -113,6 +113,12 @@ class Settings:
     pr_merge_method            = _s("PR_MERGE_METHOD", "merge")   # merge / squash / rebase（须为仓库允许的方式）
     pr_automerge_delete_branch = _b("PR_AUTOMERGE_DELETE_BRANCH", True)  # 合并后删源分支 claude/xxx
 
+    # Gitea 工单接活：把 issue 指派给 bot 的 Gitea 账号 = 派活，不进 Matrix 也能下任务。
+    # 轮询各已知项目 assigned 给 bot 的 open issue：认领（issue 下评论）→ 干活开 PR
+    # （body 带 Closes #N，合并即自动关单）→ PR 进台账盯到合并 → 进展回报到项目房间。
+    issue_intake_enabled = _b("ISSUE_INTAKE", True)
+    issue_poll_interval  = _i("ISSUE_POLL_INTERVAL", 300)   # 轮询间隔（秒）
+
     # 主动性·自驱心跳：没人派活时也巡检各项目、主动找值得做的事
     proactive_heartbeat_enabled  = _b("PROACTIVE_HEARTBEAT_ENABLED", True)
     proactive_heartbeat_interval = _i("PROACTIVE_HEARTBEAT_INTERVAL", 3600)  # 巡检间隔（秒），别太密以免烧钱/打扰

@@ -132,16 +132,19 @@ def test_startup_and_task_flow():
     bot.projects.ensure_project = fake_ensure
     bot.runner.ask = fake_ask
 
-    orig_pf = settings.pr_followup_enabled               # 关掉守护循环（PR 跟进 / 自驱心跳），否则会 sleep 住任务回收
+    orig_pf = settings.pr_followup_enabled               # 关掉守护循环（PR 跟进 / 自驱心跳 / 工单接活），否则会 sleep 住任务回收
     orig_hb = settings.proactive_heartbeat_enabled
+    orig_ii = settings.issue_intake_enabled
     settings.pr_followup_enabled = False
     settings.proactive_heartbeat_enabled = False
+    settings.issue_intake_enabled = False
     bot._context["!g:ex.org"].clear()
     try:
         asyncio.run(bot.main())
     finally:
         settings.pr_followup_enabled = orig_pf
         settings.proactive_heartbeat_enabled = orig_hb
+        settings.issue_intake_enabled = orig_ii
 
     assert state.MY_ID == "@claudebot:ex.org" and state.MY_NAME == "claude-bot"
     assert captured["key"] == "gitea.example.com/team/app|!g:ex.org"    # 会话按项目+房间（不串台）
@@ -1282,6 +1285,12 @@ def _reset_ledger():
     pr_ledger._loaded = False
 
 
+def _reset_issue_ledger():
+    import issue_ledger
+    issue_ledger._data = {}
+    issue_ledger._loaded = False
+
+
 # ---------- 自驱心跳：PASS 不打扰；有建议→提议；autopilot→派执行 ----------
 def test_heartbeat_propose_and_autopilot():
     set_identity()
@@ -1397,6 +1406,115 @@ def test_pr_followup_actions():
          gitea.pr_info, gitea.pr_reviews, gitea.ci_state) = orig
         settings.store_path = orig_store
         _reset_ledger()
+
+
+# ---------- 工单台账：登记/去重/更新/销账 + 持久化 ----------
+def test_issue_ledger():
+    import tempfile
+    import issue_ledger
+    orig = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_issue_ledger()
+    try:
+        assert issue_ledger.record("h/o/r", 3, "http://x/issues/3", "!room") is True
+        assert issue_ledger.record("h/o/r", 3, "http://x/issues/3", "!room") is False   # 不重复接单
+        assert issue_ledger.taken("h/o/r", 3) and not issue_ledger.taken("h/o/r", 4)
+        issue_ledger.update("h/o/r", 3, pr=9)
+        _reset_issue_ledger()                                    # 清内存态 → 必须能从盘恢复
+        got = issue_ledger.active()
+        assert got and got[0]["number"] == 3 and got[0]["pr"] == 9
+        issue_ledger.remove("h/o/r", 3)
+        assert issue_ledger.active() == []
+    finally:
+        settings.store_path = orig
+        _reset_issue_ledger()
+
+
+# ---------- 工单接活：指派的 issue → 登记 + 认领留言 + 房间宣布 + 派执行；已接过不重复 ----------
+def test_issue_intake_flow():
+    import tempfile
+    import issue_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_issue_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent, spawned, claimed = [], [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (state.client, state._spawn, gitea.assigned_issues, gitea.comment_issue)
+    state.client = FC()
+    state._spawn = lambda coro: (spawned.append(1), coro.close())
+    async def issues(r, login): return [{"number": 3, "title": "登录太慢", "html_url": "http://h/o/r/issues/3"}]
+    async def comment(r, n, body): claimed.append((n, body)); return True
+    gitea.assigned_issues, gitea.comment_issue = issues, comment
+    try:
+        asyncio.run(bot._intake_one(rec, "!room", "claudebot"))
+        assert issue_ledger.taken("h/o/r", 3)                              # 已登记
+        assert claimed and claimed[0][0] == 3 and "认领" in claimed[0][1]   # issue 下留言认领
+        assert spawned and any("工单 #3" in m for m in sent)               # 房间宣布 + 派执行
+        sent.clear(); spawned.clear()
+        asyncio.run(bot._intake_one(rec, "!room", "claudebot"))            # 下轮又轮询到同一单 → 不重复接
+        assert not spawned and not sent
+    finally:
+        (state.client, state._spawn, gitea.assigned_issues, gitea.comment_issue) = orig
+        settings.store_path = orig_store
+        _reset_issue_ledger()
+
+
+# ---------- 工单执行：开 PR → 进 PR 台账 + 工单记 PR + issue 贴链接；关单后 sweep 销账 ----------
+def test_issue_execute_and_sweep():
+    import tempfile
+    import issue_intake
+    import issue_ledger
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_issue_ledger(); _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent, comments = [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+        async def room_typing(self, r, *a, **k): return None
+
+    class R:
+        async def ask(self, key, prompt, **k):
+            assert "Closes #3" in prompt                          # 提示词要求 PR 带关单标记
+            return "已修复并开 PR：http://h/o/r/pulls/9"
+
+    orig = (state.client, issue_intake.runner, gitea.issue_comments, gitea.comment_issue,
+            bot.projects.get_project, gitea.issue_info)
+    state.client = FC()
+    issue_intake.runner = R()
+    async def no_comments(r, n): return []
+    async def comment(r, n, body): comments.append(body); return True
+    gitea.issue_comments, gitea.comment_issue = no_comments, comment
+    try:
+        issue_ledger.record("h/o/r", 3, "http://h/o/r/issues/3", "!room")
+        asyncio.run(bot._issue_execute(rec, "!room", {"number": 3, "title": "登录太慢", "body": "太慢了"}))
+        assert any("工单 #3" in m and "pulls/9" in m for m in sent)   # 结果回报房间
+        assert any(e["number"] == 9 for e in pr_ledger.active())      # PR 进台账 → 跟进循环盯到合并
+        assert issue_ledger.active()[0]["pr"] == 9                    # 工单记下 PR 号
+        assert any("pulls/9" in c for c in comments)                  # issue 下贴了 PR 链接
+
+        bot.projects.get_project = lambda pid: rec                    # 关单 → sweep 销账
+        async def closed(r, n): return {"state": "closed"}
+        gitea.issue_info = closed
+        asyncio.run(issue_intake._sweep_closed())
+        assert issue_ledger.active() == []
+    finally:
+        (state.client, issue_intake.runner, gitea.issue_comments, gitea.comment_issue,
+         bot.projects.get_project, gitea.issue_info) = orig
+        settings.store_path = orig_store
+        _reset_issue_ledger(); _reset_ledger()
 
 
 # ---------- 聊天逐字记录：落盘/回溯指引/保留删旧/开关 ----------
@@ -1978,6 +2096,9 @@ TESTS = [
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),
     ("PR 跟进 合并销账/评审派活", test_pr_followup_actions),
+    ("工单台账 登记/持久化/销账", test_issue_ledger),
+    ("工单接活 认领/宣布/派执行/防重", test_issue_intake_flow),
+    ("工单执行 开PR进台账/贴链接/关单销账", test_issue_execute_and_sweep),
     ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
     ("PR 自动合并 条件满足才合并", test_pr_automerge),
     ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),
@@ -1997,8 +2118,9 @@ def main():
     import gitea
     # 把状态目录指到临时目录，别让自检把 sessions.json / last_projects.json 写进真实 store
     settings.store_path = tempfile.mkdtemp(prefix="mxbot-smoke-store-")
-    # 预置"bot 自己的 Gitea 用户 id"缓存：自检必须离线，不许真去查 /api/v1/user
+    # 预置"bot 自己的 Gitea 用户 id/登录名"缓存：自检必须离线，不许真去查 /api/v1/user
     gitea._own_user["id"] = -1
+    gitea._own_user["login"] = "claudebot"
     failed = 0
     for name, fn in TESTS:
         try:

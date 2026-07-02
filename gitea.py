@@ -6,6 +6,7 @@
 import asyncio
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from config import settings
@@ -42,18 +43,63 @@ async def _aget(url: str):
 _own_user: dict = {}   # GITEA_TOKEN 对应用户的缓存（查到过才缓存，失败下次再试）
 
 
+async def _fetch_own_user() -> None:
+    if not settings.gitea_host:
+        return
+    st, d = await _aget(f"{settings.gitea_host.rstrip('/')}/api/v1/user")
+    if st == 200 and isinstance(d, dict):
+        if isinstance(d.get("id"), int):
+            _own_user["id"] = d["id"]
+        if d.get("login"):
+            _own_user["login"] = str(d["login"])
+
+
 async def own_user_id() -> int | None:
     """GITEA_TOKEN 对应的 Gitea 用户 id（bot 自己）。查不到返回 None（调用方按"不过滤"处理）。
     用途：PR 跟进时把 bot 自己发的评审/评论从"新评审意见"里剔掉，免得自己触发自己。"""
     if "id" not in _own_user:
-        if not settings.gitea_host:
-            return None
-        st, d = await _aget(f"{settings.gitea_host.rstrip('/')}/api/v1/user")
-        if st == 200 and isinstance(d, dict) and isinstance(d.get("id"), int):
-            _own_user["id"] = d["id"]
-        else:
-            return None
-    return _own_user["id"]
+        await _fetch_own_user()
+    return _own_user.get("id")
+
+
+async def own_user_login() -> str:
+    """GITEA_TOKEN 对应的 Gitea 登录名（bot 自己）。查不到返回 ""（调用方按"这轮先跳过"处理）。
+    用途：工单接活按 assigned_by=<登录名> 过滤"指派给 bot 的 issue"。"""
+    if "login" not in _own_user:
+        await _fetch_own_user()
+    return _own_user.get("login", "")
+
+
+async def assigned_issues(rec: dict, assignee: str) -> list:
+    """开着的、指派给 assignee 的 issue 列表（type=issues，不含 PR）。工单接活的轮询入口。"""
+    if not assignee:
+        return []
+    q = urllib.parse.quote(assignee)
+    st, d = await _aget(f"{_repo_api(rec)}/issues?state=open&type=issues&assigned_by={q}")
+    return d if st == 200 and isinstance(d, list) else []
+
+
+async def issue_info(rec: dict, number: int) -> dict | None:
+    """单个 issue 的状态：含 state(open/closed)、title、assignees。查不到返回 None。"""
+    st, d = await _aget(f"{_repo_api(rec)}/issues/{number}")
+    return d if st == 200 and isinstance(d, dict) else None
+
+
+async def issue_comments(rec: dict, number: int) -> list:
+    """issue 下的评论列表（body + user），接单时给 Claude 当讨论上下文。"""
+    st, d = await _aget(f"{_repo_api(rec)}/issues/{number}/comments")
+    return d if st == 200 and isinstance(d, list) else []
+
+
+async def comment_issue(rec: dict, number: int, body: str) -> bool:
+    """在 issue 下留言（认领 / 回报 PR 链接）。写操作但尽力而为：失败只返回 False，
+    不影响接单主流程——留言只是让 Gitea 侧的人看得到进展，Matrix 侧仍会回报。"""
+    url = f"{_repo_api(rec)}/issues/{number}/comments"
+    try:
+        st, _ = await asyncio.to_thread(_post, url, {"body": body})
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    return st in (200, 201)
 
 
 async def pr_info(rec: dict, number: int) -> dict | None:
