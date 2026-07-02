@@ -1562,6 +1562,27 @@ def test_issue_execute_and_sweep():
         _reset_issue_ledger(); _reset_ledger()
 
 
+# ---------- 模型拆分：干活用 CLAUDE_MODEL，轻判断（quick/consult）优先 CLAUDE_QUICK_MODEL ----------
+def test_quick_model_split():
+    from claude_runner import runner
+    orig = (settings.claude_model, settings.claude_quick_model)
+    settings.claude_model, settings.claude_quick_model = "opus", "haiku"
+    try:
+        agentic = runner._cmd("p", None, agentic=True)
+        quick = runner._cmd("p", None, agentic=False)
+        ro = runner._cmd_ro("p")
+        assert agentic[agentic.index("--model") + 1] == "opus"    # 干活用大模型
+        assert quick[quick.index("--model") + 1] == "haiku"       # 轻判断用小模型
+        assert ro[ro.index("--model") + 1] == "haiku"             # 只读查证同轻判断
+        settings.claude_quick_model = ""                          # 没拆时跟随 CLAUDE_MODEL
+        q2 = runner._cmd("p", None, agentic=False)
+        assert q2[q2.index("--model") + 1] == "opus"
+        settings.claude_model = ""                                # 都空 = 不带 --model
+        assert "--model" not in runner._cmd("p", None, agentic=True)
+    finally:
+        settings.claude_model, settings.claude_quick_model = orig
+
+
 # ---------- 聊天逐字记录：落盘/回溯指引/保留删旧/开关 ----------
 def test_transcript_log_and_recall():
     import tempfile
@@ -2145,6 +2166,7 @@ TESTS = [
     ("工单接活 认领/宣布/派执行/防重", test_issue_intake_flow),
     ("工单执行 开PR进台账/贴链接/关单销账", test_issue_execute_and_sweep),
     ("排队回执 忙时知会/空闲不发", test_queue_receipt_when_busy),
+    ("模型拆分 干活大/轻判断小", test_quick_model_split),
     ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
     ("PR 自动合并 条件满足才合并", test_pr_automerge),
     ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),

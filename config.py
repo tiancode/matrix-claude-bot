@@ -74,6 +74,9 @@ class Settings:
     # Claude Code
     claude_bin     = _s("CLAUDE_BIN", "claude")
     claude_model   = _s("CLAUDE_MODEL")
+    # 轻判断（quick 分诊/插话判定 + consult 只读查证）单独的模型；留空=跟随 CLAUDE_MODEL。
+    # 这类调用群里几乎每条消息一次，用小模型（如 haiku）省钱且更快；干活的 ask() 不受影响。
+    claude_quick_model = _s("CLAUDE_QUICK_MODEL")
     # 未绑定仓库时的兜底工作目录：与源码/凭证隔离的空目录
     claude_workdir = _s("CLAUDE_WORKDIR") or os.path.join(os.path.abspath(projects_root), "_scratch")
     # agentic 干活的超时（秒）。流式(默认)下是【空闲】超时：只要 Claude 还在持续产出就不限总时长，
