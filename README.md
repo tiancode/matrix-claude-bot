@@ -1,77 +1,65 @@
-# Matrix × Claude Code 机器人
+# Matrix × Claude Code：给自己雇一名不下班的工程师
 
-在 Matrix 房间里监听消息，被 @ / 私聊 / 命中触发词时（可选：不被 @ 也主动）调用**本机 Claude Code** 干活，并把结果发回房间。
+**在 Matrix 群里 @它派活，或在 Gitea 上把 issue 指派给它——它自己写代码、开 PR、盯 CI、改评审意见、自动合并、随时汇报。整条链路无人值守，跑在你自己的机器上。**
 
-为什么用 Matrix：能看到所在房间的**全部消息**、能**随时主动发消息**、可以**直接用你自己的账号**登录 —— 这三点企业微信官方 API 做不到。
+这不是又一个「聊天机器人接了个 LLM API」。它是一名**对结果负责的远程员工**：
 
-## 能力
+> **你**：@claude 用户反馈登录 token 过期后不会自动刷新，修一下
+> **bot**：（流式更新同一条消息，边干边给你看进度）
+> **bot**：搞定 ✅ 改了 token 刷新逻辑并补了测试，PR：`…/pulls/42`
+> **bot**（几分钟后）：✅ PR #42 CI 通过，已自动合并。
 
-- **被 @ / 单聊 / 触发词** → 调用 Claude Code 干活后回复
-- **线程化回复**（`REPLY_IN_THREAD`，默认开）→ 群里把答复挂进**提问那条消息的线程**（`m.thread`，带 `is_falling_back` 回退，不懂线程的老客户端按普通回复显示），多话题并行也不串台；私聊不挂线程
-- **流式·渐进输出**（`STREAM_REPLIES`，默认开）→ 走 `claude --output-format stream-json`，发一条占位消息后随产出**边生成边编辑**它（节流），长任务不再全程静默；定稿时替换为完整答复，超长再分块续接
-- **附件回传**（`SEND_FILES_BACK`，默认开）→ Claude 在回复里写一行 `[[send-file: 路径]]`，bot 就把对应文件作为附件（图片/文件/音视频）上传发回（加密房间走加密上传），并从文字里抹掉标记；**仅限工作目录/媒体/scratch/projects 之内**的文件，挡掉越权外泄
-- **catch-up 小结** → `/summarize [N]` 让 Claude 把最近 N 条对话（默认 `SUMMARY_LINES=60`，优先读逐字记录）做个分点小结：聊了啥、有何结论、还有哪些待办
-- **随时叫停** → `/cancel`（`/stop`/`停止`/`取消`）杀掉本房间正在跑的任务（连子进程一起，含自驱/PR 跟进任务），回报"已停止"而非"出错"
-- **状态一屏可见** → `/status`（`状态`）看本房间视角的运行状态：绑到哪个项目、有没有任务在跑、在跟哪些 PR（各自动处理了几次）、在办哪些工单、多轮会话多久前活跃、主动插话/自驱/工单接活开关
-- **上手引导** → 进房自动打招呼并指到 `/help`；`/help` 列出能力 + 命令（群里不必 @ 也认这些元命令）
-- **PROACTIVE 模式**（默认开）→ 不被 @ 时也对群消息先让 Claude 判断该不该插话——既包括**有人求助**，也包括**对话里出现明显错误/有风险的做法值得纠正**（同事聊错了你能开口指正），带冷却 + 强 `__PASS__` 倾向防刷屏；群已绑仓库时用**只读**方式看着真实代码作答（不会改代码/开 PR）。默认 `PROACTIVE_REQUIRE_HINT=0`：对每条群消息都判断（抓"没人求助但话里有错"）；设 =1 则只看含求助/报错词的消息（更省判断调用）。要收敛打扰：调大 `PROACTIVE_COOLDOWN`，或 `PROACTIVE=0` 关掉
-- **图片 / 文件 / 多媒体** → 自动下载（加密房间会解密）存到本地并在上下文标注；被 @ 时把文件路径交给 Claude 读取/分析
-- 每个**房间 × 项目**维护**多轮上下文**（Claude Code 会话，不同房间/私聊互不串台），发 `重置` / `/reset` 清空
-- **项目长期记忆**（跨会话/跨重启留存）→ 会话有 TTL，但「当初为什么这么设计、项目约定、长期目标、踩过的坑」这类**值得跨周记住**的事实落在 `store/memory/<项目>/`（一事一文件 + 索引，工作树之外不会被误 commit）；开新会话时按预算注入系统提示，会话被 TTL 清掉也"记得住事"。补「无长程记忆」短板的第一步（详见 `memory.py`）
-- **PR 台账（对结果负责）**→ bot 开了 PR 不撒手：后台轮询该 PR，收到**评审意见**或 **CI 失败**就自动在原分支上处理并推送、把进展回报到当初派活的房间，**合并/关闭才销账**（带自动处理次数上限防空转）。**PR 自动合并默认开**（`PR_AUTOMERGE=1`）：PR 可合并 + CI 通过（或没配 CI）+ 无未决"请求改动" → 直接调 Gitea API 合并、销账、回报，无需人工点合并（机械闸、不经 Claude 评审，安全性靠 CI＋快照环境）。补「fire-and-forget、不跟进」短板（详见 `pr_ledger.py` / `gitea.py`）
-- **Gitea 工单接活**（`ISSUE_INTAKE`，默认开）→ 把 issue **指派给 bot 的 Gitea 账号**就等于派活，不进 Matrix 也能给"员工"下任务：轮询各已知项目 assigned 给 bot 的 open issue（默认每 5 分钟），接单即在 issue 下评论认领、像平常派活一样干完开 PR（描述带 `Closes #N`，**合并后自动关单**）、PR 链接贴回 issue 并进 PR 台账被跟进循环盯到合并，进展同步回报到项目对应的 Matrix 房间。工单台账持久化（`store/issue_ledger.json`），重启不重复接单；同一单要重派就把 issue 关了再重开。提问/讨论类 issue 不开 PR，直接在 issue 下回复结论并关单。补「任务只能从聊天进来」的短板——Gitea issue 跟踪器成为第二个派活入口（详见 `issue_intake.py` / `issue_ledger.py`）
-- **主动性·自驱心跳**→ 没人派活时也按 `PROACTIVE_HEARTBEAT_INTERVAL` 巡检各项目（只读），挑一件值得主动推进的事（陈旧 PR、TODO/FIXME、缺测试、小 bug）。**默认 autopilot**（`PROACTIVE_AUTOPILOT=1`）：自己认领、开 PR（开的 PR 自动进台账→被 PR 跟进盯到合并）；设 `PROACTIVE_AUTOPILOT=0` 则只提议到项目房间等你点头（更安全、不自动改）。补「永远被动、无自驱」短板
-- **聊天历史回溯**（`TRANSCRIPT_ENABLED`，默认开）→ 会话有 24h 滑动 TTL、背景缓冲只有最近十几条且重启即清，都答不了「前天我们聊了什么」。开启后按房间把对话**明文**落到 `store/transcripts/<房间>.jsonl`（一行一条 + 保留天数/行数上限滚动删旧），派活时把日志**路径**注入系统提示，让 Claude 被问到更早对话时**自己去读/grep**（与项目记忆同一套"告诉它存哪、按需取"的玩法，不把整段历史塞进每次 prompt）。`/backfill [天数]` 可从 Matrix 时间线回灌开启前的历史；首次启用还会对各房间自动回灌一次。E2EE 下落盘的是收到时的明文，回溯可靠
-- **多轮·对话延续**→ 单聊每条必回；群里被 @ / 回复 bot / 命中触发词触发，且 `GROUP_FOLLOWUP_WINDOW` 秒内你的后续消息**免重复 @**也接着处理（@ 别人则不算，避免插话到你和别人的对话）
-- 登录态与 E2EE 密钥**持久化**；Claude 会话 id（`store/sessions.json`）与房间→项目路由（`store/last_projects.json`）也落盘，重启后多轮上下文与 `/reset` 仍可用；"回复了 bot"识别重启后会向服务器**补认**被回复消息的发送者（回复 bot 的旧消息照样算点名）。群聊背景对话、对话延续窗口不持久，重启后清空
+不在电脑前？在 Gitea 上建个 issue、指派给它的账号，回来时活已干完、PR 已合并、工单已自动关闭。
 
-## 任务分配：一个项目 = 一个 Claude Code worker
+**这个仓库自己就是它维护的**——`docs/CONTRIBUTING.md` 就是给它提了个 issue 后，它自己接单、写完、开 PR、CI 绿了自动合并进来的（见 issue #2 / PR #3）。
 
-**一个仓库对应一个"远程工程师"** —— 群和私聊都只是入口，同一仓库的活共用同一份本地 checkout（按仓库串行，避免两个房间并发改同一工作树）。但**多轮会话按「房间 × 项目」隔离**：不同群、不同私聊用户即便都在聊同一个仓库，各自的对话上下文互不串台。每次派活前会把工作树拉回干净的 `origin/base`（丢弃上个任务的脏改动/残留分支），不让改动串进下一个 PR。
+## 它凭什么不一样
 
-- **群 ↔ 项目（固定绑定）**：未绑定的群里发 Gitea 仓库地址（纯链接，或 `/bind <url>`，或 `@bot <url> 顺带派个活`）→ 用 `GITEA_TOKEN` clone 到 `PROJECTS_ROOT/<host>/<owner>/<repo>`，记录到 `store/bindings.json`（重启保留）。之后该群的活都归这个项目；已绑后再发裸地址不会自动换绑，需用 `/bind` 显式换。
-- **私聊（DM）↔ 自动分诊**：DM 不绑死仓库，按内容判断归属：①带仓库链接→直接路由；②文本含 `owner/repo` 全名→路由；③用轻量 `claude`（带最近对话）对照已知项目清单分诊；④仅裸仓库名命中→兜底路由；⑤都没命中→沿用这个 DM 上次的项目（多轮对话不必每条都点名）；⑥仍不确定→反问；无任何已知项目→让对方发地址。命中后都会按需登记并校验/修复本地 checkout。
-- **派活后**：改代码 → 从 `base` 建分支 `claude/xxx` → commit → push → 调 Gitea API 开 PR → **PR 链接**发回；纯问答直接回答；信息不足直接反问（接同一会话）。
-- **并发**：不同项目并行（受 `MAX_CONCURRENCY`），同一项目任务串行；排队时会**立即回执**「已排队」（并说明能否用 `/cancel` 让路），消息不会静默消失。
+- 🎯 **对结果负责，不是 fire-and-forget。** 开了 PR 就盯到合并：收到评审意见自动改、CI 挂了自动修（各带次数上限防空转）、满足条件自动合并，全程回报进展。合并/关闭才销账。
+- 📥 **五个派活入口。** 群里 @ / 私聊 / 触发词 / **Gitea issue 指派**（不进聊天软件也能下任务）/ 没人理它时**自己巡检找活**（autopilot 自己认领开 PR）。
+- 🧠 **有记忆，跨周不失忆。** 多轮会话按「房间×项目」隔离并持久化（重启不断）；超过会话 TTL 后，靠**项目长期记忆**（关键决策+原因、约定、踩过的坑，它自己沉淀）和**聊天逐字记录**（问它"上周聊到哪了"它自己去翻）接续。
+- 🗣️ **像同事，不像命令行。** 线程化回复不串台、长任务流式输出不静默、排队了立刻回执、能收发图片/文件/附件（E2EE 房间照常）、群里有人说错了它还会主动插话纠正（可关）。
+- 🏠 **一切都在你自己的机器上。** 本机 Claude Code + 自托管 Matrix + 自托管 Gitea：代码、凭证、聊天记录不出门。
 
-"已知项目清单"零配置 —— 由被绑定 / 被路由过的仓库自动汇总。需要 `GITEA_TOKEN`（clone 私有库 + 开 PR）；本地 `origin` 内嵌该 token 以便 push（明文存于 `.git/config`，自托管可接受）。
+## 架构一图流
 
-## 前置条件
+```
+   Matrix（你和同事）              Gitea（issue / PR / CI）
+     │ @派活·私聊·发文件              │ issue 指派 = 派活
+     ▼                              ▼
+  ┌────────────────────────────────────────────┐
+  │ bot（单进程异步守护，职责单一的小模块）       │
+  │  寻址 → 路由 → 派活 → 流式回报               │
+  │  ├─ PR 台账：盯评审/CI → 自动改 → 自动合并    │
+  │  ├─ 工单接活：认领 → 干活 → PR(Closes #N)    │
+  │  └─ 自驱心跳：闲时巡检 → 自己找活开 PR        │
+  └───────────────────┬────────────────────────┘
+                      ▼
+          本机 Claude Code（claude -p）
+     每仓库一份 checkout：建分支 → 改码 → 测试 → push → 开 PR
+```
 
-1. 本机已安装并登录 **Claude Code**（`claude` 命令可用）。机器人以**运行它的系统用户**身份调用。
-2. 一个 Matrix 账号：用**你自己的账号**（以"你本人"收发）或**专用 bot 账号**（机器人身份）。
-3. （可选，建议）E2EE：装系统 `libolm`。Arch/CachyOS：`sudo pacman -S libolm`
+**一个仓库 = 一名工程师**：群和私聊只是入口，同一仓库共用一份本地 checkout（按仓库串行，排队有回执）；但会话按「房间×项目」隔离，不同群/不同人互不串台。每次派活前工作树先拉回干净的 `origin/base`，上个任务的残留不会污染下个 PR。不同仓库并行（`MAX_CONCURRENCY`）。
 
-## 安装
+## 五分钟跑起来
+
+前置：本机装好并登录 [Claude Code](https://claude.com/claude-code)（`claude` 命令可用）；一个 Matrix 账号（自己的或专用 bot 号）；（可选）E2EE 需要系统 `libolm`。
 
 ```bash
-cd matrix-claude-bot
+git clone <this-repo> && cd matrix-claude-bot
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-# E2EE 额外：sudo pacman -S libolm && .venv/bin/pip install "matrix-nio[e2e]"
-cp .env.example .env        # 然后填好账号
+# E2EE（可选）：sudo pacman -S libolm && .venv/bin/pip install "matrix-nio[e2e]"
+cp .env.example .env   # 填 Matrix 账号 + GITEA_HOST / GITEA_TOKEN
+./run.sh
 ```
 
-## 配置（.env 关键项）
+然后：
+1. 把 bot 拉进群（谁邀请都进），群里发一个 Gitea 仓库地址（或 `/bind <URL>`）→ 自动 clone 绑定；
+2. @它派活。改代码的活它会开 PR 并盯到合并；纯问答直接回。私聊不用绑定，它按内容自动分诊到项目；
+3. 想不打字：Gitea 上把 issue 指派给它的账号，它每 5 分钟收一次单。
 
-| 项 | 说明 |
-|---|---|
-| `MATRIX_HOMESERVER` / `MATRIX_USER_ID` / `MATRIX_PASSWORD` | 账号；首次登录后可删掉密码 |
-| `MATRIX_ENABLE_E2E` | 加密房间需要；需先装 libolm + `matrix-nio[e2e]` |
-| `GITEA_HOST` | 受信任的 Gitea 根地址；**token 只注入到该主机**，建议必填 |
-| `CLAUDE_DANGEROUS` | `1`=无人值守全自动（跳过工具授权）；`0` 更安全 |
-| `PROACTIVE` | 主动插话：群里没 @ 也会判断该不该插话/纠错（**默认开**）；`0` 关 |
-| `GROUP_FOLLOWUP_WINDOW` | 群里 @ 过 bot 后，这段秒数内的后续消息免重复 @ 也接着处理；`0` 关 |
-
-## 运行
-
-```bash
-./run.sh           # 或： .venv/bin/python bot.py
-```
-
-首次用密码登录并把 token 存到 `store/credentials.json`（权限 600），之后用 token 复用同一设备。
-
-### 开机自启（systemd user，按你自己的用户跑，保证能用到 claude 的登录态）
+常驻运行（systemd user，用你自己的用户跑，才能用到 `claude` 的登录态）：
 
 ```ini
 # ~/.config/systemd/user/matrix-claude.service
@@ -83,67 +71,89 @@ After=network-online.target
 WorkingDirectory=%h/Projects/matrix-claude-bot
 ExecStart=%h/Projects/matrix-claude-bot/.venv/bin/python bot.py
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=default.target
 ```
 ```bash
-systemctl --user enable --now matrix-claude.service
+systemctl --user enable --now matrix-claude.service && loginctl enable-linger $USER
 journalctl --user -u matrix-claude -f
 ```
 
-## 自检（冒烟测试）
+## 能力清单
 
-不连真实 Matrix，用假 client 跑通「启动 → 收消息 → 派活 → 回复」整条链路，校验上下文/回复识别/会话/安全等行为：
+**派活与对话**
+- 群 @ / 私聊 / 触发词派活；群里 @ 过后的续话窗口内免重复 @（`GROUP_FOLLOWUP_WINDOW`）
+- 线程化回复（`m.thread`，多话题并行不串台）；流式渐进输出（占位消息边生成边编辑，长任务不静默）
+- 排队回执：同项目已有任务在跑时立即告知「已排队」，并说明能否 `/cancel` 让路
+- 收文件：图片/文件/音视频自动下载落盘（加密房解密），路径交给 Claude 读取分析；发文件：回复里写 `[[send-file: 路径]]` 即作为附件发回（仅限工作目录内，挡越权外泄）
+- 主动插话（`PROACTIVE`，默认开）：没被 @ 也判断该不该开口——有人求助，或**对话里有明显错误值得纠正**；绑了仓库的群里用只读模式看着真实代码作答；冷却 + 强 PASS 倾向防刷屏
+
+**Gitea 闭环**
+- PR 台账：bot 开的 PR 全部记账跟进——新评审意见→自动在原分支处理并推送；CI 失败→自动修（各 `PR_AUTOFIX_MAX` 次上限）；可合并+CI 绿+无未决改动→**自动合并**（`PR_AUTOMERGE`，默认开）
+- 工单接活（`ISSUE_INTAKE`，默认开）：issue 指派给 bot 账号 = 派活。接单即评论认领，干完开 PR（描述带 `Closes #N`，合并自动关单）、链接贴回 issue，进展同步到项目房间；台账持久化，重启不重复接单；重派 = 关单再重开
+- 自驱心跳（`PROACTIVE_HEARTBEAT_ENABLED`，默认开）：没人派活时按小时巡检各项目找值得做的事（小 bug、缺测试、陈旧 TODO）；autopilot 模式自己认领开 PR，关掉则只提议等你点头
+
+**记忆与上下文**
+- 会话按「房间×项目」隔离，session id 落盘，重启多轮不断；空闲 24h（`SESSION_TTL`）后自动开新会话
+- 项目长期记忆：值得跨周记住的事实（决策+原因、约定、坑）由它自己写进 `store/memory/<项目>/`，开新会话时按预算注入——会话过期也"记得住事"
+- 聊天逐字记录：按房间落盘（保留 30 天），系统提示里只给**路径**，被问到更早对话时它自己去读/grep——不把历史塞爆每次 prompt；`/backfill` 可回灌开启前的历史
+
+**元命令**（群里不必 @ 也认）：`/help` `/bind <URL>` `/status`（项目/在跑任务/在跟 PR/在办工单一屏可见）`/summarize [N]` `/cancel` `/reset` `/backfill [天]`
+
+## 安全模型（必读）
+
+这个 bot 的默认姿态是**全自动**：`CLAUDE_DANGEROUS=1`（跳过工具授权）+ 主动插话 + autopilot 自驱 + PR 自动合并 + 工单接活全默认开。合起来就是「巡检→开 PR→自动合并到 main」的闭环，**而且它不做用户白名单**——任何能给它发消息的人都能驱动它。
+
+这套取舍只适用于：**私有/仅内网可达/关闭注册的 homeserver + 可信用户 + 有快照可回滚的环境**。要点：
+
+- **把"谁能用"放到 homeserver 层**：关闭开放注册、不开联邦。bot 自己不挡人。
+- **token 隔离**：`GITEA_TOKEN` 只注入 `GITEA_HOST` 一台主机的 clone/push 地址；不设 `GITEA_HOST` 则 fail-closed（连仓库都不识别）。
+- **出口脱敏**：外发文本自动抹掉 token/密码（兜底，非主防线）。
+- **想保守**：`PROACTIVE=0` `PROACTIVE_AUTOPILOT=0` `PR_AUTOMERGE=0` `ISSUE_INTAKE=0` `CLAUDE_DANGEROUS=0`，逐项关回。
+
+若你的 homeserver 对公网/联邦开放，**等于把服务器和私有库交给任何能连上的人**——别这么部署。
+
+## 自检
+
+不连真实 Matrix，71 项离线冒烟跑通「启动→收消息→派活→回复」全链路（含上下文隔离、PR 跟进、工单接活、安全位）：
 
 ```bash
 .venv/bin/python tests/smoke.py
 ```
 
-## E2EE 说明
+仓库自带 Gitea Actions CI（冒烟 + pyflakes）；配合 `PR_AUTOMERGE`，绿了 PR 才会被自动合并。
 
-- 开启后机器人是一个**未验证的新设备**。要解密别人发的加密消息，通常需在 Element 里给它**共享密钥/验证**一次；发消息用了 `ignore_unverified_devices=True`，不会因对方设备未验证而卡住。
-- 没装 libolm 时即使 `MATRIX_ENABLE_E2E=1` 也会降级为明文模式，日志会提示。
+## 常见问题
 
-## 安全提醒
+**为什么是 Matrix，不是 Slack/企业微信？** 三件事官方 API 给不了：看到房间**全部消息**（主动插话的前提）、**随时主动发消息**（自驱汇报的前提）、可以直接用**你自己的账号**跑。Matrix 自托管还意味着聊天记录不出门。
 
-机器人会在你的服务器上**运行命令、读写文件**（`CLAUDE_DANGEROUS=1` 时无需逐次授权）。要点：
+**为什么不怕它乱来？** CI 是闸（挂了不合并）、环境有快照可回滚、token 只到一台内网 Gitea。信任是配置出来的，不是祈祷出来的——上面每个默认开的开关都能关。
 
-- **无访问控制（有意为之）**：本 bot 不做用户/房间白名单——任何能给它发消息的人都能驱动 Claude（跑命令、读写文件、用 `GITEA_TOKEN` clone/读私有库），谁邀请都进房。只适用于"所有可达用户都可信"的环境：私有 / 仅 LAN 可达 / 关了注册的 homeserver。**若你的 homeserver 开放注册或可被外部/联邦访问，等于把服务器和 token 能读到的私有库交给任何能连上的人**——这种情况别这么部署。
-- **token 隔离**：`GITEA_TOKEN` 只注入到 `GITEA_HOST` 的 clone/push 地址，其他主机一律不带。**fail-closed**：不设 `GITEA_HOST` 就完全不识别任何仓库（连 clone 都不做）。
-- **工作目录隔离**：兜底目录是 `PROJECTS_ROOT/_scratch`，别把 `CLAUDE_WORKDIR` 指到含 `.env` / `store/` 的目录。
-- **出口脱敏**：外发文本自动抹掉 `GITEA_TOKEN`、登录密码与 Matrix access token（兜底，非主防线）。
-- **媒体**：下载收到的文件（不再按用户/房间过滤），单文件受 `MEDIA_MAX_MB` 限制、每房间按 `MEDIA_KEEP` 滚动删旧；文件名经消毒（挡 `../` 穿越）。存到 `PROJECTS_ROOT/_media`（已 gitignore），不放进仓库工作树以免被误 commit。Claude 用绝对路径读取，`CLAUDE_DANGEROUS=0` 时可能读不到 cwd 之外的文件。
-- **默认偏"积极自主"**：开箱默认 `PROACTIVE=1`（群里没 @ 也会判断要不要插话/纠错）、`PROACTIVE_AUTOPILOT=1`（巡检到事自己开 PR）、`PR_AUTOMERGE=1`（PR 满足条件自动合并）、`TRANSCRIPT_ENABLED=1`（对话明文落盘）。**合起来就是"巡检→开 PR→自动合并到 main"的全自动闭环**，且无访问控制、无审批。想要保守：把对应项设 `0`。
+**它和在终端里用 Claude Code 有什么区别？** 终端是「你在场才干活」；这是「你不在场它也在干」——接工单、盯 PR、修 CI、找活，以及一个团队都能 @ 它。
 
-> **把"谁能用"放到 homeserver 这层**：bot 自己不再挡人，所以谁能驱动它 = 谁能在你的 Synapse 上给它发消息。请在 homeserver 侧收紧（**关闭开放注册、别开放联邦**），而不是指望 bot 拦。
->
-> `--dangerously-skip-permissions` 是有意保留的（让 Claude 真正干活），风险靠"快照可回滚的环境 + 可信用户 + 凭证隔离"兜底。
+## 模块导览（贡献者向）
 
-## 文件
+依赖方向单向无环：`state → fmt → matrix_io → addressing → dispatch → tasks → {pr_followup, heartbeat → issue_intake, proactive, media} → bot`
 
-按职责分模块（`bot.py` 原是单体，已拆开）。依赖方向单向无环：
-`state → fmt → matrix_io → addressing → dispatch → tasks → {pr_followup, heartbeat → issue_intake, proactive, media} → bot`。
+| 模块 | 职责 |
+|---|---|
+| `bot.py` | 入口：登录/持久化、事件回调、起后台循环，只做编排 |
+| `state.py` | 进程级共享运行态（client、上下文缓冲、路由记忆） |
+| `fmt.py` | 纯文本/富文本格式化（分块、代码围栏自洽、消毒 HTML） |
+| `matrix_io.py` | 收发：分块、线程化、流式占位与编辑、附件上传 |
+| `addressing.py` | 该不该应答：点名/回复/触发词/续话窗口 |
+| `dispatch.py` | 消息归哪个项目：群按绑定、DM 按内容分诊 |
+| `tasks.py` | 在项目上跑任务并回发 + 全部元命令 |
+| `pr_followup.py` / `pr_ledger.py` | PR 跟进循环 / PR 台账（对结果负责的状态底座） |
+| `issue_intake.py` / `issue_ledger.py` | 工单接活循环 / 工单台账（防重复接单） |
+| `heartbeat.py` | 自驱心跳：闲时巡检找活 |
+| `proactive.py` | 主动插话：求助/纠错判定 |
+| `media.py` | 图片/文件收发落盘 |
+| `claude_runner.py` | 调 `claude -p`：多轮会话/流式/取消/只读查证 |
+| `memory.py` / `transcript.py` | 项目长期记忆 / 聊天逐字记录 |
+| `projects.py` / `gitea.py` | 仓库解析绑定 clone / Gitea REST 小客户端 |
+| `config.py` / `storage.py` | `.env` 开关 / 原子落盘小工具 |
 
-- `bot.py` — 入口：登录/持久化、注册事件回调（`on_message`/`on_invite`/`on_media`）、`main` 起两个后台循环。只做编排
-- `state.py` — 进程级共享运行态：Matrix client、本机身份、各房间上下文/历史缓冲、路由记忆、`_spawn`/会话 key
-- `fmt.py` — 纯文本/富文本/上下文格式化（分块、代码围栏自洽、markdown→消毒 HTML、背景渲染），无 Matrix 调用
-- `matrix_io.py` — 收发：分块发送、线程化(m.thread)、流式占位与编辑(m.replace)、正在输入、附件上传(`_LiveReply`/`send`/`_emit_files`)
-- `addressing.py` — 该不该应答：点名 / 回复 bot / 触发词 / 续话窗口 / 剥引用块与自我 @
-- `dispatch.py` — 把消息归到哪个项目：群按绑定、DM 按内容分诊（强信号 + 轻量 LLM + 兜底）
-- `tasks.py` — 在项目上跑任务并回发（流式/附件/线程）+ 元命令 `/reset` `/summarize` `/cancel` `/status` `/backfill` `/bind`
-- `pr_followup.py` — PR 台账跟进循环：处理评审/CI、满足条件自动合并、回报原房间
-- `heartbeat.py` — 自驱心跳循环：没人派活时巡检找事，autopilot 自己开 PR
-- `issue_intake.py` — 工单接活循环：Gitea 上指派给 bot 的 issue = 派活，认领→开 PR（Closes #N）→回报
-- `issue_ledger.py` — 工单台账：接过的 issue 记账防重复接单，关单销账（持久化到 `store/issue_ledger.json`）
-- `proactive.py` — 主动插话：不被 @ 也判断该不该就群消息开口（求助 / 有错可纠正）
-- `media.py` — 图片/文件/音视频：下载（加密房解密）落盘、并入上下文、被点名时交给 Claude 读取
-- `claude_runner.py` — 调 `claude -p`：`ask()` 带工具干活+多轮会话（支持 `on_delta` 流式 + `cancel`），`quick()` 一次性判断，`consult()` 只读查证
-- `memory.py` — 项目长期记忆：跨会话/跨重启留存的事实库，开新会话时注入系统提示
-- `transcript.py` — 按房间的聊天逐字记录：落盘 + 回溯更早对话 + 从 Matrix 回灌历史
-- `pr_ledger.py` — PR 台账：bot 开过的 PR 记账，跟到合并/关闭才销账（持久化到 `store/pr_ledger.json`）
-- `gitea.py` — Gitea REST 只读小客户端：bot 自己轮询 PR 状态 / 评审 / CI
-- `projects.py` — 房间↔Gitea 仓库的解析/绑定/clone 与路由
-- `config.py` — 读取 `.env` 的全部开关
-- `storage.py` — 原子落盘小工具（写 `.tmp` + `os.replace`）；纯 stdlib 叶子，被 `projects` / `pr_ledger` / `state` / `claude_runner` / `transcript` / `memory` 共用
-- `tests/smoke.py` — 离线冒烟自检
+全部配置项及说明见 [.env.example](.env.example)。
