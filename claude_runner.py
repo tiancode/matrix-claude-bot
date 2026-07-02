@@ -259,8 +259,10 @@ class ClaudeRunner:
         cmd = [settings.claude_bin, "-p", prompt]
         cmd += (["--output-format", "stream-json", "--verbose"] if stream
                 else ["--output-format", "json"])
-        if settings.claude_model:
-            cmd += ["--model", settings.claude_model]
+        # 干活用 CLAUDE_MODEL；轻判断（非 agentic 的 quick）优先 CLAUDE_QUICK_MODEL（小模型省钱提速）
+        model = settings.claude_model if agentic else (settings.claude_quick_model or settings.claude_model)
+        if model:
+            cmd += ["--model", model]
         if agentic:
             if settings.claude_dangerous:
                 cmd += ["--dangerously-skip-permissions"]
@@ -412,8 +414,9 @@ class ClaudeRunner:
         """只读 agentic 命令：plan 模式能读代码但不会改/提交，用于主动插话在仓库里查证。"""
         cmd = [settings.claude_bin, "-p", prompt, "--output-format", "json",
                "--permission-mode", "plan"]
-        if settings.claude_model:
-            cmd += ["--model", settings.claude_model]
+        model = settings.claude_quick_model or settings.claude_model   # 只读查证也算轻判断
+        if model:
+            cmd += ["--model", model]
         sp = system_prompt if system_prompt is not None else settings.claude_system_prompt
         if sp:
             cmd += ["--append-system-prompt", sp]
