@@ -19,6 +19,9 @@ import memory
 import issue_ledger
 import pr_ledger
 import transcript
+import inflight
+import gitea
+import gitea_health
 
 log = logging.getLogger("matrix-claude.tasks")
 
@@ -174,47 +177,60 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         _project_last_active[rec["id"]] = time.time()      # 标记活跃：自驱心跳会避让最近在弄的项目
     sp = transcript.augment_system_prompt(sp, rid)   # 指给它本房间历史日志，便于回溯更早对话
     sess = _sess_key(rec, rid)
-    # 排队回执：串行锁被占（同项目已有任务在跑）时立即知会，别让用户对着 typing 猜消息丢没丢。
-    # 尽力而为——与对方拿锁存在竞态，漏发只影响提示不影响排队本身。
-    if runner.busy(lock_key or sess):
-        note = "⏳ 上一个任务还在跑，这条已排队，轮到会自动开始"
-        note += ("；等不及可发 /cancel 停掉当前任务。" if runner.running(rid)
-                 else "（正忙的是其它房间或自驱/工单任务，本房间 /cancel 停不了它）。")
-        await send(rid, note, thread_root=thread_root)
-    if settings.stream_replies:                      # 流式：边生成边编辑同一条占位消息
-        live = _LiveReply(rid, thread_root=thread_root)
-        try:
-            answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
-                                      lock_key=lock_key, prepare=prepare,
-                                      on_delta=live.on_delta, cancel_key=rid)
-        except ClaudeCancelled:
-            await live.finalize("🛑 已停止。", track=False)
-            return
-        except Exception as e:
-            # 任务异常（超时 / 非零退出等）：先把占位收尾成报错，别让它永远停在"⏳ 正在干活…"。
-            # 就地收尾即是给用户的唯一报错，故 return——不再往上抛给 handle_task 二次发一条"出错了"。
-            log.exception("流式任务失败")
+    # 在途登记：进执行/排队即记一笔，重启对账据此收尾占位/催重发（见 inflight）。摘除放 finally，
+    # 覆盖成功/取消/报错所有退出路径。占位 eid 在占位创建后（首个 delta）再补录。
+    inflight_key = inflight.record(rid, text, inflight.KIND_CHAT)
+    try:
+        # 排队回执：串行锁被占（同项目已有任务在跑）时立即知会，别让用户对着 typing 猜消息丢没丢。
+        # 尽力而为——与对方拿锁存在竞态，漏发只影响提示不影响排队本身。
+        if runner.busy(lock_key or sess):
+            note = "⏳ 上一个任务还在跑，这条已排队，轮到会自动开始"
+            note += ("；等不及可发 /cancel 停掉当前任务。" if runner.running(rid)
+                     else "（正忙的是其它房间或自驱/工单任务，本房间 /cancel 停不了它）。")
+            await send(rid, note, thread_root=thread_root)
+        if settings.stream_replies:                      # 流式：边生成边编辑同一条占位消息
+            live = _LiveReply(rid, thread_root=thread_root)
+            _attached = {"v": False}
+
+            async def _relay(t, tool):                   # 占位一建出来就把 eid 补进登记簿
+                await live.on_delta(t, tool)
+                if live.eid and not _attached["v"]:
+                    inflight.attach_eid(inflight_key, live.eid)
+                    _attached["v"] = True
             try:
-                await live.finalize(f"出错了：{e}", track=False)
-            except Exception:
-                log.exception("占位收尾成报错也失败了")
-            return
-        answer = await _emit_files(room, answer, cwd, thread_root)
-        await live.finalize(answer, track=True)
-    else:
-        try:
-            answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
-                                      lock_key=lock_key, prepare=prepare, cancel_key=rid)
-        except ClaudeCancelled:
-            await send(rid, "🛑 已停止。", thread_root=thread_root)
-            return
-        answer = await _emit_files(room, answer, cwd, thread_root)
-        await send(rid, answer, track=True, thread_root=thread_root)
-    log.info("[%s] 完成 %d 字", rid, len(answer))
-    if not rec.get("general"):   # 回复里若开了本项目的 PR，记进台账，由跟进循环盯到合并
-        pr = _extract_pr(answer, rec)
-        if pr and pr_ledger.record(rec["id"], pr[0], pr[1], rid):
-            log.info("[%s] PR #%d 进台账，开始跟进", rid, pr[0])
+                answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
+                                          lock_key=lock_key, prepare=prepare,
+                                          on_delta=_relay, cancel_key=rid)
+            except ClaudeCancelled:
+                await live.finalize("🛑 已停止。", track=False)
+                return
+            except Exception as e:
+                # 任务异常（超时 / 非零退出等）：先把占位收尾成报错，别让它永远停在"⏳ 正在干活…"。
+                # 就地收尾即是给用户的唯一报错，故 return——不再往上抛给 handle_task 二次发一条"出错了"。
+                log.exception("流式任务失败")
+                try:
+                    await live.finalize(f"出错了：{e}", track=False)
+                except Exception:
+                    log.exception("占位收尾成报错也失败了")
+                return
+            answer = await _emit_files(room, answer, cwd, thread_root)
+            await live.finalize(answer, track=True)
+        else:
+            try:
+                answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
+                                          lock_key=lock_key, prepare=prepare, cancel_key=rid)
+            except ClaudeCancelled:
+                await send(rid, "🛑 已停止。", thread_root=thread_root)
+                return
+            answer = await _emit_files(room, answer, cwd, thread_root)
+            await send(rid, answer, track=True, thread_root=thread_root)
+        log.info("[%s] 完成 %d 字", rid, len(answer))
+        if not rec.get("general"):   # 回复里若开了本项目的 PR，记进台账，由跟进循环盯到合并
+            pr = _extract_pr(answer, rec)
+            if pr and pr_ledger.record(rec["id"], pr[0], pr[1], rid):
+                log.info("[%s] PR #%d 进台账，开始跟进", rid, pr[0])
+    finally:
+        inflight.remove(inflight_key)
 
 
 
@@ -371,5 +387,8 @@ async def handle_status(room: MatrixRoom):
           if settings.proactive_heartbeat_enabled else "关")
     lines.append(f"• 主动插话={'开' if settings.proactive else '关'} · 自驱心跳={hb}"
                  f" · 工单接活={'开' if settings.issue_intake_enabled else '关'}")
+    gitea_line = gitea_health.status_line(gitea.health())   # Gitea 连不上/ token 失效时在这暴露出来
+    if gitea_line:
+        lines.append(gitea_line)
     await send(rid, "\n".join(lines))
 

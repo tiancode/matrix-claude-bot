@@ -19,8 +19,10 @@ from nio import (
     AsyncClient,
     AsyncClientConfig,
     InviteMemberEvent,
+    LocalProtocolError,
     LoginResponse,
     MatrixRoom,
+    MegolmEvent,
     RoomEncryptedMedia,
     RoomMemberEvent,
     RoomMessageMedia,
@@ -35,11 +37,15 @@ from state import (_context, _sent_events, _last_project_by_room, _group_engaged
 from claude_runner import runner  # noqa: F401
 from projects import projects, parse_repo_url, proj_id
 import transcript
+import inflight
+import issue_ledger
+import pr_ledger
+import gitea
 
 # re-export：保持 `bot.X` 可用（测试按这些名字访问内部实现）
 from fmt import (_split, _to_html, _format_context, _human_gap, _safe_name)  # noqa: F401
 from matrix_io import (send, _is_dm, _LiveReply, _emit_files, _within_allowed,  # noqa: F401
-                       _thread_root_of, _thread_rel, _resolve_reply_author)
+                       _thread_root_of, _thread_rel, _resolve_reply_author, _edit_message)
 from addressing import (_is_addressed, _has_trigger, _strip_trigger, _strip_reply_fallback,  # noqa: F401
                         _strip_self_mentions, _mark_engaged, _looks_actionable)
 from dispatch import _dispatch, _triage, TRIAGE_GENERAL  # noqa: F401
@@ -56,6 +62,11 @@ from media import (on_media, _process_media, _prune_dir,  # noqa: F401
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("matrix-claude")
+
+# 加密消息解不开时的明文提示限流：room_id -> 上次提示时刻。密钥缺失往往一连串消息
+# 都解不开，每房间这段窗口内最多提示一次，别刷屏。纯内存态，重启丢了无妨。
+_UNDECRYPT_NOTICE_COOLDOWN = 600   # 秒（10 分钟）
+_last_undecrypt_notice: dict[str, float] = {}
 
 
 async def on_message(room: MatrixRoom, event: RoomMessageText):
@@ -165,6 +176,36 @@ async def _welcome_when_ready(rid: str):
         await send(rid, _WELCOME)
     except Exception:
         log.exception("发送欢迎语失败 %s", rid)
+
+
+async def on_undecrypted(room: MatrixRoom, event: MegolmEvent):
+    """加密消息解不开（megolm 会话密钥缺失）时的兜底：向对方要密钥 + 回一条明文提示，别纯沉默。
+
+    典型诱因：bot 清过 store 换了新 device、或对方客户端没把会话密钥分享到位。这类事件
+    以 MegolmEvent 掉地上，用户在加密房 @bot 只会得到纯沉默，无从排查。
+    初始 sync 期间的积压解密失败不提示（同 on_message 的手法），免得一启动就对历史消息群发。"""
+    if not settings.process_backlog and not state._synced:  # 跳过历史/离线积压
+        return
+    # ① 先补救：向对方设备请求这条消息的会话密钥。nio 对同一 session 已在请求时会抛
+    #    LocalProtocolError（该 session_id 已有 outgoing_key_request），接住即可——本就无需重发。
+    try:
+        await state.client.request_room_key(event)
+    except LocalProtocolError:
+        pass                                   # 已在要这把密钥了，别重复请求
+    except Exception:
+        log.exception("请求会话密钥失败 %s", room.room_id)
+    # ② 限流：仅对"明文提示"限流；密钥请求每条都试（nio 自身按 session 去重，不会真刷屏）。
+    now = time.time()
+    if now - _last_undecrypt_notice.get(room.room_id, 0.0) < _UNDECRYPT_NOTICE_COOLDOWN:
+        return
+    _last_undecrypt_notice[room.room_id] = now
+    # ③ 回一条明文提示，让用户至少知道发生了什么、下一步怎么办。发失败只记日志。
+    try:
+        await send(room.room_id,
+                   "这条加密消息我解不开（密钥缺失），已尝试向你的客户端要密钥——"
+                   "稍等重发一次试试；还不行就在客户端里验证一下我这个设备。")
+    except Exception:
+        log.exception("发送解密失败提示失败 %s", room.room_id)
 
 
 async def on_member(room: MatrixRoom, event: RoomMemberEvent):
@@ -288,6 +329,92 @@ async def _login():
     log.info("登录成功并保存会话: %s (device %s)", state.client.user_id, state.client.device_id)
 
 
+def _pr_body_closes_issue(body: str, n: int) -> bool:
+    """PR 正文是否声明关闭工单 #n。_issue_execute 生成 PR 时要求带一行 `Closes #N`；
+    这里也认 Gitea 同样识别的 fixes/resolves 等同义词，大小写不敏感。
+    用 #n 后接词边界收口，免得工单 #12 误命中 #123。"""
+    return bool(re.search(
+        rf"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{n}\b", body or ""))
+
+
+async def _find_open_pr_for_issue(rec: dict, n: int) -> tuple[int, str] | None:
+    """在仓库 open PR 里找正文 Closes #n 的那条（崩在"PR 已开、台账没记 pr 号"之间）。
+    找到返回 (PR 号, 链接)，否则 None。"""
+    for pr in await gitea.open_pulls(rec):
+        if isinstance(pr, dict) and _pr_body_closes_issue(pr.get("body") or "", n):
+            num = pr.get("number")
+            if isinstance(num, int):
+                return num, (pr.get("html_url") or "")
+    return None
+
+
+async def _reconcile_inflight():
+    """启动对账在途登记簿：重启把内存里跑/排队的活蒸发了，用户端零提示。
+    聊天任务无法自动续（prompt/上下文已丢）→ 有占位就把占位编辑成中断提示，没占位（排队中就
+    死了）就补发一条催重发。工单交给 _reconcile_issues 自动重派，这里不催重发。
+    房间可能已退（不在 client.rooms）→ 跳过别报错。处理完清空整簿。"""
+    entries = inflight.active()
+    if entries:
+        log.info("启动对账：在途登记簿有 %d 条残留任务待收尾", len(entries))
+    rooms = getattr(state.client, "rooms", {}) or {}
+    for e in entries:
+        if e.get("kind") == inflight.KIND_ISSUE:
+            continue   # 工单自动重派（_reconcile_issues），不叫用户重发
+        room = e.get("room") or ""
+        if room not in rooms:
+            log.info("启动对账：房间 %s 已退出，跳过在途条目", room)
+            continue
+        summary = (e.get("summary") or "").strip()
+        tip = "⚠️ 我刚重启过，上一个任务被中断了，请把它重新发一遍。"
+        if summary:
+            tip += f"\n（中断的任务：{summary[:80]}）"
+        eid = e.get("eid") or ""
+        try:
+            if eid and await _edit_message(room, eid, tip):
+                log.info("启动对账：占位 %s 收尾成中断提示", eid)
+            else:
+                await send(room, tip)   # 无占位（排队中就死）或编辑失败 → 补发一条
+        except Exception:
+            log.exception("启动对账：向房间 %s 发送中断提示失败", room)
+    inflight.clear()
+
+
+async def _reconcile_issues():
+    """启动对账工单：issue_ledger 里 pr==0（接了单没开出 PR）= 崩在执行中途，会被台账挡着
+    永不重接、也不被 _sweep_closed 清（它只清已关闭的）→ 在这里重派。
+    防重复开 PR：崩溃可能发生在「PR 已开、台账还没记 pr 号」之间——重派前先查该仓库 open PR 里
+    有没有正文 Closes #N 的，有就只补记台账继续跟进，没有才真的重派执行。"""
+    for entry in list(issue_ledger.active()):
+        if entry.get("pr"):
+            continue   # 已开过 PR：由 PR 跟进循环盯，不用重派
+        pid, n, room = entry["pid"], entry["number"], entry.get("room") or ""
+        rec = projects.get_project(pid)
+        if not rec:
+            continue   # 项目已不在册：交给 _sweep_closed 销账
+        pr = await _find_open_pr_for_issue(rec, n)
+        if pr:
+            issue_ledger.update(pid, n, pr=pr[0])
+            if pr_ledger.record(pid, pr[0], pr[1], room):
+                log.info("[%s] 启动对账：工单 #%d 已有 PR #%d（崩在记账前），补记台账继续跟进",
+                         pid, n, pr[0])
+            continue
+        info = await gitea.issue_info(rec, n)
+        if info is None:
+            log.info("[%s] 启动对账：工单 #%d 查不到（网络抖动？），留待轮询处理", pid, n)
+            continue
+        if info.get("state") == "closed":
+            issue_ledger.remove(pid, n)   # 已被关（提问类答完关单）：无需重派
+            log.info("[%s] 启动对账：工单 #%d 已关闭，销账", pid, n)
+            continue
+        log.info("[%s] 启动对账：工单 #%d 接了单没开 PR，重新派执行", pid, n)
+        try:
+            if room and room in (getattr(state.client, "rooms", {}) or {}):
+                await send(room, f"↻ 我刚重启过，工单 #{n} 没做完，重新接手处理——", track=True)
+        except Exception:
+            log.exception("启动对账：工单 #%d 重启通知发送失败", n)
+        state._spawn(_issue_execute(rec, room, info))
+
+
 async def main():
     state.client = _new_client()
     await _login()
@@ -313,12 +440,20 @@ async def main():
     state.client.add_event_callback(on_media, (RoomMessageMedia, RoomEncryptedMedia))
     state.client.add_event_callback(on_invite, InviteMemberEvent)
     state.client.add_event_callback(on_member, RoomMemberEvent)
+    state.client.add_event_callback(on_undecrypted, MegolmEvent)  # 解不开的加密消息：要密钥+提示，别沉默
 
     # 初始同步消化积压（此时 _synced 仍 False，被 on_message 挡掉），之后才处理新消息
     await state.client.sync(timeout=30000, full_state=True)
     state._synced = True
     for rid in list(state.client.rooms):   # 上次运行以来人散了的房间，启动时一并清掉
         await _leave_if_alone(rid)
+    # 重启对账：上次跑/排队中的活只在内存里，重启即蒸发、用户端零提示。把断掉的活收尾/催重发，
+    # pr==0 的工单重派（先查是否已开过 PR，防重复）。发送失败只记日志，绝不中断启动。
+    try:
+        await _reconcile_inflight()
+        await _reconcile_issues()
+    except Exception:
+        log.exception("启动对账失败（不影响继续运行）")
     if settings.transcript_enabled:   # 首次启用记录：对没灌过的房间各回灌一次历史（一次性，有标记不重复）
         for rid in list(state.client.rooms):
             if not transcript.is_backfilled(rid):
