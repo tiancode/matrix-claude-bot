@@ -115,6 +115,13 @@ async def comment_issue(rec: dict, number: int, body: str) -> bool:
     return st in (200, 201)
 
 
+async def open_pulls(rec: dict) -> list:
+    """仓库里 open 的 PR 列表（每条含 number、body、html_url）。
+    启动对账查「是否已为某工单开过 PR」用：崩溃可能发生在 PR 已开、台账还没记 pr 号之间。"""
+    st, d = await _aget(f"{_repo_api(rec)}/pulls?state=open")
+    return d if st == 200 and isinstance(d, list) else []
+
+
 async def pr_info(rec: dict, number: int) -> dict | None:
     """单个 PR 的状态：含 state(open/closed)、merged、mergeable、head.sha/ref。"""
     st, d = await _aget(f"{_repo_api(rec)}/pulls/{number}")

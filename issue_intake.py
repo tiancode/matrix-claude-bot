@@ -21,6 +21,7 @@ import gitea
 import issue_ledger
 import pr_ledger
 import memory
+import inflight
 
 log = logging.getLogger("matrix-claude.issue")
 
@@ -34,38 +35,43 @@ def _issue_brief(issue: dict) -> str:
 async def _issue_execute(rec: dict, room: str, issue: dict):
     """把一条工单当正式派活做完：开 PR（带 Closes #N）→ 进 PR 台账 → 回报房间 + issue 下留言。"""
     n = issue["number"]
-    comments = await gitea.issue_comments(rec, n)
-    ctx = "\n".join(f"- {(c.get('user') or {}).get('login') or '?'}: {(c.get('body') or '').strip()[:300]}"
-                    for c in comments[-10:] if (c.get("body") or "").strip())
-    prompt = (
-        f"Gitea 上有人把这个 issue 指派给你，请把它当成正式派活完成：\n{_issue_brief(issue)}\n"
-        + (f"\nissue 下的讨论（供参考）：\n{ctx}\n" if ctx else "")
-        + f"\n要改代码就照常建分支、commit、push、开 PR——PR 描述里必须带一行 `Closes #{n}`"
-        f"（合并后 Gitea 自动关单），最终回复附上 PR 链接；PR 链接我会自动贴回 issue，"
-        f"你不用再去 issue 下留言。\n"
-        f"若这个 issue 不需要改代码（提问 / 讨论类），直接给出结论，并用 Gitea API "
-        f"在 issue #{n} 下回复结论后关闭它。\n用简洁中文回复。"
-    )
-    sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
+    # 在途登记：执行中途崩了，重启对账（issue_ledger pr==0 那条路）据此重派；摘除放 finally。
+    inflight_key = inflight.record(room, _issue_brief(issue), inflight.KIND_ISSUE, issue=n)
     try:
-        async with _typing(room):
-            # cancel_key=汇报房间：房间里的 /cancel 也能停掉工单任务
-            answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"], system_prompt=sp,
-                                      lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec),
-                                      cancel_key=room)
-        _project_last_active[rec["id"]] = time.time()
-        await send(room, f"📋 工单 #{n} 处理结果：\n{answer}", track=True)
-        pr = _extract_pr(answer, rec)
-        if pr:
-            issue_ledger.update(rec["id"], n, pr=pr[0])
-            if pr_ledger.record(rec["id"], pr[0], pr[1], room):
-                log.info("[%s] 工单 #%d 开了 PR #%d，进台账跟到合并", rec["id"], n, pr[0])
-            await gitea.comment_issue(rec, n, f"已提交 PR：{pr[1]}（合并后本单自动关闭）")
-    except ClaudeCancelled:
-        await send(room, f"🛑 已停止工单 #{n} 的处理。")
-    except Exception as e:
-        log.exception("工单 #%s 处理失败", n)
-        await send(room, f"工单 #{n} 处理出错：{e}")
+        comments = await gitea.issue_comments(rec, n)
+        ctx = "\n".join(f"- {(c.get('user') or {}).get('login') or '?'}: {(c.get('body') or '').strip()[:300]}"
+                        for c in comments[-10:] if (c.get("body") or "").strip())
+        prompt = (
+            f"Gitea 上有人把这个 issue 指派给你，请把它当成正式派活完成：\n{_issue_brief(issue)}\n"
+            + (f"\nissue 下的讨论（供参考）：\n{ctx}\n" if ctx else "")
+            + f"\n要改代码就照常建分支、commit、push、开 PR——PR 描述里必须带一行 `Closes #{n}`"
+            f"（合并后 Gitea 自动关单），最终回复附上 PR 链接；PR 链接我会自动贴回 issue，"
+            f"你不用再去 issue 下留言。\n"
+            f"若这个 issue 不需要改代码（提问 / 讨论类），直接给出结论，并用 Gitea API "
+            f"在 issue #{n} 下回复结论后关闭它。\n用简洁中文回复。"
+        )
+        sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
+        try:
+            async with _typing(room):
+                # cancel_key=汇报房间：房间里的 /cancel 也能停掉工单任务
+                answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"], system_prompt=sp,
+                                          lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec),
+                                          cancel_key=room)
+            _project_last_active[rec["id"]] = time.time()
+            await send(room, f"📋 工单 #{n} 处理结果：\n{answer}", track=True)
+            pr = _extract_pr(answer, rec)
+            if pr:
+                issue_ledger.update(rec["id"], n, pr=pr[0])
+                if pr_ledger.record(rec["id"], pr[0], pr[1], room):
+                    log.info("[%s] 工单 #%d 开了 PR #%d，进台账跟到合并", rec["id"], n, pr[0])
+                await gitea.comment_issue(rec, n, f"已提交 PR：{pr[1]}（合并后本单自动关闭）")
+        except ClaudeCancelled:
+            await send(room, f"🛑 已停止工单 #{n} 的处理。")
+        except Exception as e:
+            log.exception("工单 #%s 处理失败", n)
+            await send(room, f"工单 #{n} 处理出错：{e}")
+    finally:
+        inflight.remove(inflight_key)
 
 
 async def _intake_one(rec: dict, room: str, login: str):

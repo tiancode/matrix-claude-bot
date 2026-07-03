@@ -1520,6 +1520,12 @@ def _reset_issue_ledger():
     issue_ledger._loaded = False
 
 
+def _reset_inflight():
+    import inflight
+    inflight._data = {}
+    inflight._loaded = False
+
+
 # ---------- 自驱心跳：PASS 不打扰；有建议→提议；autopilot→派执行 ----------
 def test_heartbeat_propose_and_autopilot():
     set_identity()
@@ -1864,6 +1870,182 @@ def test_issue_gone_after_three_404():
         (state.client, bot.projects.get_project, gitea.issue_info, gitea.issue_gone) = orig
         settings.store_path = orig_store
         _reset_issue_ledger()
+
+
+# ---------- 在途登记簿：登记/补录占位eid/摘除/清空 + 持久化往返 ----------
+def test_inflight_ledger():
+    import tempfile
+    import inflight
+    orig = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_inflight()
+    try:
+        k = inflight.record("!room", "修一下登录 token 刷新", inflight.KIND_CHAT)
+        e = inflight.active()[0]
+        assert k and e["room"] == "!room" and e["kind"] == "chat" and e["eid"] == ""
+        inflight.attach_eid(k, "$placeholder1")                       # 占位创建后补录 eid
+        _reset_inflight()                                             # 清内存态 → 必须能从盘恢复
+        got = inflight.active()
+        assert len(got) == 1 and got[0]["eid"] == "$placeholder1"     # 落盘往返：eid 还在
+        inflight.record("!r2", "工单 #7", inflight.KIND_ISSUE, issue=7)
+        assert any(x["kind"] == "issue" and x["issue"] == 7 for x in inflight.active())
+        inflight.remove(k)                                            # 摘除聊天那条
+        assert [x["kind"] for x in inflight.active()] == ["issue"]
+        inflight.clear()                                             # 对账后清空整簿
+        assert inflight.active() == []
+    finally:
+        settings.store_path = orig
+        _reset_inflight()
+
+
+# ---------- 启动对账·在途：占位收尾成中断提示 / 排队条目补说明 / 已退房间跳过 / 工单不催重发 ----------
+def test_reconcile_inflight():
+    import tempfile
+    import inflight
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_inflight()
+    sent, edits = [], []
+
+    class FC:
+        rooms = {"!live:ex.org": object()}     # 只有这个房间还在；!dead 已退（不在 client.rooms）
+        async def room_send(self, r, mt, content, **k):
+            rel = content.get("m.relates_to") or {}
+            if rel.get("rel_type") == "m.replace":
+                edits.append((r, rel.get("event_id"), content["m.new_content"]["body"]))
+            else:
+                sent.append((r, content["body"]))
+            return types.SimpleNamespace(event_id="$x")
+
+    orig_client = state.client
+    state.client = FC()
+    try:
+        ka = inflight.record("!live:ex.org", "修登录 token", inflight.KIND_CHAT)
+        inflight.attach_eid(ka, "$ph1")                         # a) 有占位 + 房间还在 → 编辑占位
+        inflight.record("!live:ex.org", "排队的活", inflight.KIND_CHAT)   # b) 无占位 → 补发说明
+        inflight.record("!dead:ex.org", "死房间的活", inflight.KIND_CHAT) # c) 房间已退 → 跳过
+        inflight.record("!live:ex.org", "工单活", inflight.KIND_ISSUE, issue=9)  # d) 工单 → 不催重发
+
+        asyncio.run(bot._reconcile_inflight())
+
+        assert any(r == "!live:ex.org" and t == "$ph1" and "中断" in b for r, t, b in edits)  # a)
+        assert any(r == "!live:ex.org" and "重新发一遍" in b for r, b in sent)                # b)
+        assert not any(r == "!dead:ex.org" for r, _, _ in edits)                              # c)
+        assert not any(r == "!dead:ex.org" for r, _ in sent)                                  # c)
+        assert not any("工单活" in b for _, b in sent)                                        # d)
+        assert inflight.active() == []                          # 处理完清空整簿
+    finally:
+        state.client = orig_client
+        settings.store_path = orig_store
+        _reset_inflight()
+
+
+# ---------- 启动对账·工单：pr==0 且无对应 open PR → 重新派执行 ----------
+def test_reconcile_issues_redispatches_pr_zero():
+    import tempfile
+    import issue_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_issue_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent, dispatched, pend = [], [], []
+
+    class FC:
+        rooms = {"!room": object()}
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    async def no_open_pulls(r): return []                        # 仓库没有任何 open PR
+    async def open_issue(r, n):
+        return {"number": n, "state": "open", "title": "登录太慢", "body": "太慢了"}
+
+    async def fake_execute(rec_, room_, issue_):
+        dispatched.append((room_, issue_["number"]))
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.open_pulls, gitea.issue_info, bot._issue_execute)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: pend.append(coro)
+    gitea.open_pulls, gitea.issue_info = no_open_pulls, open_issue
+    bot._issue_execute = fake_execute
+    try:
+        issue_ledger.record("h/o/r", 5, "http://h/o/r/issues/5", "!room")   # pr==0（接了单没开 PR）
+        async def go():
+            await bot._reconcile_issues()
+            for c in pend:
+                await c
+        asyncio.run(go())
+        assert dispatched == [("!room", 5)]                     # 重派执行
+        assert any("工单 #5" in m and "重新接手" in m for m in sent)   # 房间告知重启后重接
+        assert issue_ledger.active()[0]["pr"] == 0              # 没找到 PR → 仍 pr==0，靠重派产出
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.open_pulls, gitea.issue_info, bot._issue_execute) = orig
+        settings.store_path = orig_store
+        _reset_issue_ledger()
+
+
+# ---------- 启动对账·工单：已有正文 Closes #N 的 open PR → 只补账继续跟进，不重复执行（防重复开 PR） ----------
+def test_reconcile_issues_skips_when_pr_exists():
+    import tempfile
+    import issue_ledger
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_issue_ledger(); _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    dispatched, pend, info_calls = [], [], []
+
+    class FC:
+        rooms = {"!room": object()}
+        async def room_send(self, r, mt, content, **k):
+            return types.SimpleNamespace(event_id="$x")
+
+    async def pulls_with_closes(r):     # 崩在"PR 已开、台账没记 pr 号"之间：open PR 正文带 Closes #5
+        return [{"number": 12, "body": "修复登录刷新\n\nCloses #5", "html_url": "http://h/o/r/pulls/12"},
+                {"number": 8, "body": "无关 PR，Closes #99", "html_url": "http://h/o/r/pulls/8"}]
+
+    async def issue_info(r, n):
+        info_calls.append(n); return {"number": n, "state": "open", "title": "登录太慢", "body": "太慢"}
+
+    async def fake_execute(rec_, room_, issue_):
+        dispatched.append(issue_["number"])
+
+    # 匹配器本身：命中 Closes/fixes，按 #N 边界收口，不误命中 #50/无关键词
+    assert bot._pr_body_closes_issue("干完了 Closes #5", 5)
+    assert bot._pr_body_closes_issue("fixes #5 done", 5)
+    assert not bot._pr_body_closes_issue("Closes #50", 5)
+    assert not bot._pr_body_closes_issue("提到 #5 但没关键词", 5)
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.open_pulls, gitea.issue_info, bot._issue_execute)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: pend.append(coro)
+    gitea.open_pulls, gitea.issue_info = pulls_with_closes, issue_info
+    bot._issue_execute = fake_execute
+    try:
+        issue_ledger.record("h/o/r", 5, "http://h/o/r/issues/5", "!room")   # pr==0
+        async def go():
+            await bot._reconcile_issues()
+            for c in pend:
+                await c
+        asyncio.run(go())
+        assert dispatched == []                                  # 不重复执行（PR 已在开）
+        assert info_calls == []                                  # 命中 open PR 即短路，不再查 issue
+        assert issue_ledger.active()[0]["pr"] == 12              # 台账补记已开的 PR 号
+        assert any(e["number"] == 12 for e in pr_ledger.active())   # PR 进跟进台账盯到合并
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.open_pulls, gitea.issue_info, bot._issue_execute) = orig
+        settings.store_path = orig_store
+        _reset_issue_ledger(); _reset_ledger()
 
 
 # ---------- 模型拆分：干活用 CLAUDE_MODEL，轻判断（quick/consult）优先 CLAUDE_QUICK_MODEL ----------
@@ -2740,6 +2922,10 @@ TESTS = [
     ("工单接活 认领/宣布/派执行/防重", test_issue_intake_flow),
     ("工单执行 开PR进台账/贴链接/关单销账", test_issue_execute_and_sweep),
     ("工单连续3轮404才销账 抖动不销", test_issue_gone_after_three_404),
+    ("在途登记簿 登记/补录eid/摘除/落盘", test_inflight_ledger),
+    ("启动对账·在途 占位收尾/排队补说明/退房跳过", test_reconcile_inflight),
+    ("启动对账·工单 pr==0 重派执行", test_reconcile_issues_redispatches_pr_zero),
+    ("启动对账·工单 已有CloseS PR不重派只补账", test_reconcile_issues_skips_when_pr_exists),
     ("排队回执 忙时知会/空闲不发", test_queue_receipt_when_busy),
     ("模型拆分 干活大/轻判断小", test_quick_model_split),
     ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
