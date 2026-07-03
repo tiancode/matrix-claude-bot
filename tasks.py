@@ -20,6 +20,8 @@ import issue_ledger
 import pr_ledger
 import transcript
 import inflight
+import gitea
+import gitea_health
 
 log = logging.getLogger("matrix-claude.tasks")
 
@@ -385,5 +387,8 @@ async def handle_status(room: MatrixRoom):
           if settings.proactive_heartbeat_enabled else "关")
     lines.append(f"• 主动插话={'开' if settings.proactive else '关'} · 自驱心跳={hb}"
                  f" · 工单接活={'开' if settings.issue_intake_enabled else '关'}")
+    gitea_line = gitea_health.status_line(gitea.health())   # Gitea 连不上/ token 失效时在这暴露出来
+    if gitea_line:
+        lines.append(gitea_line)
     await send(rid, "\n".join(lines))
 

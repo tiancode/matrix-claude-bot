@@ -5,6 +5,7 @@
 """
 import asyncio
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,16 +34,60 @@ def _post(url: str, payload: dict):
         return r.status, (r.read().decode(errors="ignore") or "")
 
 
+# ---- Gitea 全局健康度 ----
+# 在 _aget 的成功/失败路径**统一**埋点（别在每个业务函数里散着记）；下游用 health() 查询：
+# /status 显示一条、后台循环跨阈值时告警。区分"token 失效(401/403)"与"网络连不上(0)"，
+# 好点名说清是哪种。**404 是"对象不存在"的业务答案、不是故障**——与 2xx 一样算"Gitea 活着"。
+# （写操作走 _post，不在此埋点：只读轮询已足够反映连通性，也不牵连合并/留言的失败语义。）
+_health = {
+    "consecutive_failures": 0,   # 连续失败次数（任一次"活着"即清零）
+    "last_success_ts": 0.0,      # 最近一次"Gitea 活着"（2xx/404）的时间戳
+    "last_failure_ts": 0.0,      # 最近一次失败的时间戳
+    "last_code": 0,              # 最近一次失败的 HTTP 状态码（0=网络层没连上）
+    "last_kind": "",             # 最近一次失败定性：auth(401/403,疑似 token 失效) / network / http
+}
+
+
+def _note_alive() -> None:
+    _health["consecutive_failures"] = 0
+    _health["last_success_ts"] = time.time()
+
+
+def _note_failure(code: int, kind: str) -> None:
+    _health["consecutive_failures"] += 1
+    _health["last_failure_ts"] = time.time()
+    _health["last_code"] = code
+    _health["last_kind"] = kind
+
+
+def health() -> dict:
+    """Gitea 连通性健康快照（只读拷贝）。ok=当前没有连续失败；异常时看 last_kind/last_code 定性、
+    last_success_ts 判断"最近成功多久前"。字段说明见 _health。"""
+    h = dict(_health)
+    h["ok"] = h["consecutive_failures"] == 0
+    return h
+
+
 async def _aget(url: str):
     # 返回 (status, data)。区分两类失败，好让上层分辨"对象真没了"和"网络抖动"：
     #   HTTPError（含 404）→ (e.code, None)：服务器答了、对象确实不在（被删/改名/无权）；
     #   URLError/OSError/解析失败 → (0, None)：连不上 / 抖动，语义是"下轮再试"。
     # HTTPError 是 URLError 子类，必须先捕。
+    # 顺带在这里给全局健康度埋点（见上）——返回语义不变，只多记一笔连通性。
     try:
-        return await asyncio.to_thread(_get, url)
+        st, data = await asyncio.to_thread(_get, url)
+        _note_alive()                       # 2xx：Gitea 活着
+        return st, data
     except urllib.error.HTTPError as e:
+        if e.code == 404:
+            _note_alive()                   # 404 = 对象不存在的业务答案，不是故障：Gitea 仍活着
+        elif e.code in (401, 403):
+            _note_failure(e.code, "auth")   # 鉴权失败：token 可能已失效
+        else:
+            _note_failure(e.code, "http")   # 5xx 等：连上了但服务器不正常
         return e.code, None
     except (urllib.error.URLError, OSError, ValueError):
+        _note_failure(0, "network")         # 连不上 / 抖动
         return 0, None
 
 
