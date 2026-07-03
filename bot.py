@@ -19,8 +19,10 @@ from nio import (
     AsyncClient,
     AsyncClientConfig,
     InviteMemberEvent,
+    LocalProtocolError,
     LoginResponse,
     MatrixRoom,
+    MegolmEvent,
     RoomEncryptedMedia,
     RoomMemberEvent,
     RoomMessageMedia,
@@ -56,6 +58,11 @@ from media import (on_media, _process_media, _prune_dir,  # noqa: F401
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("matrix-claude")
+
+# 加密消息解不开时的明文提示限流：room_id -> 上次提示时刻。密钥缺失往往一连串消息
+# 都解不开，每房间这段窗口内最多提示一次，别刷屏。纯内存态，重启丢了无妨。
+_UNDECRYPT_NOTICE_COOLDOWN = 600   # 秒（10 分钟）
+_last_undecrypt_notice: dict[str, float] = {}
 
 
 async def on_message(room: MatrixRoom, event: RoomMessageText):
@@ -165,6 +172,36 @@ async def _welcome_when_ready(rid: str):
         await send(rid, _WELCOME)
     except Exception:
         log.exception("发送欢迎语失败 %s", rid)
+
+
+async def on_undecrypted(room: MatrixRoom, event: MegolmEvent):
+    """加密消息解不开（megolm 会话密钥缺失）时的兜底：向对方要密钥 + 回一条明文提示，别纯沉默。
+
+    典型诱因：bot 清过 store 换了新 device、或对方客户端没把会话密钥分享到位。这类事件
+    以 MegolmEvent 掉地上，用户在加密房 @bot 只会得到纯沉默，无从排查。
+    初始 sync 期间的积压解密失败不提示（同 on_message 的手法），免得一启动就对历史消息群发。"""
+    if not settings.process_backlog and not state._synced:  # 跳过历史/离线积压
+        return
+    # ① 先补救：向对方设备请求这条消息的会话密钥。nio 对同一 session 已在请求时会抛
+    #    LocalProtocolError（该 session_id 已有 outgoing_key_request），接住即可——本就无需重发。
+    try:
+        await state.client.request_room_key(event)
+    except LocalProtocolError:
+        pass                                   # 已在要这把密钥了，别重复请求
+    except Exception:
+        log.exception("请求会话密钥失败 %s", room.room_id)
+    # ② 限流：仅对"明文提示"限流；密钥请求每条都试（nio 自身按 session 去重，不会真刷屏）。
+    now = time.time()
+    if now - _last_undecrypt_notice.get(room.room_id, 0.0) < _UNDECRYPT_NOTICE_COOLDOWN:
+        return
+    _last_undecrypt_notice[room.room_id] = now
+    # ③ 回一条明文提示，让用户至少知道发生了什么、下一步怎么办。发失败只记日志。
+    try:
+        await send(room.room_id,
+                   "这条加密消息我解不开（密钥缺失），已尝试向你的客户端要密钥——"
+                   "稍等重发一次试试；还不行就在客户端里验证一下我这个设备。")
+    except Exception:
+        log.exception("发送解密失败提示失败 %s", room.room_id)
 
 
 async def on_member(room: MatrixRoom, event: RoomMemberEvent):
@@ -313,6 +350,7 @@ async def main():
     state.client.add_event_callback(on_media, (RoomMessageMedia, RoomEncryptedMedia))
     state.client.add_event_callback(on_invite, InviteMemberEvent)
     state.client.add_event_callback(on_member, RoomMemberEvent)
+    state.client.add_event_callback(on_undecrypted, MegolmEvent)  # 解不开的加密消息：要密钥+提示，别沉默
 
     # 初始同步消化积压（此时 _synced 仍 False，被 on_message 挡掉），之后才处理新消息
     await state.client.sync(timeout=30000, full_state=True)

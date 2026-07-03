@@ -427,6 +427,56 @@ def test_leave_cleans_up_room():
     assert media_gone                # 媒体目录被删
 
 
+# ---------- 8a4) 加密消息解不开：要密钥 + 明文提示，同房限流、积压期不提示 ----------
+def test_undecryptable_notifies_and_rate_limits():
+    from nio import LocalProtocolError
+    set_identity()
+    rid = "!enc:ex.org"
+    room = FakeRoom(rid, 2)
+    sent, key_reqs = [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"])
+            return types.SimpleNamespace(event_id="$x%d" % len(sent))
+
+        async def request_room_key(self, event, tx_id=None):
+            key_reqs.append(event)
+            return types.SimpleNamespace()          # 成功响应即可
+
+    ev = types.SimpleNamespace(session_id="sess1", room_id=rid)
+    orig = (state.client, state._synced, settings.process_backlog)
+    state.client, settings.process_backlog = FC(), False
+    bot._last_undecrypt_notice.pop(rid, None)
+    try:
+        state._synced = False                       # 初始同步期间：积压解密失败不动手
+        asyncio.run(bot.on_undecrypted(room, ev))
+        assert sent == [] and key_reqs == []        # 既不要密钥也不提示
+
+        state._synced = True
+        asyncio.run(bot.on_undecrypted(room, ev))   # 首条解不开 → 要密钥 + 明文提示
+        assert len(key_reqs) == 1
+        assert len(sent) == 1 and "解不开" in sent[0] and "密钥" in sent[0]
+
+        asyncio.run(bot.on_undecrypted(room, ev))   # 限流窗口内第二条：仍试要密钥，但不再提示
+        assert len(sent) == 1                       # 提示没被刷屏
+        assert len(key_reqs) == 2                   # 密钥请求每条都试（nio 自身按 session 去重）
+
+        # 补救抛 LocalProtocolError（同 session 已在要密钥）要被接住，且不拦住提示
+        bot._last_undecrypt_notice.pop(rid, None)   # 放开限流，验证提示仍发得出
+
+        class FC2(FC):
+            async def request_room_key(self, event, tx_id=None):
+                raise LocalProtocolError("already requested")
+
+        state.client = FC2()
+        asyncio.run(bot.on_undecrypted(room, ev))
+        assert len(sent) == 2                       # 抛错被吞，提示照发
+    finally:
+        (state.client, state._synced, settings.process_backlog) = orig
+        bot._last_undecrypt_notice.pop(rid, None)
+
+
 # ---------- 8b) 群"对话延续窗口"：点过名后免重复 @ 也算续话 ----------
 def test_group_followup_window():
     set_identity()
@@ -2692,6 +2742,7 @@ TESTS = [
     ("无访问控制：谁邀请都进房", test_no_access_control_invite_joins),
     ("孤儿房间 人走光自动退", test_leave_when_alone),
     ("退房清尾巴 绑定/路由/任务/记录", test_leave_cleans_up_room),
+    ("加密解不开 要密钥+提示+限流", test_undecryptable_notifies_and_rate_limits),
     ("群对话延续窗口", test_group_followup_window),
     ("/reset 清空背景上下文", test_reset_clears_context),
     ("重试仅限会话失效", test_retry_only_on_session_error),
