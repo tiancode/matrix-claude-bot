@@ -63,6 +63,16 @@ def mark_backfilled(room: str) -> None:
         pass
 
 
+def discard(room: str) -> None:
+    """删掉某房间的逐字记录 + 回灌标记（退房清理用）；文件不存在视作已清，不报错。"""
+    for p in (path_for(room), _marker(room)):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    _last_prune.pop(room, None)
+
+
 def _read_all(room: str) -> list[dict]:
     out: list[dict] = []
     try:

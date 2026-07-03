@@ -232,6 +232,27 @@ def test_own_account_context():
     assert not spawned                                        # 没派活
 
 
+# ---------- 5b) 编辑消息(m.replace)当新消息进来：不重派活、不进上下文 ----------
+def test_edit_event_ignored():
+    set_identity()
+    state._synced = True
+    rid = "!edit:ex.org"
+    room = FakeRoom(rid, 2)                    # DM → 否则不必回、测不出"本会派活"
+    bot._context[rid].clear()
+    spawned = []
+    orig = state._spawn
+    state._spawn = lambda coro: (spawned.append(1), coro.close())
+    try:
+        ev = make_event("* 修正后的正文", event_id="$edit1")
+        ev.source["content"]["m.relates_to"] = {"rel_type": "m.replace", "event_id": "$orig1"}
+        asyncio.run(bot.on_message(room, ev))
+    finally:
+        state._spawn = orig
+        bot._context[rid].clear()
+    assert not spawned                          # 编辑事件不派活
+    assert len(bot._context[rid]) == 0          # 也不进上下文/逐字记录
+
+
 # ---------- 6) TTL 过期提示（claude_runner） ----------
 def test_ttl_notice():
     async def run():
@@ -349,6 +370,61 @@ def test_leave_when_alone():
         assert asyncio.run(bot._leave_if_alone("!alone:ex.org")) is False  # 已退的房间再查不误报
     finally:
         state.client, state._synced = orig_client, orig_synced
+
+
+# ---------- 8a3) 退房后清尾巴：绑定/路由被清、在跑任务被取消、聊天记录/媒体被删 ----------
+def test_leave_cleans_up_room():
+    import tempfile
+    import transcript
+    set_identity()
+    rid = "!dead:ex.org"
+    cancelled = []
+
+    class FC:
+        rooms = {}
+        async def room_leave(self, r):
+            self.rooms.pop(r, None)
+        async def room_forget(self, r):
+            pass
+
+    room = FakeRoom(rid, 0)
+    room.users = {"@claudebot:ex.org": 1}          # 只剩自己 → 触发退房
+
+    tmp_media = tempfile.mkdtemp()
+    mdir = os.path.join(tmp_media, bot._safe_name(rid, "room"))
+    os.makedirs(mdir)
+    open(os.path.join(mdir, "f.bin"), "w").close()
+    bpath = os.path.join(tempfile.mkdtemp(), "bindings.json")
+
+    orig = (state.client, state._synced, settings.media_root,
+            bot.projects.bindings_path, bot.runner.cancel)
+    fc = FC(); fc.rooms = {rid: room}
+    state.client, state._synced = fc, True
+    settings.media_root = tmp_media
+    bot.projects.bindings_path = bpath
+    bot.runner.cancel = lambda k: (cancelled.append(k) or 1)
+    bot.projects._rooms[rid] = "h/o/app"           # 该房间绑着某项目
+    bot._last_project_by_room[rid] = "h/o/app"     # 且有路由记忆
+    os.makedirs(transcript._root(), exist_ok=True)
+    open(transcript.path_for(rid), "w").close()    # 造一份逐字记录
+    transcript.mark_backfilled(rid)                # 和回灌标记
+    try:
+        left = asyncio.run(bot._leave_if_alone(rid))
+        still_bound = rid in bot.projects._rooms
+        still_routed = rid in bot._last_project_by_room
+        tr_gone = not os.path.exists(transcript.path_for(rid)) and not transcript.is_backfilled(rid)
+        media_gone = not os.path.exists(mdir)
+    finally:
+        (state.client, state._synced, settings.media_root,
+         bot.projects.bindings_path, bot.runner.cancel) = orig
+        bot.projects._rooms.pop(rid, None)
+        bot._last_project_by_room.pop(rid, None)
+    assert left is True
+    assert cancelled == [rid]        # 在跑任务按房间取消（复用 /cancel 路径）
+    assert not still_bound           # 绑定被清并落盘
+    assert not still_routed          # 路由记忆被清
+    assert tr_gone                   # 逐字记录 + 回灌标记被删
+    assert media_gone                # 媒体目录被删
 
 
 # ---------- 8b) 群"对话延续窗口"：点过名后免重复 @ 也算续话 ----------
@@ -711,6 +787,41 @@ def test_media_oversize_skipped():
         (settings.media_root, settings.media_max_mb, state.client, media.handle_task) = orig
     assert called["dl"] == 0                                       # 超限不下载
     assert any("超过上限" in b for _, _, b in bot._context[rid])   # 上下文有标注
+
+
+# ---------- 20b) DM 文件处理失败且无 caption：明确回错误，不沉默 return ----------
+def test_media_failure_notifies_when_addressed():
+    import tempfile
+    set_identity()
+    state._synced = True
+    rid = "!mfail:ex.org"
+    room = FakeRoom(rid, 2)                     # DM → 必回
+    bot._context[rid].clear()
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+        async def download(self, mxc=None, save_to=None, **k):   # 不写文件 → size 0 → 判失败
+            return types.SimpleNamespace(content_type="", filename="broken.bin")
+
+    async def fake_handle(rm, ev, text, skip_body=None):
+        pass
+
+    orig = (settings.media_root, settings.media_enabled, state.client, media.handle_task)
+    settings.media_root, settings.media_enabled = tempfile.mkdtemp(), True
+    state.client = FC()
+    media.handle_task = fake_handle
+    try:
+        async def go():
+            await bot._process_media(
+                room, make_media_event(body="broken.bin", event_id="$mfail1"), False)
+            await _drain_tasks()
+        asyncio.run(go())
+    finally:
+        (settings.media_root, settings.media_enabled, state.client, media.handle_task) = orig
+        bot._context[rid].clear()
+    assert any("没能处理" in m and "下载失败" in m for m in sent)   # 文件失败且无 caption → 回错误
 
 
 # ---------- 21) 媒体文件名消毒：挡掉 ../ 路径穿越 ----------
@@ -1294,6 +1405,40 @@ def test_dm_general_question():
     assert out is not None and out.get("general") is True   # 返回通用助手 rec
     assert out["path"] == settings.claude_workdir            # 在隔离 scratch 目录答
     assert not any("哪个项目" in m for m in asked)           # 没有反问
+
+
+# ---------- 43b) DM 发 /bind：给引导，不把 "/bind http://…" 当任务喂给 Claude ----------
+def test_dm_bind_gets_guidance():
+    set_identity()
+    state._synced = True
+    rid = "!dmbind:ex.org"
+    room = FakeRoom(rid, 2)                     # DM
+    bot._context[rid].clear()
+    sent, task_calls, pend = [], [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    async def fake_task(*a, **k):
+        task_calls.append(a)
+
+    orig = (state.client, state._spawn, bot.handle_task)
+    state.client = FC()
+    state._spawn = lambda coro: pend.append(coro)
+    bot.handle_task = fake_task
+    try:
+        async def go():
+            await bot.on_message(room, make_event(
+                "/bind https://gitea.example.com/o/r", event_id="$dmb"))
+            for c in pend:
+                await c
+        asyncio.run(go())
+    finally:
+        (state.client, state._spawn, bot.handle_task) = orig
+        bot._context[rid].clear()
+    assert any("私聊不用绑定" in m for m in sent)   # 得到引导
+    assert task_calls == []                          # 没被当任务派给 Claude
 
 
 # ---------- 42) 会话 session_id 落盘：重启（新 runner）后仍能恢复，多轮不断 ----------
@@ -2541,10 +2686,12 @@ TESTS = [
     ("引用回退块剥离", test_reply_fallback_strip),
     ("track 门控 + 时间单调", test_track_and_monotonic),
     ("自己账号入上下文不派活", test_own_account_context),
+    ("编辑消息 m.replace 不重派活", test_edit_event_ignored),
     ("TTL 过期提示", test_ttl_notice),
     ("token 受信主机 + redact", test_security_bits),
     ("无访问控制：谁邀请都进房", test_no_access_control_invite_joins),
     ("孤儿房间 人走光自动退", test_leave_when_alone),
+    ("退房清尾巴 绑定/路由/任务/记录", test_leave_cleans_up_room),
     ("群对话延续窗口", test_group_followup_window),
     ("/reset 清空背景上下文", test_reset_clears_context),
     ("重试仅限会话失效", test_retry_only_on_session_error),
@@ -2558,6 +2705,7 @@ TESTS = [
     ("未同步群不当私聊+剥外链img", test_dm_classification_and_html_hardening),
     ("媒体下载落盘+入上下文+派活", test_media_download_and_dispatch),
     ("媒体超体积跳过", test_media_oversize_skipped),
+    ("媒体失败无caption 明确回错误", test_media_failure_notifies_when_addressed),
     ("媒体文件名消毒", test_media_safe_name),
     ("媒体滚动删旧", test_media_prune),
     ("DM 分诊路由过 ensure", test_dm_routing_ensures_checkout),
@@ -2582,6 +2730,7 @@ TESTS = [
     ("触发词按词边界匹配", test_trigger_word_boundary),
     ("会话落盘重启可恢复", test_sessions_persisted_across_restart),
     ("DM 一般性问题当通用助手答", test_dm_general_question),
+    ("DM /bind 给引导不派活", test_dm_bind_gets_guidance),
     ("项目长期记忆 跨会话留存", test_project_memory),
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),

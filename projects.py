@@ -262,6 +262,16 @@ class Projects:
             self._save()
         return rec
 
+    async def unbind(self, room_id: str) -> bool:
+        """解除某房间的绑定并落盘（退房清理用），返回是否真的解了。
+        只清房间→项目这一条映射；项目记录 / 本地 clone 保留（别的房间或 DM 路由可能还在用）。"""
+        async with self._save_lock:
+            if room_id not in self._rooms:
+                return False
+            self._rooms.pop(room_id, None)
+            self._save()
+        return True
+
     async def prepare_worktree(self, rec: dict) -> None:
         """每次派活前把工作树拉回干净的 origin/base：fetch 一次，丢弃上个任务残留的脏改动 /
         半截分支 / 未跟踪文件，免得在脏的或过期的状态上接着开工、把改动串进下一个 PR。
