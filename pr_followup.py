@@ -11,6 +11,7 @@ from tasks import _employee_prompt
 from projects import projects
 from claude_runner import runner, ClaudeCancelled
 import gitea
+import gitea_health
 import pr_ledger
 import memory
 
@@ -174,6 +175,7 @@ async def _pr_followup_loop():
                     await _followup_one(entry)
                 except Exception:
                     log.exception("PR #%s 跟进失败", entry.get("number"))
+            await gitea_health.check_and_alert()   # 搭车这轮巡检：Gitea 连不上/token 失效就告警一次
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -18,6 +18,7 @@ from heartbeat import _project_home_room
 from projects import projects
 from claude_runner import runner, ClaudeCancelled
 import gitea
+import gitea_health
 import issue_ledger
 import pr_ledger
 import memory
@@ -124,6 +125,8 @@ async def _issue_intake_loop():
         try:
             await asyncio.sleep(settings.issue_poll_interval)
             login = await gitea.own_user_login()
+            # 先告警：login 查不到往往正是 Gitea 连不上 / token 失效，别被下面的 continue 吞掉
+            await gitea_health.check_and_alert()
             if not login:
                 continue   # 查不到 bot 的 Gitea 登录名（网络抖动）：这轮先跳过
             await _sweep_closed()
