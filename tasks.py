@@ -190,6 +190,15 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         except ClaudeCancelled:
             await live.finalize("🛑 已停止。", track=False)
             return
+        except Exception as e:
+            # 任务异常（超时 / 非零退出等）：先把占位收尾成报错，别让它永远停在"⏳ 正在干活…"。
+            # 就地收尾即是给用户的唯一报错，故 return——不再往上抛给 handle_task 二次发一条"出错了"。
+            log.exception("流式任务失败")
+            try:
+                await live.finalize(f"出错了：{e}", track=False)
+            except Exception:
+                log.exception("占位收尾成报错也失败了")
+            return
         answer = await _emit_files(room, answer, cwd, thread_root)
         await live.finalize(answer, track=True)
     else:
@@ -299,10 +308,20 @@ async def handle_summarize(room: MatrixRoom, event: RoomMessageText, body: str):
 
 
 async def handle_cancel(room: MatrixRoom):
-    """/cancel：停掉本房间正在跑的任务。"""
+    """/cancel：停掉本房间在途的任务——运行中的杀进程、排队/准备中的取消掉。文案按实际区分三种情况。"""
     rid = room.room_id
-    n = runner.cancel(rid)
-    await send(rid, "🛑 已停止当前任务。" if n else "现在没有正在运行的任务。")
+    res = runner.cancel(rid)
+    # runner.cancel 返回 (运行中被停, 排队中被取消)；兼容旧式只返回单个 int（测试里的假 runner）。
+    running, queued = res if isinstance(res, tuple) else (res, 0)
+    if running:
+        msg = "🛑 已停止正在运行的任务。"
+        if queued:
+            msg += f"排队中的 {queued} 个任务也一并取消了。"
+    elif queued:
+        msg = "🛑 已取消排队中的任务（还没轮到，不会再开跑了）。"
+    else:
+        msg = "现在没有正在运行或排队的任务。"
+    await send(rid, msg)
 
 
 
