@@ -51,7 +51,8 @@ from pr_followup import _followup_one, _pr_followup_loop  # noqa: F401
 from heartbeat import _heartbeat_one, _heartbeat_loop  # noqa: F401
 from issue_intake import _intake_one, _issue_execute, _issue_intake_loop  # noqa: F401
 from proactive import maybe_proactive, _PROACTIVE_PASS_COOLDOWN  # noqa: F401
-from media import on_media, _process_media, _prune_dir  # noqa: F401
+from media import (on_media, _process_media, _prune_dir,  # noqa: F401
+                   discard_room, sweep_stale_downloads)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("matrix-claude")
@@ -62,10 +63,15 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
         return
     if event.event_id in _sent_events:  # 防自激
         return
+    content = (event.source or {}).get("content", {})
+    # 编辑消息(m.replace)会作为新 RoomMessageText 再次进来。当新消息处理会：同一任务带着
+    # "* 修正后的正文"重跑，还重复进上下文/逐字记录。取舍：编辑一律不重派活——代价是上下文里
+    # 留的是改前的旧文本，可接受。
+    if (content.get("m.relates_to") or {}).get("rel_type") == "m.replace":
+        return
 
     # 无访问控制：用这个 bot 的都是可信的人，所有用户的消息都进上下文、都可派活。
     is_self = event.sender == state.MY_ID
-    content = (event.source or {}).get("content", {})
     body = _strip_reply_fallback(event.body or "", content)
     sender_name = room.user_name(event.sender) or event.sender
     # 用本地接收时刻而非 event.server_timestamp：与 send() 里 bot 回复同一时钟，
@@ -94,6 +100,11 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
         return
     if low.startswith("/status") or stripped in STATUS_CMDS:
         state._spawn(handle_status(room))
+        return
+    # 私聊发 /bind 没意义：DM 不绑房间、按内容自动分诊。别把 "/bind http://…" 放进任务分诊
+    # 让 Claude 对着它自由发挥——直接给句引导。
+    if _is_dm(room) and low.startswith("/bind"):
+        state._spawn(send(room.room_id, "私聊不用绑定，我按内容自动分诊；直接说要干什么就行。"))
         return
 
     # 重启后 _sent_events 已清空：被回复的若是 bot 的旧消息，先向服务器补认，寻址才认得出
@@ -180,7 +191,35 @@ async def _leave_if_alone(rid: str) -> bool:
     except Exception:
         log.exception("退房失败 %s", rid)
         return False
+    await _cleanup_room(rid)                   # 退成功后把这个死房间的尾巴一并清掉
     return True
+
+
+async def _cleanup_room(rid: str):
+    """退房后清掉该房间留下的一切尾巴：否则心跳/工单/PR 跟进仍把它当"汇报口"往里发消息、
+    房内在跑的任务也白烧完对着死房间回复。每一步失败只记日志——已经退成功了，别让某步崩了
+    拖累其它清理，更别把异常冒回退房流程。"""
+    try:
+        runner.cancel(rid)   # ① 停掉房内在跑的任务（与 /cancel 同一路径，按房间取消）
+    except Exception:
+        log.exception("退房清理：取消在跑任务失败 %s", rid)
+    try:
+        await projects.unbind(rid)   # ② 清项目绑定并落盘
+    except Exception:
+        log.exception("退房清理：解绑失败 %s", rid)
+    if _last_project_by_room.pop(rid, None) is not None:   # ③ 清路由记忆并落盘
+        try:
+            state._save_last_projects()
+        except Exception:
+            log.exception("退房清理：路由记忆落盘失败 %s", rid)
+    try:
+        transcript.discard(rid)   # ④ 删逐字记录 + 回灌标记
+    except Exception:
+        log.exception("退房清理：删聊天记录失败 %s", rid)
+    try:
+        discard_room(rid)   # ⑤ 删该房间的媒体目录
+    except Exception:
+        log.exception("退房清理：删媒体目录失败 %s", rid)
 
 
 def _new_client() -> AsyncClient:
@@ -265,6 +304,7 @@ async def main():
         log.warning("MATRIX_ENABLE_E2E=1 但未检测到 olm，已降级为明文模式。"
                     "请先安装 libolm 并 pip install 'matrix-nio[e2e]'。")
     os.makedirs(settings.claude_workdir, exist_ok=True)
+    sweep_stale_downloads()       # 清掉上次被杀留下的下载残件（mxdl-*），启动时扫一遍
     state._load_last_projects()   # 恢复重启前各房间的项目路由（DM /reset、多轮延续要用）
     log.info("启动: 身份=%s (%s) E2EE=%s 工作目录=%s 主动模式=%s",
              state.MY_ID, state.MY_NAME, state.E2E, settings.claude_workdir, settings.proactive)

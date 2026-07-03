@@ -1,6 +1,7 @@
 """图片/文件/音视频：下载（加密房解密）落盘、并入上下文、被点名时交给 Claude 读取。"""
 import logging
 import os
+import shutil
 import tempfile
 import time
 
@@ -10,7 +11,7 @@ from config import settings
 import state
 from state import _context
 from fmt import _safe_name, _human_bytes
-from matrix_io import _is_dm, _resolve_reply_author
+from matrix_io import send, _is_dm, _resolve_reply_author
 from addressing import _has_trigger, _is_addressed, _mark_engaged
 from tasks import handle_task
 import transcript
@@ -34,6 +35,27 @@ def _media_meta(event) -> tuple[str, str]:
     caption = body if (content.get("filename") and content["filename"] != body) else ""
     return fname, caption
 
+
+
+def sweep_stale_downloads() -> None:
+    """启动时清掉上次进程被中途杀掉留下的下载临时文件（mkstemp 的 mxdl-*，正常走 finally 删）。
+    只扫 media_root 根目录一层——临时文件都建在这里，不进按房间的子目录。"""
+    try:
+        entries = list(os.scandir(settings.media_root))
+    except OSError:
+        return
+    for e in entries:
+        if e.name.startswith("mxdl-") and e.is_file():
+            try:
+                os.remove(e.path)
+            except OSError:
+                pass
+
+
+def discard_room(rid: str) -> None:
+    """删掉某房间的媒体目录（退房清理用）；不存在视作已清，不报错。"""
+    d = os.path.join(settings.media_root, _safe_name(rid, "room"))
+    shutil.rmtree(d, ignore_errors=True)
 
 
 def _prune_dir(d: str, keep: int) -> None:
@@ -162,7 +184,10 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
             _mark_engaged(rid, event.sender)
         have_file = bool(saved.get("path"))
         have_caption = bool(cleaned and cleaned != fname)   # 无 caption 时 cleaned 就是文件名
-        if not have_file and not have_caption:   # 既没文件又没正文，没什么可干
+        if not have_file and not have_caption:
+            # 走到这说明寻址命中（DM 必回 / 群里被 @），但文件超限/下载失败/媒体功能关，
+            # 又没配文字。DM 本该必回——别沉默 return 让用户对着空气等，直接把失败原因回给他。
+            await send(rid, f"文件 {fname} 没能处理：{saved.get('error', '未取到内容')}")
             return
         parts = []
         if have_caption:
@@ -182,6 +207,9 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
 async def on_media(room: MatrixRoom, event):
     if not settings.process_backlog and not state._synced:   # 跳过历史/离线积压
         return
+    content = (event.source or {}).get("content", {})
+    if (content.get("m.relates_to") or {}).get("rel_type") == "m.replace":
+        return   # 编辑事件不重派活（与文本一致；媒体编辑罕见，一并挡掉）
     is_self = event.sender == state.MY_ID
     state._spawn(_process_media(room, event, is_self))
 
