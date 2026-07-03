@@ -118,7 +118,7 @@ journalctl --user -u matrix-claude -f
 
 ## 自检
 
-不连真实 Matrix，77 项离线冒烟跑通「启动→收消息→派活→回复」全链路（含上下文隔离、PR 跟进、工单接活、安全位）：
+不连真实 Matrix，85 项离线冒烟跑通「启动→收消息→派活→回复」全链路（含上下文隔离、PR 跟进、工单接活、安全位）：
 
 ```bash
 .venv/bin/python tests/smoke.py
