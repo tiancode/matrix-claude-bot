@@ -2000,6 +2000,176 @@ def test_autonomous_tasks_cancellable_by_room():
         heartbeat.runner, pr_followup.runner, state.client = orig
 
 
+# ---------- /cancel：排队中的任务被取消后绝不开跑；三种情况文案可区分 ----------
+def test_cancel_stops_queued_task():
+    cr = claude_runner
+
+    # (a) runner 级：A 在跑占着锁、B 排队等锁；此刻 /cancel → A 被杀、B 拿到锁即了断，绝不偷偷开跑
+    async def go():
+        r = cr.ClaudeRunner()
+        a_in = asyncio.Event()        # A 已进锁并起了子进程
+        release_a = asyncio.Event()   # 放行 A（模拟它被杀后返回）
+        b_started_proc = {"v": False}
+        killed = []
+        orig_kill = cr._kill_group
+        cr._kill_group = lambda p: (killed.append(p), setattr(p, "returncode", -9))
+
+        class P:                      # 假子进程：只用到 pid / returncode
+            def __init__(self): self.pid, self.returncode = 4321, None
+
+        async def fake_run(cmd, cwd=None, on_proc=None):
+            first = not a_in.is_set()
+            proc = P()
+            if on_proc:
+                on_proc(proc)                          # 登记进程 → token.started=True
+            if first:
+                a_in.set()
+                await release_a.wait()                 # A 持锁阻塞，其间会被 /cancel 杀
+                return proc.returncode or -9, b"", b""
+            b_started_proc["v"] = True                 # B 一旦起了子进程就记下——本不该发生
+            return 0, json.dumps({"result": "b-ran", "session_id": "sb", "is_error": False}).encode(), b""
+
+        r._run = fake_run
+        try:
+            ta = asyncio.create_task(r.ask("A", "a", lock_key="proj", cancel_key="room"))
+            await a_in.wait()                            # 确保 A 已进锁在跑
+            tb = asyncio.create_task(r.ask("B", "b", lock_key="proj", cancel_key="room"))
+            for _ in range(200):                         # 等 B 登记令牌并排到锁上
+                if len(r._tokens.get("room", ())) == 2:
+                    break
+                await asyncio.sleep(0)
+            running, queued = r.cancel("room")           # /cancel
+            release_a.set()
+            ra = (await asyncio.gather(ta, return_exceptions=True))[0]
+            rb = (await asyncio.gather(tb, return_exceptions=True))[0]
+            return running, queued, ra, rb, b_started_proc["v"], killed
+        finally:
+            cr._kill_group = orig_kill
+
+    running, queued, ra, rb, b_ran, killed = asyncio.run(go())
+    assert running == 1 and queued == 1                  # A 运行中、B 排队中，各计一
+    assert isinstance(ra, cr.ClaudeCancelled)            # A 按取消路径退（上层回"已停止"而非"出错了"）
+    assert isinstance(rb, cr.ClaudeCancelled)            # B 也按取消退
+    assert b_ran is False                                # B 根本没起子进程——没有背着用户开跑
+    assert len(killed) == 1                              # A 的子进程组被杀
+
+    # (b) handle_cancel 三种情况文案可区分：运行中 / 排队中 / 空场
+    orig_runner, orig_client = tasks.runner, state.client
+    c = _CapClient(); state.client = c
+
+    class FR:
+        def __init__(self, res): self.res = res
+        def cancel(self, rid): return self.res
+    try:
+        for res, expect in (((1, 0), "已停止正在运行"),
+                            ((0, 2), "已取消排队"),
+                            ((0, 0), "没有正在运行或排队")):
+            c.sent.clear()
+            tasks.runner = FR(res)
+            asyncio.run(bot.handle_cancel(FakeRoom("!cq:ex.org", 3)))
+            assert any(expect in (m.get("body") or "") for m in c.sent), (res, expect)
+    finally:
+        tasks.runner, state.client = orig_runner, orig_client
+
+
+# ---------- /cancel 空场不留标记：之后新派的任务不会被莫名毒杀 ----------
+def test_cancel_empty_no_poison():
+    cr = claude_runner
+
+    async def go():
+        r = cr.ClaudeRunner()
+        assert r.cancel("room") == (0, 0)                # 空场：什么都没停
+        assert not r._tokens.get("room")                 # 且没留下任何取消令牌（否则会毒杀下一个任务）
+
+        async def fake_run(cmd, cwd=None, on_proc=None):
+            proc = types.SimpleNamespace(pid=1, returncode=None)
+            if on_proc:
+                on_proc(proc)
+            proc.returncode = 0
+            return 0, json.dumps({"result": "干完了", "session_id": "s", "is_error": False}).encode(), b""
+
+        r._run = fake_run
+        return await r.ask("k", "干活", lock_key="proj", cancel_key="room")   # 之后正常派活
+    assert asyncio.run(go()) == "干完了"                  # 不被那条陈旧标记莫名秒杀
+
+
+# ---------- 流式任务异常：占位收尾成报错，不再永远停在"正在干活"、也不重复报错 ----------
+def test_stream_task_error_finalizes_placeholder():
+    set_identity()
+    rid = "!serr:ex.org"
+    room = FakeRoom(rid, 2)
+    bot._context[rid].clear()
+    c = _CapClient(); state.client = c
+
+    class R:
+        def busy(self, k): return False
+        def running(self, k): return 0
+        async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
+                      prepare=None, on_delta=None, cancel_key=None):
+            if on_delta:
+                await on_delta("看了一半代码", "Bash")     # 先造出占位消息（停在"正在干活"）
+            raise RuntimeError("claude 退出码 1: boom")     # 再异常退出
+
+    rec = {"id": "p", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
+    orig = (tasks.runner, settings.stream_replies)
+    tasks.runner = R()
+    settings.stream_replies = True
+    try:
+        asyncio.run(bot._run_on_project(room, make_event("干个活"), "干个活", rec))  # 不该往外抛
+    finally:
+        (tasks.runner, settings.stream_replies) = orig
+        bot._context[rid].clear()
+
+    edits = [m for m in c.sent if (m.get("m.relates_to") or {}).get("rel_type") == "m.replace"]
+    assert edits and "出错了" in edits[-1]["m.new_content"]["body"]     # 占位被收尾成报错
+    assert "boom" in edits[-1]["m.new_content"]["body"]                # 带上具体错因
+    top_errs = [m for m in c.sent                                      # 不重复报错：没有另发的顶层"出错了"
+                if (m.get("m.relates_to") or {}).get("rel_type") != "m.replace"
+                and "出错了" in (m.get("body") or "")]
+    assert not top_errs
+
+
+# ---------- 手动前台 Ctrl-C：协程取消时子进程组被杀，不留孤儿 claude ----------
+def test_run_kills_group_on_cancel():
+    import tempfile
+    cr = claude_runner
+
+    async def go():
+        r = cr.ClaudeRunner()
+        killed = []
+        orig_kill = cr._kill_group
+        cr._kill_group = lambda p: killed.append(p)
+
+        class FakeProc:
+            def __init__(self): self.pid, self.returncode = 999, None
+            async def communicate(self): await asyncio.sleep(3600)   # 永远卡住，等外部取消
+            async def wait(self): return self.returncode
+
+        proc = FakeProc()
+        orig_exec = asyncio.create_subprocess_exec
+        async def fake_exec(*a, **k): return proc
+        asyncio.create_subprocess_exec = fake_exec
+        started = asyncio.Event()
+        try:
+            task = asyncio.create_task(
+                r._run(["claude", "-p", "hi"], cwd=tempfile.mkdtemp(),
+                       on_proc=lambda p: started.set()))
+            await started.wait()          # 子进程已登记
+            await asyncio.sleep(0)         # 让 _run 进入 communicate 的 await
+            task.cancel()                  # 模拟 Ctrl-C 打断协程
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return proc, killed
+        finally:
+            cr._kill_group = orig_kill
+            asyncio.create_subprocess_exec = orig_exec
+
+    proc, killed = asyncio.run(go())
+    assert proc in killed                  # 取消时子进程组被杀，claude 不会变孤儿继续 push/开 PR
+
+
 # ---------- 重启后回复 bot 旧消息仍算点名（向服务器补认发送者） ----------
 def test_reply_to_bot_after_restart():
     set_identity()
@@ -2213,6 +2383,10 @@ TESTS = [
     ("/status 状态一屏可见", test_status_command),
     ("流式定稿 编辑失败退回新发", test_livereply_finalize_edit_fallback),
     ("自驱/跟进任务可被 /cancel", test_autonomous_tasks_cancellable_by_room),
+    ("/cancel 停排队任务+三种文案", test_cancel_stops_queued_task),
+    ("/cancel 空场不毒杀下个任务", test_cancel_empty_no_poison),
+    ("流式异常 占位收尾不重复报错", test_stream_task_error_finalizes_placeholder),
+    ("取消协程 子进程组被杀", test_run_kills_group_on_cancel),
     ("重启后回复 bot 仍算点名", test_reply_to_bot_after_restart),
     ("PR 跟进忽略自己的评论", test_followup_ignores_own_reviews),
     ("分诊背景剔除当前消息", test_dispatch_triage_skips_current),
