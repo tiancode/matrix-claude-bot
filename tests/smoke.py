@@ -312,6 +312,45 @@ def test_no_access_control_invite_joins():
         state.client = orig_client
 
 
+# ---------- 8a2) 孤儿房间：人走光只剩自己 → 退房+forget ----------
+def test_leave_when_alone():
+    set_identity()
+    left, forgot = [], []
+
+    class FC:
+        rooms = {}
+        async def room_leave(self, rid):
+            left.append(rid)
+            self.rooms.pop(rid, None)
+        async def room_forget(self, rid):
+            forgot.append(rid)
+
+    orig_client, orig_synced = state.client, state._synced
+    state.client, state._synced = FC(), True
+    try:
+        alone = FakeRoom("!alone:ex.org", 0)
+        alone.users = {"@claudebot:ex.org": 1}
+        both = FakeRoom("!both:ex.org", 0)
+        both.users = {"@claudebot:ex.org": 1, "@alice:ex.org": 1}
+        FC.rooms = {"!alone:ex.org": alone, "!both:ex.org": both}
+        mk = lambda sk, m: types.SimpleNamespace(state_key=sk, membership=m)
+
+        asyncio.run(bot.on_member(both, mk("@bob:ex.org", "leave")))    # 还有人在 → 不退
+        assert left == []
+        asyncio.run(bot.on_member(alone, mk("@claudebot:ex.org", "leave")))  # 自己的成员事件不触发
+        asyncio.run(bot.on_member(alone, mk("@alice:ex.org", "join")))       # 进房类事件不触发
+        assert left == []
+        state._synced = False                                           # 初始同步期间不动手
+        asyncio.run(bot.on_member(alone, mk("@alice:ex.org", "leave")))
+        assert left == []
+        state._synced = True
+        asyncio.run(bot.on_member(alone, mk("@alice:ex.org", "leave")))  # 只剩自己 → 退房+forget
+        assert left == ["!alone:ex.org"] and forgot == ["!alone:ex.org"]
+        assert asyncio.run(bot._leave_if_alone("!alone:ex.org")) is False  # 已退的房间再查不误报
+    finally:
+        state.client, state._synced = orig_client, orig_synced
+
+
 # ---------- 8b) 群"对话延续窗口"：点过名后免重复 @ 也算续话 ----------
 def test_group_followup_window():
     set_identity()
@@ -2121,6 +2160,7 @@ TESTS = [
     ("TTL 过期提示", test_ttl_notice),
     ("token 受信主机 + redact", test_security_bits),
     ("无访问控制：谁邀请都进房", test_no_access_control_invite_joins),
+    ("孤儿房间 人走光自动退", test_leave_when_alone),
     ("群对话延续窗口", test_group_followup_window),
     ("/reset 清空背景上下文", test_reset_clears_context),
     ("重试仅限会话失效", test_retry_only_on_session_error),
