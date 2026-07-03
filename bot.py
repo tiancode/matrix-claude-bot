@@ -22,6 +22,7 @@ from nio import (
     LoginResponse,
     MatrixRoom,
     RoomEncryptedMedia,
+    RoomMemberEvent,
     RoomMessageMedia,
     RoomMessageText,
     WhoamiResponse,
@@ -155,6 +156,33 @@ async def _welcome_when_ready(rid: str):
         log.exception("发送欢迎语失败 %s", rid)
 
 
+async def on_member(room: MatrixRoom, event: RoomMemberEvent):
+    """有人离开/被踢后房间若只剩自己就退房。进房类事件造不出孤儿房，不用管。"""
+    if not state._synced or event.state_key == state.MY_ID:
+        return
+    if event.membership not in ("leave", "ban"):
+        return
+    await _leave_if_alone(room.room_id)
+
+
+async def _leave_if_alone(rid: str) -> bool:
+    """房间只剩自己（无他人、也无待接受的邀请）→ 退房并 forget，返回是否退了。
+
+    人散了的房间留着只会攒垃圾（测试遗留的临时房、建完即弃的群）。
+    room.users 含已加入+被邀请两类成员，长度为 1 即真·孤儿房。"""
+    room = state.client.rooms.get(rid)
+    if room is None or len(room.users) != 1 or state.MY_ID not in room.users:
+        return False
+    log.info("[%s] 房间只剩我自己，退房", rid)
+    try:
+        await state.client.room_leave(rid)
+        await state.client.room_forget(rid)   # 从服务端房间列表一并抹掉，重启不再 sync 到
+    except Exception:
+        log.exception("退房失败 %s", rid)
+        return False
+    return True
+
+
 def _new_client() -> AsyncClient:
     cfg = AsyncClientConfig(store_sync_tokens=True, encryption_enabled=state.E2E)
     return AsyncClient(settings.homeserver, settings.user_id,
@@ -244,10 +272,13 @@ async def main():
     state.client.add_event_callback(on_message, RoomMessageText)
     state.client.add_event_callback(on_media, (RoomMessageMedia, RoomEncryptedMedia))
     state.client.add_event_callback(on_invite, InviteMemberEvent)
+    state.client.add_event_callback(on_member, RoomMemberEvent)
 
     # 初始同步消化积压（此时 _synced 仍 False，被 on_message 挡掉），之后才处理新消息
     await state.client.sync(timeout=30000, full_state=True)
     state._synced = True
+    for rid in list(state.client.rooms):   # 上次运行以来人散了的房间，启动时一并清掉
+        await _leave_if_alone(rid)
     if settings.transcript_enabled:   # 首次启用记录：对没灌过的房间各回灌一次历史（一次性，有标记不重复）
         for rid in list(state.client.rooms):
             if not transcript.is_backfilled(rid):
