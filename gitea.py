@@ -34,8 +34,14 @@ def _post(url: str, payload: dict):
 
 
 async def _aget(url: str):
+    # 返回 (status, data)。区分两类失败，好让上层分辨"对象真没了"和"网络抖动"：
+    #   HTTPError（含 404）→ (e.code, None)：服务器答了、对象确实不在（被删/改名/无权）；
+    #   URLError/OSError/解析失败 → (0, None)：连不上 / 抖动，语义是"下轮再试"。
+    # HTTPError 是 URLError 子类，必须先捕。
     try:
         return await asyncio.to_thread(_get, url)
+    except urllib.error.HTTPError as e:
+        return e.code, None
     except (urllib.error.URLError, OSError, ValueError):
         return 0, None
 
@@ -85,6 +91,13 @@ async def issue_info(rec: dict, number: int) -> dict | None:
     return d if st == 200 and isinstance(d, dict) else None
 
 
+async def issue_gone(rec: dict, number: int) -> bool:
+    """确认某 issue 在 Gitea 上是否真的没了（HTTP 404）——与"网络抖动"区分，用于销账前定性。
+    只有拿到确切 404 才返回 True；抖动 / 其它错误返回 False（宁可下轮再试也别误销账）。"""
+    st, _ = await _aget(f"{_repo_api(rec)}/issues/{number}")
+    return st == 404
+
+
 async def issue_comments(rec: dict, number: int) -> list:
     """issue 下的评论列表（body + user），接单时给 Claude 当讨论上下文。"""
     st, d = await _aget(f"{_repo_api(rec)}/issues/{number}/comments")
@@ -108,6 +121,13 @@ async def pr_info(rec: dict, number: int) -> dict | None:
     return d if st == 200 and isinstance(d, dict) else None
 
 
+async def pr_gone(rec: dict, number: int) -> bool:
+    """确认某 PR 在 Gitea 上是否真的没了（HTTP 404）——与"网络抖动"区分，用于销账前定性。
+    只有拿到确切 404 才返回 True；抖动 / 其它错误返回 False（宁可下轮再试也别误销账）。"""
+    st, _ = await _aget(f"{_repo_api(rec)}/pulls/{number}")
+    return st == 404
+
+
 async def pr_reviews(rec: dict, number: int) -> list:
     """PR 的评审列表：每条含 id、state(APPROVED/REQUEST_CHANGES/COMMENT/PENDING)、body、user、submitted_at。"""
     st, d = await _aget(f"{_repo_api(rec)}/pulls/{number}/reviews")
@@ -120,12 +140,16 @@ async def review_comments(rec: dict, number: int, review_id: int) -> list:
     return d if st == 200 and isinstance(d, list) else []
 
 
-async def ci_state(rec: dict, sha: str) -> str:
-    """提交的合并 CI 状态：success / failure / error / pending / ""（无 CI）。"""
+async def ci_state(rec: dict, sha: str) -> str | None:
+    """提交的合并 CI 状态：success / failure / error / pending / ""（真没配 CI）。
+    查询失败（网络抖动 / 非 200）返回 None——务必与"没配 CI"的 "" 区分开：调用方遇 None 应保守跳过，
+    别把一次查询抖动当成"CI 通过"放行自动合并（否则 CI 还红着就可能把 PR 合进 main）。"""
     if not sha:
         return ""
     st, d = await _aget(f"{_repo_api(rec)}/commits/{sha}/status")
-    return (d or {}).get("state", "") if st == 200 and isinstance(d, dict) else ""
+    if st == 200 and isinstance(d, dict):
+        return d.get("state", "")
+    return None
 
 
 async def merge(rec: dict, number: int, method: str = "merge",

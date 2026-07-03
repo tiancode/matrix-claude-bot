@@ -22,6 +22,17 @@ class ClaudeCancelled(Exception):
     """用户 /cancel 主动停止任务——与运行出错区分开，让调用方回报"已停止"而非"出错了"。"""
 
 
+class _CancelToken:
+    """一次 ask() 的在途取消令牌：/cancel 把当下在途的每个令牌 cancelled 置真；
+    每个任务只认自己的令牌、并在结束时把自己摘掉——所以取消只作用于"当时在途"的任务，
+    不会毒杀之后新派的活（新活拿的是干净的新令牌）。started：是否已起子进程（供 /cancel 区分运行中/排队中）。"""
+    __slots__ = ("cancelled", "started")
+
+    def __init__(self):
+        self.cancelled = False
+        self.started = False
+
+
 # quick() 处理不可信外来内容，给子进程剔除这些密钥（它用不到）。agentic 的 ask() 仍需 GITEA_TOKEN。
 _QUICK_STRIP_ENV = ("GITEA_TOKEN", "MATRIX_PASSWORD")
 
@@ -52,17 +63,27 @@ class ClaudeRunner:
         self._sema = asyncio.Semaphore(max(1, settings.max_concurrency))
         self._quick_sema = asyncio.Semaphore(max(1, settings.max_concurrency))  # quick 独立并发池
         self._active: dict[str, list] = {}   # cancel_key -> 正在跑的子进程列表（供 /cancel 杀）
-        self._cancel_req: set[str] = set()   # 已请求取消的 cancel_key
+        self._tokens: dict[str, set] = {}    # cancel_key -> 在途任务的取消令牌集合（含排队等锁、prepare 中、运行中的）
 
-    # ---- 取消：杀掉某 cancel_key 下在跑的子进程；ask() 据 _cancel_req 抛 ClaudeCancelled ----
-    def cancel(self, cancel_key: str) -> int:
-        """停掉该维度下正在运行的任务，返回杀掉的进程数（0=本来就没在跑）。"""
+    # ---- 取消：杀在跑的子进程 + 给在途任务（含还没起进程的排队/准备中）置取消令牌 ----
+    def cancel(self, cancel_key: str) -> tuple[int, int]:
+        """停掉该维度下的在途任务。返回 (运行中被停的任务数, 排队/准备中被取消的任务数)。
+
+        关键点（防毒丸）：只对"此刻确有在途任务"的令牌置位；空场（该 key 下没有任何在途任务）
+        绝不留下任何标记，否则几小时后新派的活会被这条陈旧标记莫名秒杀。令牌随任务结束即被摘除。
+        运行中的任务不仅置令牌、还立刻杀掉其子进程组；排队/准备中的任务没有进程可杀，靠令牌在
+        它拿到锁后自我了断（见 ask()）。"""
         live = [p for p in self._active.get(cancel_key, []) if p.returncode is None]
-        if live:
-            self._cancel_req.add(cancel_key)
+        running = queued = 0
+        for t in self._tokens.get(cancel_key) or ():
+            t.cancelled = True
+            if t.started:
+                running += 1
+            else:
+                queued += 1
         for p in live:
             _kill_group(p)
-        return len(live)
+        return running, queued
 
     # ---- 只读查询（/status 用）----
     def running(self, cancel_key: str) -> int:
@@ -164,6 +185,11 @@ class ClaudeRunner:
                 _kill_group(proc)
                 await proc.wait()
                 raise RuntimeError("Claude 响应超时")
+            except asyncio.CancelledError:
+                # 手动前台跑时 Ctrl-C：协程被取消，若不主动收尾，子进程（独立进程组）会变孤儿
+                # 继续在后台 push / 开 PR。杀掉整组再把取消抛上去。
+                _kill_group(proc)
+                raise
         return proc.returncode, out or b"", err or b""
 
     async def _run_stream(self, cmd: list[str], cwd: str | None, on_proc, on_line,
@@ -238,6 +264,10 @@ class ClaudeRunner:
                 _kill_group(proc)
                 await proc.wait()
                 raise RuntimeError("Claude 响应超时")
+            except asyncio.CancelledError:
+                # 同 _run：Ctrl-C 取消时别把子进程组丢成孤儿，杀掉再抛。
+                _kill_group(proc)
+                raise
             finally:
                 err_task.cancel()
                 try:
@@ -310,8 +340,13 @@ class ClaudeRunner:
         lock_key = lock_key or key
         ckey = cancel_key or lock_key
         my_procs: list = []
+        token = _CancelToken()
+        # 一进 ask 就登记令牌（此刻可能还在排队等锁、还没起子进程）：这样 /cancel 也能标记到
+        # "已派但没轮到"的任务，而不是只逮住已在跑的那个。
+        self._tokens.setdefault(ckey, set()).add(token)
 
         def _reg(proc):
+            token.started = True   # 起了子进程：/cancel 据此把本任务算作"运行中"而非"排队中"
             my_procs.append(proc)
             self._active.setdefault(ckey, []).append(proc)
 
@@ -348,24 +383,31 @@ class ClaudeRunner:
             result = st["result"] if st["result"] is not None else st["text"]
             return rc, (result or "").strip(), err, (st["sid"], st["is_err"])
 
-        async with self._lock(lock_key):
-            if prepare is not None:
-                try:
-                    await prepare()
-                except Exception:
-                    log.exception("任务前置准备失败（继续按现状跑）")
-            try:
+        try:
+            async with self._lock(lock_key):
+                # 拿到锁后、起子进程前先验一次：排队等锁期间若被 /cancel，这里即刻了断，
+                # 连 prepare（git fetch 可数十秒）和子进程都不再起——正是"派 A 又派 B、B 排队时 /cancel"
+                # 那条 B 该走的路：不能等它默默开跑。
+                if token.cancelled:
+                    raise ClaudeCancelled()
+                if prepare is not None:
+                    try:
+                        await prepare()
+                    except Exception:
+                        log.exception("任务前置准备失败（继续按现状跑）")
+                if token.cancelled:   # prepare 本身可能耗时，跑完再验一次，别白起子进程
+                    raise ClaudeCancelled()
                 epoch = self._epoch.get(key, 0)
                 sid, expired = self._sid(key)
                 rc, payload, err, meta = await _once(sid)
-                if ckey in self._cancel_req:
+                if token.cancelled:
                     raise ClaudeCancelled()
                 if rc != 0 and sid and self._looks_like_session_error(
                         payload if isinstance(payload, bytes) else b"", err):
                     self.reset(key)
                     epoch = self._epoch.get(key, 0)
                     rc, payload, err, meta = await _once(None)
-                    if ckey in self._cancel_req:
+                    if token.cancelled:
                         raise ClaudeCancelled()
                 if rc != 0:
                     # 先 redact 再截断，免得 token 跨在截断边界被切成半截
@@ -383,17 +425,22 @@ class ClaudeRunner:
                 if expired:  # 上次对话隔太久被清，提示用户已开新会话
                     answer = "（距上次较久，已开启新对话）\n\n" + answer
                 return answer
-            finally:
-                lst = self._active.get(ckey)
-                if lst:
-                    for p in my_procs:
-                        try:
-                            lst.remove(p)
-                        except ValueError:
-                            pass
-                    if not lst:
-                        self._active.pop(ckey, None)
-                self._cancel_req.discard(ckey)
+        finally:
+            lst = self._active.get(ckey)
+            if lst:
+                for p in my_procs:
+                    try:
+                        lst.remove(p)
+                    except ValueError:
+                        pass
+                if not lst:
+                    self._active.pop(ckey, None)
+            # 摘掉自己的令牌：任务一结束（正常/取消/异常）它就不再"在途"，之后的 /cancel 也不该再动它。
+            toks = self._tokens.get(ckey)
+            if toks is not None:
+                toks.discard(token)
+                if not toks:
+                    self._tokens.pop(ckey, None)
 
     async def _oneshot(self, cmd: list[str], cwd: str | None = None) -> str:
         """跑一次性纯文本判断（quick / consult 共用）：短超时、独立并发池、剔密钥环境，不复用会话。"""

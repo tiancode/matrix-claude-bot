@@ -84,16 +84,33 @@ async def _intake_one(rec: dict, room: str, login: str):
 
 
 async def _sweep_closed():
-    """在册工单里已被关闭的（PR 合并自动关 / 人工关）→ 销账；项目已不在册的也一并清掉。"""
+    """在册工单里已被关闭的（PR 合并自动关 / 人工关）→ 销账；项目已不在册的也一并清掉。
+    工单查不到时分辨"网络抖动（下轮再试）"和"工单真没了（被删 / 转移，连续 ≥3 轮 404 才销账并知会）"。"""
     for entry in issue_ledger.active():
-        rec = projects.get_project(entry["pid"])
+        pid, n, room = entry["pid"], entry["number"], entry.get("room") or ""
+        rec = projects.get_project(pid)
         if not rec:
-            issue_ledger.remove(entry["pid"], entry["number"])
+            issue_ledger.remove(pid, n)
             continue
-        info = await gitea.issue_info(rec, entry["number"])
-        if info is not None and info.get("state") == "closed":
-            issue_ledger.remove(entry["pid"], entry["number"])
-            log.info("[%s] 工单 #%d 已关闭，销账", entry["pid"], entry["number"])
+        info = await gitea.issue_info(rec, n)
+        if info is None:
+            if await gitea.issue_gone(rec, n):
+                gone = entry.get("gone_rounds", 0) + 1
+                if gone >= 3:
+                    issue_ledger.remove(pid, n)
+                    if room:
+                        await send(room, f"⚠️ 工单 #{n} 在 Gitea 上已不存在（被删 / 转移），停止跟进。")
+                    log.info("[%s] 工单 #%d 连续 %d 轮 404，销账", pid, n, gone)
+                else:
+                    issue_ledger.update(pid, n, gone_rounds=gone)
+            elif entry.get("gone_rounds"):
+                issue_ledger.update(pid, n, gone_rounds=0)   # 抖动而非真没了：清零重新计
+            continue
+        if entry.get("gone_rounds"):
+            issue_ledger.update(pid, n, gone_rounds=0)        # 成功查到一次 → 清零
+        if info.get("state") == "closed":
+            issue_ledger.remove(pid, n)
+            log.info("[%s] 工单 #%d 已关闭，销账", pid, n)
 
 
 async def _issue_intake_loop():

@@ -232,6 +232,27 @@ def test_own_account_context():
     assert not spawned                                        # 没派活
 
 
+# ---------- 5b) 编辑消息(m.replace)当新消息进来：不重派活、不进上下文 ----------
+def test_edit_event_ignored():
+    set_identity()
+    state._synced = True
+    rid = "!edit:ex.org"
+    room = FakeRoom(rid, 2)                    # DM → 否则不必回、测不出"本会派活"
+    bot._context[rid].clear()
+    spawned = []
+    orig = state._spawn
+    state._spawn = lambda coro: (spawned.append(1), coro.close())
+    try:
+        ev = make_event("* 修正后的正文", event_id="$edit1")
+        ev.source["content"]["m.relates_to"] = {"rel_type": "m.replace", "event_id": "$orig1"}
+        asyncio.run(bot.on_message(room, ev))
+    finally:
+        state._spawn = orig
+        bot._context[rid].clear()
+    assert not spawned                          # 编辑事件不派活
+    assert len(bot._context[rid]) == 0          # 也不进上下文/逐字记录
+
+
 # ---------- 6) TTL 过期提示（claude_runner） ----------
 def test_ttl_notice():
     async def run():
@@ -349,6 +370,61 @@ def test_leave_when_alone():
         assert asyncio.run(bot._leave_if_alone("!alone:ex.org")) is False  # 已退的房间再查不误报
     finally:
         state.client, state._synced = orig_client, orig_synced
+
+
+# ---------- 8a3) 退房后清尾巴：绑定/路由被清、在跑任务被取消、聊天记录/媒体被删 ----------
+def test_leave_cleans_up_room():
+    import tempfile
+    import transcript
+    set_identity()
+    rid = "!dead:ex.org"
+    cancelled = []
+
+    class FC:
+        rooms = {}
+        async def room_leave(self, r):
+            self.rooms.pop(r, None)
+        async def room_forget(self, r):
+            pass
+
+    room = FakeRoom(rid, 0)
+    room.users = {"@claudebot:ex.org": 1}          # 只剩自己 → 触发退房
+
+    tmp_media = tempfile.mkdtemp()
+    mdir = os.path.join(tmp_media, bot._safe_name(rid, "room"))
+    os.makedirs(mdir)
+    open(os.path.join(mdir, "f.bin"), "w").close()
+    bpath = os.path.join(tempfile.mkdtemp(), "bindings.json")
+
+    orig = (state.client, state._synced, settings.media_root,
+            bot.projects.bindings_path, bot.runner.cancel)
+    fc = FC(); fc.rooms = {rid: room}
+    state.client, state._synced = fc, True
+    settings.media_root = tmp_media
+    bot.projects.bindings_path = bpath
+    bot.runner.cancel = lambda k: (cancelled.append(k) or 1)
+    bot.projects._rooms[rid] = "h/o/app"           # 该房间绑着某项目
+    bot._last_project_by_room[rid] = "h/o/app"     # 且有路由记忆
+    os.makedirs(transcript._root(), exist_ok=True)
+    open(transcript.path_for(rid), "w").close()    # 造一份逐字记录
+    transcript.mark_backfilled(rid)                # 和回灌标记
+    try:
+        left = asyncio.run(bot._leave_if_alone(rid))
+        still_bound = rid in bot.projects._rooms
+        still_routed = rid in bot._last_project_by_room
+        tr_gone = not os.path.exists(transcript.path_for(rid)) and not transcript.is_backfilled(rid)
+        media_gone = not os.path.exists(mdir)
+    finally:
+        (state.client, state._synced, settings.media_root,
+         bot.projects.bindings_path, bot.runner.cancel) = orig
+        bot.projects._rooms.pop(rid, None)
+        bot._last_project_by_room.pop(rid, None)
+    assert left is True
+    assert cancelled == [rid]        # 在跑任务按房间取消（复用 /cancel 路径）
+    assert not still_bound           # 绑定被清并落盘
+    assert not still_routed          # 路由记忆被清
+    assert tr_gone                   # 逐字记录 + 回灌标记被删
+    assert media_gone                # 媒体目录被删
 
 
 # ---------- 8b) 群"对话延续窗口"：点过名后免重复 @ 也算续话 ----------
@@ -711,6 +787,41 @@ def test_media_oversize_skipped():
         (settings.media_root, settings.media_max_mb, state.client, media.handle_task) = orig
     assert called["dl"] == 0                                       # 超限不下载
     assert any("超过上限" in b for _, _, b in bot._context[rid])   # 上下文有标注
+
+
+# ---------- 20b) DM 文件处理失败且无 caption：明确回错误，不沉默 return ----------
+def test_media_failure_notifies_when_addressed():
+    import tempfile
+    set_identity()
+    state._synced = True
+    rid = "!mfail:ex.org"
+    room = FakeRoom(rid, 2)                     # DM → 必回
+    bot._context[rid].clear()
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+        async def download(self, mxc=None, save_to=None, **k):   # 不写文件 → size 0 → 判失败
+            return types.SimpleNamespace(content_type="", filename="broken.bin")
+
+    async def fake_handle(rm, ev, text, skip_body=None):
+        pass
+
+    orig = (settings.media_root, settings.media_enabled, state.client, media.handle_task)
+    settings.media_root, settings.media_enabled = tempfile.mkdtemp(), True
+    state.client = FC()
+    media.handle_task = fake_handle
+    try:
+        async def go():
+            await bot._process_media(
+                room, make_media_event(body="broken.bin", event_id="$mfail1"), False)
+            await _drain_tasks()
+        asyncio.run(go())
+    finally:
+        (settings.media_root, settings.media_enabled, state.client, media.handle_task) = orig
+        bot._context[rid].clear()
+    assert any("没能处理" in m and "下载失败" in m for m in sent)   # 文件失败且无 caption → 回错误
 
 
 # ---------- 21) 媒体文件名消毒：挡掉 ../ 路径穿越 ----------
@@ -1296,6 +1407,40 @@ def test_dm_general_question():
     assert not any("哪个项目" in m for m in asked)           # 没有反问
 
 
+# ---------- 43b) DM 发 /bind：给引导，不把 "/bind http://…" 当任务喂给 Claude ----------
+def test_dm_bind_gets_guidance():
+    set_identity()
+    state._synced = True
+    rid = "!dmbind:ex.org"
+    room = FakeRoom(rid, 2)                     # DM
+    bot._context[rid].clear()
+    sent, task_calls, pend = [], [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    async def fake_task(*a, **k):
+        task_calls.append(a)
+
+    orig = (state.client, state._spawn, bot.handle_task)
+    state.client = FC()
+    state._spawn = lambda coro: pend.append(coro)
+    bot.handle_task = fake_task
+    try:
+        async def go():
+            await bot.on_message(room, make_event(
+                "/bind https://gitea.example.com/o/r", event_id="$dmb"))
+            for c in pend:
+                await c
+        asyncio.run(go())
+    finally:
+        (state.client, state._spawn, bot.handle_task) = orig
+        bot._context[rid].clear()
+    assert any("私聊不用绑定" in m for m in sent)   # 得到引导
+    assert task_calls == []                          # 没被当任务派给 Claude
+
+
 # ---------- 42) 会话 session_id 落盘：重启（新 runner）后仍能恢复，多轮不断 ----------
 def test_sessions_persisted_across_restart():
     import tempfile
@@ -1492,6 +1637,70 @@ def test_pr_followup_actions():
         _reset_ledger()
 
 
+# ---------- PR 台账：连续 3 轮确切 404 才销账并通知；中途成功清零；网络抖动一轮都不攒 ----------
+def test_pr_gone_after_three_404():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store, orig_am = settings.store_path, settings.pr_automerge
+    settings.store_path = tempfile.mkdtemp()
+    settings.pr_automerge = False                      # 不走合并路径，专测销账逻辑
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.pr_gone)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: coro.close()
+    async def none_info(r, n): return None            # pr_info 查不到
+    async def is_gone(r, n): return True              # 确切 404
+    async def not_gone(r, n): return False            # 网络抖动（查不到但非 404）
+    async def no_reviews(r, n): return []
+    async def no_ci(r, s): return ""
+    e = lambda num: [x for x in pr_ledger.active() if x["number"] == num]
+    try:
+        gitea.pr_info, gitea.pr_gone = none_info, is_gone
+        gitea.pr_reviews, gitea.ci_state = no_reviews, no_ci
+
+        # 连续 3 轮确切 404 → 才销账 + 通知
+        pr_ledger.record("h/o/r", 1, "u1", "!room")
+        asyncio.run(bot._followup_one(e(1)[0]))
+        assert e(1) and e(1)[0]["gone_rounds"] == 1
+        asyncio.run(bot._followup_one(e(1)[0]))
+        assert e(1) and e(1)[0]["gone_rounds"] == 2 and not any("已不存在" in m for m in sent)
+        asyncio.run(bot._followup_one(e(1)[0]))
+        assert not e(1) and any("PR #1" in m and "已不存在" in m for m in sent)   # 3 轮 → 销账 + 报
+
+        # 网络抖动（非 404）：一轮都不攒，永远不销
+        gitea.pr_gone = not_gone
+        pr_ledger.record("h/o/r", 2, "u2", "!room")
+        for _ in range(5):
+            asyncio.run(bot._followup_one(e(2)[0]))
+        assert e(2) and e(2)[0]["gone_rounds"] == 0
+
+        # 中途成功查到一次 → 之前攒的 404 轮数清零
+        gitea.pr_gone = is_gone
+        pr_ledger.update("h/o/r", 2, gone_rounds=2)
+        async def open_info(r, n):
+            return {"state": "open", "merged": False, "mergeable": True,
+                    "head": {"ref": "b", "sha": "s"}}
+        gitea.pr_info = open_info
+        asyncio.run(bot._followup_one(e(2)[0]))
+        assert e(2) and e(2)[0]["gone_rounds"] == 0
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.pr_gone) = orig
+        settings.store_path, settings.pr_automerge = orig_store, orig_am
+        _reset_ledger()
+
+
 # ---------- 工单台账：登记/去重/更新/销账 + 持久化 ----------
 def test_issue_ledger():
     import tempfile
@@ -1599,6 +1808,62 @@ def test_issue_execute_and_sweep():
          bot.projects.get_project, gitea.issue_info) = orig
         settings.store_path = orig_store
         _reset_issue_ledger(); _reset_ledger()
+
+
+# ---------- 工单台账：连续 3 轮确切 404 才销账并通知；中途成功清零；网络抖动一轮都不攒 ----------
+def test_issue_gone_after_three_404():
+    import tempfile
+    import issue_intake
+    import issue_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_issue_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (state.client, bot.projects.get_project, gitea.issue_info, gitea.issue_gone)
+    state.client = FC()
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    async def none_info(r, n): return None
+    async def is_gone(r, n): return True
+    async def not_gone(r, n): return False
+    a = lambda num: [x for x in issue_ledger.active() if x["number"] == num]
+    try:
+        gitea.issue_info, gitea.issue_gone = none_info, is_gone
+
+        # 连续 3 轮确切 404 → 才销账 + 通知
+        issue_ledger.record("h/o/r", 3, "u3", "!room")
+        asyncio.run(issue_intake._sweep_closed())
+        assert a(3) and a(3)[0]["gone_rounds"] == 1
+        asyncio.run(issue_intake._sweep_closed())
+        assert a(3) and a(3)[0]["gone_rounds"] == 2 and not any("已不存在" in m for m in sent)
+        asyncio.run(issue_intake._sweep_closed())
+        assert not a(3) and any("工单 #3" in m and "已不存在" in m for m in sent)
+
+        # 网络抖动（非 404）：一轮都不攒
+        gitea.issue_gone = not_gone
+        issue_ledger.record("h/o/r", 4, "u4", "!room")
+        for _ in range(4):
+            asyncio.run(issue_intake._sweep_closed())
+        assert a(4) and a(4)[0]["gone_rounds"] == 0
+
+        # 中途成功查到（未关）→ 清零、留在册
+        gitea.issue_gone = is_gone
+        issue_ledger.update("h/o/r", 4, gone_rounds=2)
+        async def open_issue(r, n): return {"state": "open"}
+        gitea.issue_info = open_issue
+        asyncio.run(issue_intake._sweep_closed())
+        assert a(4) and a(4)[0]["gone_rounds"] == 0
+    finally:
+        (state.client, bot.projects.get_project, gitea.issue_info, gitea.issue_gone) = orig
+        settings.store_path = orig_store
+        _reset_issue_ledger()
 
 
 # ---------- 模型拆分：干活用 CLAUDE_MODEL，轻判断（quick/consult）优先 CLAUDE_QUICK_MODEL ----------
@@ -1728,6 +1993,100 @@ def test_pr_automerge():
          gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge) = orig
         settings.pr_automerge, settings.pr_merge_method = orig_am
         settings.store_path = orig_store
+        _reset_ledger()
+
+
+# ---------- 自动合并闸：ci_state 查询失败(None) 不当"CI 通过"放行，且不误报 CI 失败 ----------
+def test_automerge_skips_on_ci_unknown():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    orig_am = (settings.pr_automerge, settings.pr_merge_method)
+    settings.store_path = tempfile.mkdtemp()
+    settings.pr_automerge = True
+    settings.pr_merge_method = "merge"
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent, merged = [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: coro.close()
+
+    async def open_mergeable(r, n):
+        return {"state": "open", "merged": False, "mergeable": True,
+                "head": {"ref": "claude/x", "sha": "s"}}
+    async def no_reviews(r, n): return []
+    async def ci_unknown(r, s): return None                   # CI 查询失败：状态未知
+    async def fake_merge(r, n, method="merge", delete_branch=False):
+        merged.append((n, method)); return True, ""
+    try:
+        gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge = (
+            open_mergeable, no_reviews, ci_unknown, fake_merge)
+        pr_ledger.record("h/o/r", 1, "u1", "!room")
+        asyncio.run(bot._followup_one([e for e in pr_ledger.active() if e["number"] == 1][0]))
+        assert merged == []                                   # CI 未知 → 绝不自动合并
+        assert any(e["number"] == 1 for e in pr_ledger.active())   # 仍在册，等 CI 明朗
+        assert not any("CI 失败" in m for m in sent)          # 也不误报 CI 失败
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge) = orig
+        settings.pr_automerge, settings.pr_merge_method = orig_am
+        settings.store_path = orig_store
+        _reset_ledger()
+
+
+# ---------- PR 冲突：首见告警一次，同 sha 不重复刷屏；换了 sha 会再报一次 ----------
+def test_conflict_alert_once():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store, orig_am = settings.store_path, settings.pr_automerge
+    settings.store_path = tempfile.mkdtemp()
+    settings.pr_automerge = True
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: coro.close()
+    async def no_reviews(r, n): return []
+    async def no_ci(r, s): return ""
+    head = {"sha": "s1"}
+    async def conflict(r, n):
+        return {"state": "open", "merged": False, "mergeable": False,
+                "head": {"ref": "claude/x", "sha": head["sha"]}}
+    e = lambda: [x for x in pr_ledger.active() if x["number"] == 1][0]
+    try:
+        gitea.pr_info, gitea.pr_reviews, gitea.ci_state = conflict, no_reviews, no_ci
+        pr_ledger.record("h/o/r", 1, "u1", "!room")
+        asyncio.run(bot._followup_one(e()))
+        asyncio.run(bot._followup_one(e()))               # 同一 sha 再冲突一轮
+        assert sum("有冲突" in m for m in sent) == 1        # 只告警一次，不每 180s 刷屏
+        assert e()["conflict_seen"] == "s1"
+        head["sha"] = "s2"                                 # 重推了新 commit（换 sha）
+        asyncio.run(bot._followup_one(e()))
+        assert sum("有冲突" in m for m in sent) == 2        # 新版本 → 允许再报一次
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state) = orig
+        settings.store_path, settings.pr_automerge = orig_store, orig_am
         _reset_ledger()
 
 
@@ -2000,6 +2359,176 @@ def test_autonomous_tasks_cancellable_by_room():
         heartbeat.runner, pr_followup.runner, state.client = orig
 
 
+# ---------- /cancel：排队中的任务被取消后绝不开跑；三种情况文案可区分 ----------
+def test_cancel_stops_queued_task():
+    cr = claude_runner
+
+    # (a) runner 级：A 在跑占着锁、B 排队等锁；此刻 /cancel → A 被杀、B 拿到锁即了断，绝不偷偷开跑
+    async def go():
+        r = cr.ClaudeRunner()
+        a_in = asyncio.Event()        # A 已进锁并起了子进程
+        release_a = asyncio.Event()   # 放行 A（模拟它被杀后返回）
+        b_started_proc = {"v": False}
+        killed = []
+        orig_kill = cr._kill_group
+        cr._kill_group = lambda p: (killed.append(p), setattr(p, "returncode", -9))
+
+        class P:                      # 假子进程：只用到 pid / returncode
+            def __init__(self): self.pid, self.returncode = 4321, None
+
+        async def fake_run(cmd, cwd=None, on_proc=None):
+            first = not a_in.is_set()
+            proc = P()
+            if on_proc:
+                on_proc(proc)                          # 登记进程 → token.started=True
+            if first:
+                a_in.set()
+                await release_a.wait()                 # A 持锁阻塞，其间会被 /cancel 杀
+                return proc.returncode or -9, b"", b""
+            b_started_proc["v"] = True                 # B 一旦起了子进程就记下——本不该发生
+            return 0, json.dumps({"result": "b-ran", "session_id": "sb", "is_error": False}).encode(), b""
+
+        r._run = fake_run
+        try:
+            ta = asyncio.create_task(r.ask("A", "a", lock_key="proj", cancel_key="room"))
+            await a_in.wait()                            # 确保 A 已进锁在跑
+            tb = asyncio.create_task(r.ask("B", "b", lock_key="proj", cancel_key="room"))
+            for _ in range(200):                         # 等 B 登记令牌并排到锁上
+                if len(r._tokens.get("room", ())) == 2:
+                    break
+                await asyncio.sleep(0)
+            running, queued = r.cancel("room")           # /cancel
+            release_a.set()
+            ra = (await asyncio.gather(ta, return_exceptions=True))[0]
+            rb = (await asyncio.gather(tb, return_exceptions=True))[0]
+            return running, queued, ra, rb, b_started_proc["v"], killed
+        finally:
+            cr._kill_group = orig_kill
+
+    running, queued, ra, rb, b_ran, killed = asyncio.run(go())
+    assert running == 1 and queued == 1                  # A 运行中、B 排队中，各计一
+    assert isinstance(ra, cr.ClaudeCancelled)            # A 按取消路径退（上层回"已停止"而非"出错了"）
+    assert isinstance(rb, cr.ClaudeCancelled)            # B 也按取消退
+    assert b_ran is False                                # B 根本没起子进程——没有背着用户开跑
+    assert len(killed) == 1                              # A 的子进程组被杀
+
+    # (b) handle_cancel 三种情况文案可区分：运行中 / 排队中 / 空场
+    orig_runner, orig_client = tasks.runner, state.client
+    c = _CapClient(); state.client = c
+
+    class FR:
+        def __init__(self, res): self.res = res
+        def cancel(self, rid): return self.res
+    try:
+        for res, expect in (((1, 0), "已停止正在运行"),
+                            ((0, 2), "已取消排队"),
+                            ((0, 0), "没有正在运行或排队")):
+            c.sent.clear()
+            tasks.runner = FR(res)
+            asyncio.run(bot.handle_cancel(FakeRoom("!cq:ex.org", 3)))
+            assert any(expect in (m.get("body") or "") for m in c.sent), (res, expect)
+    finally:
+        tasks.runner, state.client = orig_runner, orig_client
+
+
+# ---------- /cancel 空场不留标记：之后新派的任务不会被莫名毒杀 ----------
+def test_cancel_empty_no_poison():
+    cr = claude_runner
+
+    async def go():
+        r = cr.ClaudeRunner()
+        assert r.cancel("room") == (0, 0)                # 空场：什么都没停
+        assert not r._tokens.get("room")                 # 且没留下任何取消令牌（否则会毒杀下一个任务）
+
+        async def fake_run(cmd, cwd=None, on_proc=None):
+            proc = types.SimpleNamespace(pid=1, returncode=None)
+            if on_proc:
+                on_proc(proc)
+            proc.returncode = 0
+            return 0, json.dumps({"result": "干完了", "session_id": "s", "is_error": False}).encode(), b""
+
+        r._run = fake_run
+        return await r.ask("k", "干活", lock_key="proj", cancel_key="room")   # 之后正常派活
+    assert asyncio.run(go()) == "干完了"                  # 不被那条陈旧标记莫名秒杀
+
+
+# ---------- 流式任务异常：占位收尾成报错，不再永远停在"正在干活"、也不重复报错 ----------
+def test_stream_task_error_finalizes_placeholder():
+    set_identity()
+    rid = "!serr:ex.org"
+    room = FakeRoom(rid, 2)
+    bot._context[rid].clear()
+    c = _CapClient(); state.client = c
+
+    class R:
+        def busy(self, k): return False
+        def running(self, k): return 0
+        async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
+                      prepare=None, on_delta=None, cancel_key=None):
+            if on_delta:
+                await on_delta("看了一半代码", "Bash")     # 先造出占位消息（停在"正在干活"）
+            raise RuntimeError("claude 退出码 1: boom")     # 再异常退出
+
+    rec = {"id": "p", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
+    orig = (tasks.runner, settings.stream_replies)
+    tasks.runner = R()
+    settings.stream_replies = True
+    try:
+        asyncio.run(bot._run_on_project(room, make_event("干个活"), "干个活", rec))  # 不该往外抛
+    finally:
+        (tasks.runner, settings.stream_replies) = orig
+        bot._context[rid].clear()
+
+    edits = [m for m in c.sent if (m.get("m.relates_to") or {}).get("rel_type") == "m.replace"]
+    assert edits and "出错了" in edits[-1]["m.new_content"]["body"]     # 占位被收尾成报错
+    assert "boom" in edits[-1]["m.new_content"]["body"]                # 带上具体错因
+    top_errs = [m for m in c.sent                                      # 不重复报错：没有另发的顶层"出错了"
+                if (m.get("m.relates_to") or {}).get("rel_type") != "m.replace"
+                and "出错了" in (m.get("body") or "")]
+    assert not top_errs
+
+
+# ---------- 手动前台 Ctrl-C：协程取消时子进程组被杀，不留孤儿 claude ----------
+def test_run_kills_group_on_cancel():
+    import tempfile
+    cr = claude_runner
+
+    async def go():
+        r = cr.ClaudeRunner()
+        killed = []
+        orig_kill = cr._kill_group
+        cr._kill_group = lambda p: killed.append(p)
+
+        class FakeProc:
+            def __init__(self): self.pid, self.returncode = 999, None
+            async def communicate(self): await asyncio.sleep(3600)   # 永远卡住，等外部取消
+            async def wait(self): return self.returncode
+
+        proc = FakeProc()
+        orig_exec = asyncio.create_subprocess_exec
+        async def fake_exec(*a, **k): return proc
+        asyncio.create_subprocess_exec = fake_exec
+        started = asyncio.Event()
+        try:
+            task = asyncio.create_task(
+                r._run(["claude", "-p", "hi"], cwd=tempfile.mkdtemp(),
+                       on_proc=lambda p: started.set()))
+            await started.wait()          # 子进程已登记
+            await asyncio.sleep(0)         # 让 _run 进入 communicate 的 await
+            task.cancel()                  # 模拟 Ctrl-C 打断协程
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return proc, killed
+        finally:
+            cr._kill_group = orig_kill
+            asyncio.create_subprocess_exec = orig_exec
+
+    proc, killed = asyncio.run(go())
+    assert proc in killed                  # 取消时子进程组被杀，claude 不会变孤儿继续 push/开 PR
+
+
 # ---------- 重启后回复 bot 旧消息仍算点名（向服务器补认发送者） ----------
 def test_reply_to_bot_after_restart():
     set_identity()
@@ -2157,10 +2686,12 @@ TESTS = [
     ("引用回退块剥离", test_reply_fallback_strip),
     ("track 门控 + 时间单调", test_track_and_monotonic),
     ("自己账号入上下文不派活", test_own_account_context),
+    ("编辑消息 m.replace 不重派活", test_edit_event_ignored),
     ("TTL 过期提示", test_ttl_notice),
     ("token 受信主机 + redact", test_security_bits),
     ("无访问控制：谁邀请都进房", test_no_access_control_invite_joins),
     ("孤儿房间 人走光自动退", test_leave_when_alone),
+    ("退房清尾巴 绑定/路由/任务/记录", test_leave_cleans_up_room),
     ("群对话延续窗口", test_group_followup_window),
     ("/reset 清空背景上下文", test_reset_clears_context),
     ("重试仅限会话失效", test_retry_only_on_session_error),
@@ -2174,6 +2705,7 @@ TESTS = [
     ("未同步群不当私聊+剥外链img", test_dm_classification_and_html_hardening),
     ("媒体下载落盘+入上下文+派活", test_media_download_and_dispatch),
     ("媒体超体积跳过", test_media_oversize_skipped),
+    ("媒体失败无caption 明确回错误", test_media_failure_notifies_when_addressed),
     ("媒体文件名消毒", test_media_safe_name),
     ("媒体滚动删旧", test_media_prune),
     ("DM 分诊路由过 ensure", test_dm_routing_ensures_checkout),
@@ -2198,21 +2730,30 @@ TESTS = [
     ("触发词按词边界匹配", test_trigger_word_boundary),
     ("会话落盘重启可恢复", test_sessions_persisted_across_restart),
     ("DM 一般性问题当通用助手答", test_dm_general_question),
+    ("DM /bind 给引导不派活", test_dm_bind_gets_guidance),
     ("项目长期记忆 跨会话留存", test_project_memory),
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),
     ("PR 跟进 合并销账/评审派活", test_pr_followup_actions),
+    ("PR 连续3轮404才销账 抖动不销", test_pr_gone_after_three_404),
     ("工单台账 登记/持久化/销账", test_issue_ledger),
     ("工单接活 认领/宣布/派执行/防重", test_issue_intake_flow),
     ("工单执行 开PR进台账/贴链接/关单销账", test_issue_execute_and_sweep),
+    ("工单连续3轮404才销账 抖动不销", test_issue_gone_after_three_404),
     ("排队回执 忙时知会/空闲不发", test_queue_receipt_when_busy),
     ("模型拆分 干活大/轻判断小", test_quick_model_split),
     ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
     ("PR 自动合并 条件满足才合并", test_pr_automerge),
+    ("CI查询失败不放行自动合并", test_automerge_skips_on_ci_unknown),
+    ("PR 冲突只告警一次不刷屏", test_conflict_alert_once),
     ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),
     ("/status 状态一屏可见", test_status_command),
     ("流式定稿 编辑失败退回新发", test_livereply_finalize_edit_fallback),
     ("自驱/跟进任务可被 /cancel", test_autonomous_tasks_cancellable_by_room),
+    ("/cancel 停排队任务+三种文案", test_cancel_stops_queued_task),
+    ("/cancel 空场不毒杀下个任务", test_cancel_empty_no_poison),
+    ("流式异常 占位收尾不重复报错", test_stream_task_error_finalizes_placeholder),
+    ("取消协程 子进程组被杀", test_run_kills_group_on_cancel),
     ("重启后回复 bot 仍算点名", test_reply_to_bot_after_restart),
     ("PR 跟进忽略自己的评论", test_followup_ignores_own_reviews),
     ("分诊背景剔除当前消息", test_dispatch_triage_skips_current),

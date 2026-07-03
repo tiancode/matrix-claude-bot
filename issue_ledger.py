@@ -57,8 +57,9 @@ def record(pid: str, number: int, url: str, room: str) -> bool:
     k = _key(pid, number)
     if k in _data:
         return False
+    # gone_rounds: 连续查到 404 的轮数（成功一次即清零，≥3 轮才销账，防抖动误销）。
     _data[k] = {"pid": pid, "number": number, "url": url, "room": room,
-                "pr": 0, "created_ts": time.time()}
+                "pr": 0, "gone_rounds": 0, "created_ts": time.time()}
     _save()
     return True
 
