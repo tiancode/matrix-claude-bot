@@ -43,6 +43,23 @@ async def _followup_dispatch(rec: dict, entry: dict, detail: str):
 
 
 
+async def _handle_missing(entry: dict):
+    """pr_info 查不到时定性：只有连续 ≥3 轮确切 404（PR 被删 / 仓库改名）才销账并知会房间；
+    网络抖动（404 之外的查不到）不计入、并把之前攒的轮数清零，免得一次断网就把台账条目误销。"""
+    pid, n, room = entry["pid"], entry["number"], entry["room"]
+    rec = projects.get_project(pid)
+    if rec and await gitea.pr_gone(rec, n):
+        gone = entry.get("gone_rounds", 0) + 1
+        if gone >= 3:
+            pr_ledger.remove(pid, n)
+            await send(room, f"⚠️ PR #{n} 在 Gitea 上已不存在（被删 / 仓库改名），停止跟进。")
+            log.info("[%s] PR #%d 连续 %d 轮 404，销账", pid, n, gone)
+        else:
+            pr_ledger.update(pid, n, gone_rounds=gone)
+    elif entry.get("gone_rounds"):
+        pr_ledger.update(pid, n, gone_rounds=0)   # 抖动而非真没了：清零重新计
+
+
 async def _followup_one(entry: dict):
     pid, n, room = entry["pid"], entry["number"], entry["room"]
     rec = projects.get_project(pid)
@@ -50,7 +67,10 @@ async def _followup_one(entry: dict):
         return
     info = await gitea.pr_info(rec, n)
     if info is None:
-        return   # 查不到（网络抖动 / 被删）：下轮再试，不销账
+        await _handle_missing(entry)   # 查不到：分辨"网络抖动（下轮再试）"和"PR 真没了（连续 404 才销账）"
+        return
+    if entry.get("gone_rounds"):
+        pr_ledger.update(pid, n, gone_rounds=0)   # 成功查到一次 → 之前攒的 404 轮数清零
     pr_ledger.update(pid, n, last_check_ts=time.time())
     if info.get("merged"):
         pr_ledger.remove(pid, n)
@@ -86,7 +106,7 @@ async def _followup_one(entry: dict):
             await send(room, f"📝 PR #{n} 又有评审意见，但已到自动处理上限（{cap} 次），需要人看看：{entry.get('url', '')}")
         return
 
-    # 2) CI 失败
+    # 2) CI 失败（ci 可能为 None=查询失败：None 不在 ("failure","error") 里，天然不会误报"CI 失败"）
     ci = await gitea.ci_state(rec, sha)
     if ci in ("failure", "error") and entry.get("ci_seen") != sha:
         pr_ledger.update(pid, n, ci_seen=sha)
@@ -104,14 +124,24 @@ async def _followup_one(entry: dict):
 
 
 
-async def _maybe_automerge(rec: dict, entry: dict, info: dict, ci: str, reviews: list):
+async def _maybe_automerge(rec: dict, entry: dict, info: dict, ci: str | None, reviews: list):
     """followup 末尾的机械合并闸：PR 可合并 + CI 通过(或无 CI 配置) + 无未决"请求改动"评审 →
     直接按 Gitea API 合并、销账、回报。不经 Claude 评审（"只做合并"）；移除人工合并这道闸，
-    安全性靠 CI（若配了）+ 快照环境。合并失败保持 PR 开启，下轮再试或等人工。"""
+    安全性靠 CI（若配了）+ 快照环境。合并失败保持 PR 开启，下轮再试或等人工。
+    "盯到合并"=遇冲突 / 合并失败要吭声，别每 180s 沉默重查——按 head sha 记水位，同一版本只告警一次。"""
     pid, n, room = entry["pid"], entry["number"], entry["room"]
-    if not info.get("mergeable"):
-        return                                   # 有冲突 / 暂不可合并：等下一轮
-    if ci not in ("", "success"):                # pending / 未知：CI 没跑完就先等（failure 已在上一段处理）
+    sha = (info.get("head") or {}).get("sha") or ""
+    if not info.get("mergeable"):                # 有冲突 / 暂不可合并
+        if entry.get("conflict_seen") != sha:    # 首见这个版本的冲突 → 告警一次（换 sha 会再报）
+            pr_ledger.update(pid, n, conflict_seen=sha)
+            await send(room, f"⚠️ PR #{n} 有冲突无法自动合并，需要人工处理或让我重做：{entry.get('url', '')}")
+            log.info("[%s] PR #%d 有冲突，已知会", pid, n)
+        return
+    if entry.get("conflict_seen"):               # 变回可合并：清冲突水位，下次再冲突还能再报
+        pr_ledger.update(pid, n, conflict_seen="")
+    if ci is None:                               # CI 状态查询失败（网络抖动）：本轮别赌，跳过合并
+        return
+    if ci not in ("", "success"):                # pending：CI 没跑完就先等（failure 已在上一段处理）
         return
     decisive = [r.get("state") for r in reviews if r.get("state") in ("APPROVED", "REQUEST_CHANGES")]
     if decisive and decisive[-1] == "REQUEST_CHANGES":
@@ -122,8 +152,12 @@ async def _maybe_automerge(rec: dict, entry: dict, info: dict, ci: str, reviews:
         pr_ledger.remove(pid, n)
         await send(room, f"✅ PR #{n} 已自动合并（{settings.pr_merge_method}）：{entry.get('url', '')}")
         log.info("[%s] PR #%d 自动合并", pid, n)
+    elif entry.get("merge_fail_seen") != sha:    # 同一 sha 的合并失败只告警一次，别刷屏
+        pr_ledger.update(pid, n, merge_fail_seen=sha)
+        await send(room, f"⚠️ PR #{n} 自动合并失败，需要人工处理或让我重做：{entry.get('url', '')}\n（原因：{detail}）")
+        log.warning("[%s] PR #%d 自动合并失败（保持开启，待人工）：%s", pid, n, detail)
     else:
-        log.warning("[%s] PR #%d 自动合并失败（保持开启，下轮再试或待人工）：%s", pid, n, detail)
+        log.warning("[%s] PR #%d 自动合并仍失败（同一 sha 不再刷屏）：%s", pid, n, detail)
 
 
 

@@ -56,9 +56,12 @@ def record(pid: str, number: int, url: str, room: str) -> bool:
     k = _key(pid, number)
     if k in _data:
         return False
+    # gone_rounds: 连续查到 404 的轮数（成功一次即清零，≥3 轮才销账，防抖动误销）；
+    # conflict_seen / merge_fail_seen: 冲突 / 自动合并失败告警的水位（记 head sha，同一版本只吭一次）。
     _data[k] = {"pid": pid, "number": number, "url": url, "room": room,
                 "branch": "", "seen_review": 0, "review_fixes": 0, "ci_fixes": 0,
-                "ci_seen": "", "created_ts": time.time(), "last_check_ts": 0.0}
+                "ci_seen": "", "gone_rounds": 0, "conflict_seen": "", "merge_fail_seen": "",
+                "created_ts": time.time(), "last_check_ts": 0.0}
     _save()
     return True
 

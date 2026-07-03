@@ -1492,6 +1492,70 @@ def test_pr_followup_actions():
         _reset_ledger()
 
 
+# ---------- PR 台账：连续 3 轮确切 404 才销账并通知；中途成功清零；网络抖动一轮都不攒 ----------
+def test_pr_gone_after_three_404():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store, orig_am = settings.store_path, settings.pr_automerge
+    settings.store_path = tempfile.mkdtemp()
+    settings.pr_automerge = False                      # 不走合并路径，专测销账逻辑
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.pr_gone)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: coro.close()
+    async def none_info(r, n): return None            # pr_info 查不到
+    async def is_gone(r, n): return True              # 确切 404
+    async def not_gone(r, n): return False            # 网络抖动（查不到但非 404）
+    async def no_reviews(r, n): return []
+    async def no_ci(r, s): return ""
+    e = lambda num: [x for x in pr_ledger.active() if x["number"] == num]
+    try:
+        gitea.pr_info, gitea.pr_gone = none_info, is_gone
+        gitea.pr_reviews, gitea.ci_state = no_reviews, no_ci
+
+        # 连续 3 轮确切 404 → 才销账 + 通知
+        pr_ledger.record("h/o/r", 1, "u1", "!room")
+        asyncio.run(bot._followup_one(e(1)[0]))
+        assert e(1) and e(1)[0]["gone_rounds"] == 1
+        asyncio.run(bot._followup_one(e(1)[0]))
+        assert e(1) and e(1)[0]["gone_rounds"] == 2 and not any("已不存在" in m for m in sent)
+        asyncio.run(bot._followup_one(e(1)[0]))
+        assert not e(1) and any("PR #1" in m and "已不存在" in m for m in sent)   # 3 轮 → 销账 + 报
+
+        # 网络抖动（非 404）：一轮都不攒，永远不销
+        gitea.pr_gone = not_gone
+        pr_ledger.record("h/o/r", 2, "u2", "!room")
+        for _ in range(5):
+            asyncio.run(bot._followup_one(e(2)[0]))
+        assert e(2) and e(2)[0]["gone_rounds"] == 0
+
+        # 中途成功查到一次 → 之前攒的 404 轮数清零
+        gitea.pr_gone = is_gone
+        pr_ledger.update("h/o/r", 2, gone_rounds=2)
+        async def open_info(r, n):
+            return {"state": "open", "merged": False, "mergeable": True,
+                    "head": {"ref": "b", "sha": "s"}}
+        gitea.pr_info = open_info
+        asyncio.run(bot._followup_one(e(2)[0]))
+        assert e(2) and e(2)[0]["gone_rounds"] == 0
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.pr_gone) = orig
+        settings.store_path, settings.pr_automerge = orig_store, orig_am
+        _reset_ledger()
+
+
 # ---------- 工单台账：登记/去重/更新/销账 + 持久化 ----------
 def test_issue_ledger():
     import tempfile
@@ -1599,6 +1663,62 @@ def test_issue_execute_and_sweep():
          bot.projects.get_project, gitea.issue_info) = orig
         settings.store_path = orig_store
         _reset_issue_ledger(); _reset_ledger()
+
+
+# ---------- 工单台账：连续 3 轮确切 404 才销账并通知；中途成功清零；网络抖动一轮都不攒 ----------
+def test_issue_gone_after_three_404():
+    import tempfile
+    import issue_intake
+    import issue_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    settings.store_path = tempfile.mkdtemp()
+    _reset_issue_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (state.client, bot.projects.get_project, gitea.issue_info, gitea.issue_gone)
+    state.client = FC()
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    async def none_info(r, n): return None
+    async def is_gone(r, n): return True
+    async def not_gone(r, n): return False
+    a = lambda num: [x for x in issue_ledger.active() if x["number"] == num]
+    try:
+        gitea.issue_info, gitea.issue_gone = none_info, is_gone
+
+        # 连续 3 轮确切 404 → 才销账 + 通知
+        issue_ledger.record("h/o/r", 3, "u3", "!room")
+        asyncio.run(issue_intake._sweep_closed())
+        assert a(3) and a(3)[0]["gone_rounds"] == 1
+        asyncio.run(issue_intake._sweep_closed())
+        assert a(3) and a(3)[0]["gone_rounds"] == 2 and not any("已不存在" in m for m in sent)
+        asyncio.run(issue_intake._sweep_closed())
+        assert not a(3) and any("工单 #3" in m and "已不存在" in m for m in sent)
+
+        # 网络抖动（非 404）：一轮都不攒
+        gitea.issue_gone = not_gone
+        issue_ledger.record("h/o/r", 4, "u4", "!room")
+        for _ in range(4):
+            asyncio.run(issue_intake._sweep_closed())
+        assert a(4) and a(4)[0]["gone_rounds"] == 0
+
+        # 中途成功查到（未关）→ 清零、留在册
+        gitea.issue_gone = is_gone
+        issue_ledger.update("h/o/r", 4, gone_rounds=2)
+        async def open_issue(r, n): return {"state": "open"}
+        gitea.issue_info = open_issue
+        asyncio.run(issue_intake._sweep_closed())
+        assert a(4) and a(4)[0]["gone_rounds"] == 0
+    finally:
+        (state.client, bot.projects.get_project, gitea.issue_info, gitea.issue_gone) = orig
+        settings.store_path = orig_store
+        _reset_issue_ledger()
 
 
 # ---------- 模型拆分：干活用 CLAUDE_MODEL，轻判断（quick/consult）优先 CLAUDE_QUICK_MODEL ----------
@@ -1728,6 +1848,100 @@ def test_pr_automerge():
          gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge) = orig
         settings.pr_automerge, settings.pr_merge_method = orig_am
         settings.store_path = orig_store
+        _reset_ledger()
+
+
+# ---------- 自动合并闸：ci_state 查询失败(None) 不当"CI 通过"放行，且不误报 CI 失败 ----------
+def test_automerge_skips_on_ci_unknown():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store = settings.store_path
+    orig_am = (settings.pr_automerge, settings.pr_merge_method)
+    settings.store_path = tempfile.mkdtemp()
+    settings.pr_automerge = True
+    settings.pr_merge_method = "merge"
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent, merged = [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: coro.close()
+
+    async def open_mergeable(r, n):
+        return {"state": "open", "merged": False, "mergeable": True,
+                "head": {"ref": "claude/x", "sha": "s"}}
+    async def no_reviews(r, n): return []
+    async def ci_unknown(r, s): return None                   # CI 查询失败：状态未知
+    async def fake_merge(r, n, method="merge", delete_branch=False):
+        merged.append((n, method)); return True, ""
+    try:
+        gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge = (
+            open_mergeable, no_reviews, ci_unknown, fake_merge)
+        pr_ledger.record("h/o/r", 1, "u1", "!room")
+        asyncio.run(bot._followup_one([e for e in pr_ledger.active() if e["number"] == 1][0]))
+        assert merged == []                                   # CI 未知 → 绝不自动合并
+        assert any(e["number"] == 1 for e in pr_ledger.active())   # 仍在册，等 CI 明朗
+        assert not any("CI 失败" in m for m in sent)          # 也不误报 CI 失败
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state, gitea.merge) = orig
+        settings.pr_automerge, settings.pr_merge_method = orig_am
+        settings.store_path = orig_store
+        _reset_ledger()
+
+
+# ---------- PR 冲突：首见告警一次，同 sha 不重复刷屏；换了 sha 会再报一次 ----------
+def test_conflict_alert_once():
+    import tempfile
+    import pr_ledger
+    import gitea
+    set_identity()
+    orig_store, orig_am = settings.store_path, settings.pr_automerge
+    settings.store_path = tempfile.mkdtemp()
+    settings.pr_automerge = True
+    _reset_ledger()
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "host": "http://h", "path": "/x", "base": "main"}
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_project, state.client, state._spawn,
+            gitea.pr_info, gitea.pr_reviews, gitea.ci_state)
+    bot.projects.get_project = lambda pid: rec if pid == "h/o/r" else None
+    state.client = FC()
+    state._spawn = lambda coro: coro.close()
+    async def no_reviews(r, n): return []
+    async def no_ci(r, s): return ""
+    head = {"sha": "s1"}
+    async def conflict(r, n):
+        return {"state": "open", "merged": False, "mergeable": False,
+                "head": {"ref": "claude/x", "sha": head["sha"]}}
+    e = lambda: [x for x in pr_ledger.active() if x["number"] == 1][0]
+    try:
+        gitea.pr_info, gitea.pr_reviews, gitea.ci_state = conflict, no_reviews, no_ci
+        pr_ledger.record("h/o/r", 1, "u1", "!room")
+        asyncio.run(bot._followup_one(e()))
+        asyncio.run(bot._followup_one(e()))               # 同一 sha 再冲突一轮
+        assert sum("有冲突" in m for m in sent) == 1        # 只告警一次，不每 180s 刷屏
+        assert e()["conflict_seen"] == "s1"
+        head["sha"] = "s2"                                 # 重推了新 commit（换 sha）
+        asyncio.run(bot._followup_one(e()))
+        assert sum("有冲突" in m for m in sent) == 2        # 新版本 → 允许再报一次
+    finally:
+        (bot.projects.get_project, state.client, state._spawn,
+         gitea.pr_info, gitea.pr_reviews, gitea.ci_state) = orig
+        settings.store_path, settings.pr_automerge = orig_store, orig_am
         _reset_ledger()
 
 
@@ -2202,13 +2416,17 @@ TESTS = [
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),
     ("PR 跟进 合并销账/评审派活", test_pr_followup_actions),
+    ("PR 连续3轮404才销账 抖动不销", test_pr_gone_after_three_404),
     ("工单台账 登记/持久化/销账", test_issue_ledger),
     ("工单接活 认领/宣布/派执行/防重", test_issue_intake_flow),
     ("工单执行 开PR进台账/贴链接/关单销账", test_issue_execute_and_sweep),
+    ("工单连续3轮404才销账 抖动不销", test_issue_gone_after_three_404),
     ("排队回执 忙时知会/空闲不发", test_queue_receipt_when_busy),
     ("模型拆分 干活大/轻判断小", test_quick_model_split),
     ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
     ("PR 自动合并 条件满足才合并", test_pr_automerge),
+    ("CI查询失败不放行自动合并", test_automerge_skips_on_ci_unknown),
+    ("PR 冲突只告警一次不刷屏", test_conflict_alert_once),
     ("自驱心跳 提议/autopilot", test_heartbeat_propose_and_autopilot),
     ("/status 状态一屏可见", test_status_command),
     ("流式定稿 编辑失败退回新发", test_livereply_finalize_edit_fallback),
