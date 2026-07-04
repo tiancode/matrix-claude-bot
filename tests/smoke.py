@@ -2812,6 +2812,137 @@ def test_transcript_log_and_recall():
          settings.transcript_keep_days, settings.transcript_max_lines) = orig
 
 
+# ---------- 聊天日摘要 + 主题索引：触发判断 / 东八区分桶 / 落盘 / 水位线 / 合并去重 / 注入 ----------
+def test_digest_layer():
+    import tempfile
+    import datetime as dt
+    import digest
+    import transcript
+
+    orig = (settings.store_path, settings.transcript_enabled, settings.digest_enabled,
+            settings.digest_min_lines, settings.digest_min_interval,
+            settings.digest_keep_days, settings.digest_tz_hours, settings.transcript_keep_days)
+    orig_quick = digest.runner.quick
+    settings.store_path = tempfile.mkdtemp()
+    settings.transcript_enabled = True
+    # 固定用 2026-03 的历史日期测东八区分桶，得把逐字记录保留期放大，否则 append 的自动 prune
+    # 会按真实时钟（远晚于 2026-03）把这些"过期"行删掉，读回来就凑不齐两行了。
+    settings.transcript_keep_days = 10 ** 6
+    settings.digest_enabled = True
+    settings.digest_min_lines = 30
+    settings.digest_min_interval = 7200
+    settings.digest_keep_days = 180
+    settings.digest_tz_hours = 8
+    rid = "!dg:ex.org"
+
+    # 假 quick：返回固定格式（条目 + 末行 INDEX）；主题清单可切换以验证合并去重
+    topics = {"line": "INDEX: 部署；登录"}
+    async def fake_quick(prompt):
+        return ("- **10:00–10:30** 部署：把服务部署到 pi.lan（ts 1—2）\n"
+                "- **11:00–11:10** 登录：token 自动刷新（ts 3—4）\n" + topics["line"])
+    digest.runner.quick = fake_quick
+    digest._last_run.pop(rid, None)      # _last_run 是内存态，清一下防跨用例串
+    digest._last_prune.pop(rid, None)
+    try:
+        # ---- should_digest：不够行数 → False ----
+        for i in range(5):
+            transcript.append(rid, "alice", f"闲聊{i}", event_id=f"$c{i}")
+        assert digest.should_digest(rid) is False        # 5 行 < 30、全今天、无跨天残留
+
+        # ---- should_digest：够行数 + 够间隔 → True ----
+        transcript.discard(rid)
+        digest._last_run.pop(rid, None)
+        for i in range(30):
+            transcript.append(rid, "alice", f"活跃{i}", event_id=f"$m{i}")
+        assert digest.should_digest(rid) is True         # 30 ≥ 30 且上次运行=0（间隔够）
+
+        # ---- should_digest：跨天残留 + 600s 后 → True（行数不够也收尾昨天）----
+        transcript.discard(rid)
+        transcript.append(rid, "alice", "昨天的尾巴", event_id="$y1", ts=time.time() - 86400)
+        digest._last_run[rid] = time.time() - 100        # 距上次 100s < 600 → 先不收
+        assert digest.should_digest(rid) is False
+        digest._last_run[rid] = time.time() - 700        # 700s ≥ 600 → 收尾昨天
+        assert digest.should_digest(rid) is True
+
+        # ---- digest_room：东八区分桶（UTC 20:00 → +8 次日）+ 落盘 + 水位线 ----
+        transcript.discard(rid)
+        digest.discard(rid)
+        digest._last_run.pop(rid, None)
+        # 用 20:00 UTC 而非 15:00：15:00 UTC +8=23:00 仍同日、跨不过午夜；≥16:00 才真进次日，
+        # 测才有意义。2026-03-10 20:00 UTC → 东八区 2026-03-11 04:00 → 落到 03-11.md
+        cross = dt.datetime(2026, 3, 10, 20, 0, tzinfo=dt.timezone.utc).timestamp()
+        transcript.append(rid, "alice", "半夜聊部署", event_id="$x1", ts=cross)
+        transcript.append(rid, "bot", "好的部署到 pi", event_id="$x2", ts=cross + 60)
+        assert asyncio.run(digest.digest_room(rid)) == 2        # 覆盖 2 行
+        ddir = digest._room_dir(rid)
+        day = open(os.path.join(ddir, "2026-03-11.md")).read()  # +8 次日的日文件
+        assert day.startswith("# 2026-03-11") and "部署" in day
+        idx = open(os.path.join(ddir, "INDEX.md")).read()
+        assert idx.startswith("2026-03-11:") and "部署" in idx and "登录" in idx
+        assert digest._read_wm(rid) == round(cross + 60, 3)     # 水位线推到该批最大 ts
+
+        # ---- 第二次调用：旧行都在水位线下 → 不重复处理 ----
+        assert asyncio.run(digest.digest_room(rid)) == 0
+
+        # ---- 同日期两批 INDEX 主题合并去重 ----
+        transcript.append(rid, "alice", "同天又聊", event_id="$x3", ts=cross + 120)
+        topics["line"] = "INDEX: 登录；测试"                     # 与上批「登录」重叠、新增「测试」
+        assert asyncio.run(digest.digest_room(rid)) == 1
+        line = [l for l in open(os.path.join(ddir, "INDEX.md")).read().splitlines()
+                if l.startswith("2026-03-11:")][0]
+        assert line.count("登录") == 1                           # 去重：登录只一次
+        assert "部署" in line and "测试" in line                 # 合并：老部署 + 新测试都在
+
+        # ---- augment_system_prompt：含目录路径 + 原始日志 + 近 7 天索引行全文 ----
+        rid2 = "!dg2:ex.org"
+        transcript.append(rid2, "alice", "今天聊架构", event_id="$t1")   # 今天 → 落在近 7 天窗口
+        topics["line"] = "INDEX: 架构选型"
+        asyncio.run(digest.digest_room(rid2))
+        sp = digest.augment_system_prompt("BASE", rid2)
+        assert sp.startswith("BASE")
+        assert digest._room_dir(rid2) in sp and transcript.path_for(rid2) in sp
+        assert digest._today() in sp and "架构选型" in sp        # 今天这行索引被注入
+        assert "查询协议" in sp
+
+        # ---- runner.quick 抛异常：不崩、水位线不动、不落盘 ----
+        rid3 = "!dg3:ex.org"
+        transcript.append(rid3, "alice", "会失败的一批", event_id="$f1")
+        async def boom(prompt):
+            raise RuntimeError("quick 挂了")
+        digest.runner.quick = boom
+        assert asyncio.run(digest.digest_room(rid3)) == 0       # 吞异常、返回已完成 0
+        assert digest._read_wm(rid3) == 0.0                     # 水位线没动
+        assert not os.path.exists(os.path.join(digest._room_dir(rid3), "INDEX.md"))
+
+        # ---- 批切分：行数或正文字符量任一到顶就断批（防把整段粘贴日志一次喂爆 quick）----
+        big = [{"ts": i, "body": "x" * 4000} for i in range(31)]
+        old_cap = digest._MAX_BATCH_CHARS
+        digest._MAX_BATCH_CHARS = 10000
+        try:
+            chunks = list(digest._batches(big))
+        finally:
+            digest._MAX_BATCH_CHARS = old_cap
+        assert all(len(c) <= 2 for c in chunks)         # 10000/4000 → 每批最多 2 行
+        assert sum(len(c) for c in chunks) == 31        # 切批不丢行
+
+        # ---- discard 幂等 ----
+        digest.discard(rid)
+        digest.discard(rid)                                     # 再删一次不报错
+        assert not os.path.exists(digest._room_dir(rid))
+
+        # ---- 未开启：augment 原样返回 ----
+        settings.digest_enabled = False
+        assert digest.augment_system_prompt("BASE", rid2) == "BASE"
+    finally:
+        (settings.store_path, settings.transcript_enabled, settings.digest_enabled,
+         settings.digest_min_lines, settings.digest_min_interval,
+         settings.digest_keep_days, settings.digest_tz_hours, settings.transcript_keep_days) = orig
+        digest.runner.quick = orig_quick
+        for r in ("!dg:ex.org", "!dg2:ex.org", "!dg3:ex.org"):
+            digest._last_run.pop(r, None)
+            digest._last_prune.pop(r, None)
+
+
 # ---------- PR 自动合并：可合并+CI通过(或无CI)+无未决改动 → 合并销账；否则不动 ----------
 def test_pr_automerge():
     import tempfile
@@ -3844,6 +3975,7 @@ TESTS = [
     ("排队回执 忙时知会/空闲不发", test_queue_receipt_when_busy),
     ("模型拆分 干活大/轻判断小", test_quick_model_split),
     ("聊天逐字记录 落盘/回溯/删旧/开关", test_transcript_log_and_recall),
+    ("聊天日摘要 触发/东八区分桶/落盘/水位线/合并/注入", test_digest_layer),
     ("PR 自动合并 条件满足才合并", test_pr_automerge),
     ("CI查询失败不放行自动合并", test_automerge_skips_on_ci_unknown),
     ("PR 冲突只告警一次不刷屏", test_conflict_alert_once),

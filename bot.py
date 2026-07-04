@@ -42,6 +42,7 @@ from state import (_context, _sent_events, _last_project_by_room, _group_engaged
 from claude_runner import runner  # noqa: F401
 from projects import projects, parse_repo_url, proj_id
 import transcript
+import digest
 import inflight
 import issue_ledger
 import pr_ledger
@@ -95,6 +96,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     # _format_context 的"间隔"提示才不会因收/发两端时钟偏差算错。
     _context[room.room_id].append((time.time(), sender_name, body, _thread_of(event)))
     transcript.append(room.room_id, sender_name, body, event_id=event.event_id)  # 落盘逐字记录，供回溯
+    if digest.should_digest(room.room_id):   # 攒够量 / 跨天残留就后台把原始日志预压成日摘要+主题索引
+        state._spawn(digest.digest_room(room.room_id))
 
     # 用自己账号跑时：消息照进上下文，但无触发词不当派活（否则会去回你发给别人的话）。
     if is_self and not _has_trigger(event.body or ""):
@@ -334,6 +337,10 @@ async def _cleanup_room(rid: str):
         transcript.discard(rid)   # ④ 删逐字记录 + 回灌标记
     except Exception:
         log.exception("退房清理：删聊天记录失败 %s", rid)
+    try:
+        digest.discard(rid)   # ④' 删该房间的日摘要 + 主题索引目录
+    except Exception:
+        log.exception("退房清理：删日摘要失败 %s", rid)
     try:
         discard_room(rid)   # ⑤ 删该房间的媒体目录
     except Exception:
