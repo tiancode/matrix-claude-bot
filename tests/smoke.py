@@ -525,6 +525,95 @@ def test_group_followup_window():
         bot._group_engaged.clear()
 
 
+# ---------- 8b) 续话窗口：第三人插话作废 + 强/弱信号分级 ----------
+def test_followup_window_third_party_invalidates():
+    set_identity()
+    rid = "!fw3:ex.org"
+    room = FakeRoom(rid, 3)
+    orig_win = settings.group_followup_window
+    settings.group_followup_window = 180
+    bot._group_engaged.clear()
+    bot._context[rid].clear()
+    try:
+        t0 = time.time()
+        bot._group_engaged[(rid, "@alice:ex.org")] = t0        # alice 在 t0 点过名
+
+        # 窗口内只有 alice 自己 + bot 说话 → 续话仍成立（弱信号）
+        bot._context[rid].append((t0 + 1, "claude-bot", "好的，已处理"))
+        bot._context[rid].append((t0 + 2, "Alice", "接着再改一处"))
+        kind, _ = bot._address_kind(room, make_event("接着再改一处", sender="@alice:ex.org"))
+        assert kind == "weak"
+
+        # 窗口内 bob 插了话 → 对话转向别人，续话作废（零成本规则堵最常见误触发）
+        bot._context[rid].append((t0 + 3, "Bob", "对了你们看球了吗"))
+        kind, _ = bot._address_kind(room, make_event("哈哈是啊", sender="@alice:ex.org"))
+        assert kind == ""
+    finally:
+        settings.group_followup_window = orig_win
+        bot._group_engaged.clear()
+        bot._context[rid].clear()
+
+
+def test_address_kind_strong_vs_weak():
+    set_identity()
+    rid = "!ak:ex.org"
+    room = FakeRoom(rid, 3)
+    orig_win = settings.group_followup_window
+    settings.group_followup_window = 180
+    bot._group_engaged.clear()
+    bot._context[rid].clear()
+    bot._sent_events.clear()
+    try:
+        # @我 → strong
+        k, _ = bot._address_kind(room, make_event(
+            "@claude-bot 帮我看看", sender="@alice:ex.org", mentions=["@claudebot:ex.org"]))
+        assert k == "strong"
+        # 回复 bot 的旧消息 → strong
+        bot._sent_events.append("$mybot1")
+        k, _ = bot._address_kind(room, make_event(
+            "再改一下", sender="@alice:ex.org", in_reply_to="$mybot1"))
+        assert k == "strong"
+        # 点过名 + 窗口内无旁人插话 → weak
+        bot._mark_engaged(rid, "@alice:ex.org")
+        k, _ = bot._address_kind(room, make_event("接着改", sender="@alice:ex.org"))
+        assert k == "weak"
+        # 没点名、没续话窗口 → ""
+        bot._group_engaged.clear()
+        k, _ = bot._address_kind(room, make_event("今天天气不错", sender="@bob:ex.org"))
+        assert k == ""
+    finally:
+        settings.group_followup_window = orig_win
+        bot._group_engaged.clear()
+        bot._context[rid].clear()
+        bot._sent_events.clear()
+
+
+# ---------- 8c) 续话语义闸：__NO__ 拦下、__YES__/出错放行 ----------
+def test_followup_semantic_gate():
+    import proactive
+    rid = "!gate:ex.org"
+    bot._context[rid].clear()
+    orig_quick = proactive.runner.quick
+    try:
+        async def q_no(prompt):
+            return "__NO__"
+        proactive.runner.quick = q_no
+        assert asyncio.run(proactive.followup_is_for_me(rid, "Alice", "该睡了")) is False
+
+        async def q_yes(prompt):
+            return "__YES__"
+        proactive.runner.quick = q_yes
+        assert asyncio.run(proactive.followup_is_for_me(rid, "Alice", "那再加个测试")) is True
+
+        async def q_boom(prompt):
+            raise RuntimeError("claude 挂了")
+        proactive.runner.quick = q_boom          # 判断出错 → 放行（宁可多接，不漏真续话）
+        assert asyncio.run(proactive.followup_is_for_me(rid, "Alice", "继续")) is True
+    finally:
+        proactive.runner.quick = orig_quick
+        bot._context[rid].clear()
+
+
 # ---------- 9) /reset 连背景对话一起清空 ----------
 def test_reset_clears_context():
     set_identity()
@@ -3302,6 +3391,9 @@ TESTS = [
     ("退房清尾巴 绑定/路由/任务/记录", test_leave_cleans_up_room),
     ("加密解不开 要密钥+提示+限流", test_undecryptable_notifies_and_rate_limits),
     ("群对话延续窗口", test_group_followup_window),
+    ("续话窗口第三人插话作废+强弱分级", test_followup_window_third_party_invalidates),
+    ("_address_kind 强/弱信号分级", test_address_kind_strong_vs_weak),
+    ("续话语义闸 NO拦下/YES/出错放行", test_followup_semantic_gate),
     ("/reset 清空背景上下文", test_reset_clears_context),
     ("重试仅限会话失效", test_retry_only_on_session_error),
     ("分块代码围栏自洽", test_fence_balance_on_split),

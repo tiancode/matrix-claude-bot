@@ -20,6 +20,29 @@ _PROACTIVE_PASS_COOLDOWN = settings.proactive_pass_cooldown
 
 
 
+async def followup_is_for_me(rid: str, sender_name: str, text: str) -> bool:
+    """续话窗口命中属弱信号：轻量判断这条"没点名"的消息是不是接着刚才的话题继续跟 bot 说，
+    而不是转头跟旁人说 / 自言自语 / 与刚才找 bot 的事无关。只在**明确判定不是对我说**时才拦下
+    （返回 False）；拿不准、判断出错一律放行（True）——宁可偶尔多接一句，也别把真续话漏掉。"""
+    ctx = _format_context(rid)
+    prompt = (
+        f"下面是一个 Matrix 群里最近的对话。你是群里的助手，刚才在和「{sender_name}」对话。\n"
+        f"现在「{sender_name}」又发了一条**没有点名你**的消息：\n"
+        f"\"\"\"\n{text}\n\"\"\"\n"
+        "判断这条是不是接着刚才的话题**继续在跟你（助手）说**：\n"
+        "- 是，或拿不准 → 只回 __YES__\n"
+        "- 明显在跟群里别人说话 / 自言自语 / 与刚才找你的事无关 → 只回 __NO__\n\n"
+        f"最近对话：\n{ctx}"
+    )
+    try:
+        ans = (await runner.quick(prompt)).strip().upper()
+    except Exception:
+        log.exception("续话语义闸判断失败，放行")
+        return True
+    return "__NO__" not in ans
+
+
+
 async def maybe_proactive(room: MatrixRoom, event: RoomMessageText, body: str):
     rid = room.room_id
     now = time.time()

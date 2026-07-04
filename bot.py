@@ -47,8 +47,8 @@ from fmt import (_split, _to_html, _format_context, _human_gap, _safe_name)  # n
 from matrix_io import (send, _is_dm, _LiveReply, _emit_files, _within_allowed,  # noqa: F401
                        _thread_of, _thread_root_of, _thread_rel, _reply_rel, _ack,
                        _resolve_reply_author, _edit_message)
-from addressing import (_is_addressed, _has_trigger, _strip_trigger, _strip_reply_fallback,  # noqa: F401
-                        _strip_self_mentions, _mark_engaged, _looks_actionable)
+from addressing import (_is_addressed, _address_kind, _has_trigger, _strip_trigger,  # noqa: F401
+                        _strip_reply_fallback, _strip_self_mentions, _mark_engaged, _looks_actionable)
 from dispatch import _dispatch, _triage, TRIAGE_GENERAL  # noqa: F401
 from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, do_bind,  # noqa: F401
                    _backfill_cmd, _auto_backfill, _run_on_project, _extract_pr,
@@ -57,7 +57,7 @@ from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, 
 from pr_followup import _followup_one, _pr_followup_loop  # noqa: F401
 from heartbeat import _heartbeat_one, _heartbeat_loop  # noqa: F401
 from issue_intake import _intake_one, _issue_execute, _issue_intake_loop  # noqa: F401
-from proactive import maybe_proactive, _PROACTIVE_PASS_COOLDOWN  # noqa: F401
+from proactive import maybe_proactive, followup_is_for_me, _PROACTIVE_PASS_COOLDOWN  # noqa: F401
 from media import (on_media, _process_media, _prune_dir,  # noqa: F401
                    discard_room, sweep_stale_downloads)
 
@@ -121,7 +121,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
 
     # 重启后 _sent_events 已清空：被回复的若是 bot 的旧消息，先向服务器补认，寻址才认得出
     await _resolve_reply_author(room.room_id, content)
-    addressed, cleaned = _is_addressed(room, event)
+    kind, cleaned = _address_kind(room, event)   # "strong"=明确点名 / "weak"=仅续话窗口命中 / ""=没点名
+    addressed = bool(kind)
 
     # 绑定仓库：仅群聊；/bind 显式，或未绑定群里"仅一条仓库 URL"。DM 交给 handle_task 自动分诊。
     repo = parse_repo_url(body)
@@ -145,14 +146,30 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
                               f"这个群已绑定 {bound['owner']}/{bound['repo']}；要换绑请用 /bind <仓库URL>。"))
             return
 
-    if addressed:
-        if not is_self and not _is_dm(room):   # 群里被点名/续话 → 开/续"对话延续窗口"，下条免重复 @
+    if kind == "strong":
+        if not is_self and not _is_dm(room):   # 群里被点名 → 开/续"对话延续窗口"，下条免重复 @
             _mark_engaged(room.room_id, event.sender)
         state._spawn(handle_task(room, event, cleaned))
+    elif kind == "weak":   # 仅续话窗口命中的弱信号：先过语义闸确认是在跟我说，再决定接不接
+        state._spawn(_maybe_followup_task(room, event, cleaned, body, is_self))
     elif body.strip() in RESET_CMDS:   # 群里不点名也认重置（重置是元命令，不必 @ 机器人）
         state._spawn(handle_task(room, event, body.strip()))
     elif settings.proactive:
         state._spawn(maybe_proactive(room, event, body))
+
+
+async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
+                               cleaned: str, body: str, is_self: bool):
+    """续话窗口命中（弱信号）时的接活闸：语义闸确认"确实在接着跟我说"才派活并续窗口；
+    判为"不是对我说"则安静跳过——不接、也不主动插话，避免"没话找话"。"""
+    if settings.followup_semantic_gate:
+        sender_name = room.user_name(event.sender) or event.sender
+        if not await followup_is_for_me(room.room_id, sender_name, body):
+            log.info("[%s] 续话窗口命中但语义判断非对我说，跳过", room.room_id)
+            return
+    if not is_self:   # 弱信号只出现在群里（DM 恒 strong），确认接活后再续窗口
+        _mark_engaged(room.room_id, event.sender)
+    await handle_task(room, event, cleaned)
 
 
 async def on_invite(room: MatrixRoom, event: InviteMemberEvent):
