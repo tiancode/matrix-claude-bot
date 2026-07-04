@@ -9,7 +9,8 @@ from nio import MatrixRoom, RoomMessageText
 from config import settings
 import state
 from state import _context, _sess_key, _last_project_by_room, _save_last_projects, _project_last_active
-from matrix_io import send, _typing, _is_dm, _LiveReply, _emit_files, _thread_root_of, _FILE_SEND_HINT
+from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
+                       _thread_of, _thread_root_of, _ack, _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
 from addressing import _strip_reply_fallback
 from dispatch import _dispatch
@@ -51,7 +52,7 @@ _HELP_TEXT = (
     "我是接到 Matrix 的 Claude Code 工程师：群里 @我 或私聊我就能派活——写代码、查问题、做方案，"
     "改代码会自动开 PR 并跟到合并。群里没点名时，遇到求助或明显错误我也可能主动插一句。\n\n"
     "**怎么用**\n"
-    "• 群里先绑仓库：发 Gitea 仓库地址，或 `/bind <仓库URL>`\n"
+    "• 群里 @我 就能聊天/问问题；要派仓库的活先绑定：发 Gitea 仓库地址，或 `/bind <仓库URL>`\n"
     "• 然后 @我 派活；刚 @过我的几分钟内不必每句都 @（对话延续窗口）\n"
     "• 私聊直接说，我自动判断是哪个项目\n"
     "• 也可以不进 Matrix：在 Gitea 上把 issue **指派给我**，我会接单、开 PR（合并自动关单）并回报进展\n"
@@ -71,7 +72,8 @@ _HELP_TEXT = (
 
 _WELCOME = (
     "👋 我是 Claude Code 工程师 bot。@我（群里）或直接私聊就能派活：写代码、查问题、做方案，"
-    "改代码会自动开 PR。群里先发个 Gitea 仓库地址或 `/bind <URL>` 绑定本群。发 `帮助` 看完整用法"
+    "改代码会自动开 PR；闲聊、问一般问题也行。要派仓库的活，群里先发个 Gitea 仓库地址或 "
+    "`/bind <URL>` 绑定本群。发 `帮助` 看完整用法"
     "（`/help` 会被 Matrix 客户端自己吞掉，用中文词 `帮助`）。"
 )
 
@@ -93,6 +95,8 @@ def _employee_prompt(info: dict) -> str:
         f"-d '{{\"head\":\"<你的分支>\",\"base\":\"{base}\",\"title\":\"<标题>\",\"body\":\"<说明>\"}}'\n"
         f"   从返回 JSON 取 html_url，并在最终回复里**附上 PR 链接**。\n"
         f"4) 纯问答/查代码/无需改动：直接简洁中文回答，不用建分支或开 PR。\n"
+        f"5) 群里不全是派活——也有闲聊、与仓库无关的问题、对你上一条回复的追问：像同事一样自然接话，"
+        f"别硬把话题扯回仓库，更别为此动代码。\n"
         f"用简洁中文回复，内容会直接发到群里。"
         + (_FILE_SEND_HINT if settings.send_files_back else "")
     )
@@ -147,11 +151,14 @@ async def _auto_backfill(room_id: str):
 
 
 async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, rec: dict,
-                          skip_body: str | None = None, thread_root: str | None = None):
+                          skip_body: str | None = None, thread_root: str | None = None,
+                          reply_to=None):
     """在某项目上跑任务并回发。"正在输入"由调用方 handle_task 的 _typing 统一负责。
     skip_body：当前这条消息在背景上下文里的原文，用于从背景里剔除它免得重复喂。
     媒体走的是 "[文件]…" 那行，和 event.body（文件名/caption）不一样，必须由调用方显式传。
-    thread_root：群里把答复挂进该线程；流式时占位消息也挂这里。"""
+    thread_root：用户在线程里说话（或旧式 REPLY_IN_THREAD=1）时把答复挂进该线程。
+    reply_to：零参可调用，发送/占位那一刻求值——群里已插进别的消息就返回触发消息 event_id
+    （改用引用回复指明在回哪条），房间安静就返回 None（顶层直答）。"""
     rid = room.room_id
     sender = room.user_name(event.sender) or event.sender
     cur_body = (skip_body if skip_body is not None
@@ -168,6 +175,10 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     log.info("[%s] 任务@%s: %s", rid, rec["id"], text[:80])
     if rec.get("general"):   # 通用助手：每房间独立 scratch 子目录（互不串文件）、无 employee/Gitea 指引、不碰 git
         sp = settings.claude_system_prompt + (_FILE_SEND_HINT if settings.send_files_back else "")
+        if rec.get("unbound_room"):   # 未绑定仓库的群：闲聊/答疑照常，但派仓库活时要引导绑定
+            sp += ("\n这个群还没绑定仓库：闲聊、答疑照常自然回应；但若对方是想让你对某个仓库/项目干活"
+                   "（改它的代码、查它的问题），引导他发一下 Gitea 仓库地址或 `/bind <仓库URL>`，"
+                   "绑定后你才能拿到代码干活。")
         cwd = os.path.join(settings.claude_workdir, _safe_name(rid, "dm"))
         lock_key, prepare = None, None   # lock_key=None → 用会话 key（按房间），各房间可并行
     else:
@@ -182,6 +193,12 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     # 在途登记：进执行/排队即记一笔，重启对账据此收尾占位/催重发（见 inflight）。摘除放 finally，
     # 覆盖成功/取消/报错所有退出路径。占位 eid 在占位创建后（首个 delta）再补录。
     inflight_key = inflight.record(rid, text, inflight.KIND_CHAT)
+
+    def _reply_eid():   # 发送那一刻求值；未启用引用回复（DM/线程内）时恒 None
+        try:
+            return reply_to() if callable(reply_to) else reply_to
+        except Exception:
+            return None
     try:
         # 排队回执：串行锁被占（同项目已有任务在跑）时立即知会，别让用户对着 typing 猜消息丢没丢。
         # 尽力而为——与对方拿锁存在竞态，漏发只影响提示不影响排队本身。
@@ -189,9 +206,9 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             note = "⏳ 上一个任务还在跑，这条已排队，轮到会自动开始"
             note += ("；等不及可发 /cancel 停掉当前任务。" if runner.running(rid)
                      else "（正忙的是其它房间或自驱/工单任务，本房间 /cancel 停不了它）。")
-            await send(rid, note, thread_root=thread_root)
+            await send(rid, note, thread_root=thread_root, reply_to=_reply_eid())
         if settings.stream_replies:                      # 流式：边生成边编辑同一条占位消息
-            live = _LiveReply(rid, thread_root=thread_root)
+            live = _LiveReply(rid, thread_root=thread_root, reply_to=reply_to)
             _attached = {"v": False}
 
             async def _relay(t, tool):                   # 占位一建出来就把 eid 补进登记簿
@@ -222,10 +239,10 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                 answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
                                           lock_key=lock_key, prepare=prepare, cancel_key=rid)
             except ClaudeCancelled:
-                await send(rid, "🛑 已停止。", thread_root=thread_root)
+                await send(rid, "🛑 已停止。", thread_root=thread_root, reply_to=_reply_eid())
                 return
             answer = await _emit_files(room, answer, cwd, thread_root)
-            await send(rid, answer, track=True, thread_root=thread_root)
+            await send(rid, answer, track=True, thread_root=thread_root, reply_to=_reply_eid())
         log.info("[%s] 完成 %d 字", rid, len(answer))
         if not rec.get("general"):   # 回复里若开了本项目的 PR，记进台账，由跟进循环盯到合并
             pr = _extract_pr(answer, rec)
@@ -247,43 +264,62 @@ def _extract_pr(answer: str, rec: dict) -> tuple[int, str] | None:
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                       skip_body: str | None = None):
     rid = room.room_id
-    # 群里把答复挂进"提问那条"的线程；私聊不挂线程（1:1 无需分流，挂了反而碍眼）。
-    thr = _thread_root_of(event) if (settings.reply_in_thread and not _is_dm(room)) else None
+    # 线程策略：跟着用户走——他在线程里说话就把答复挂进那个线程；顶层消息不再强开新线程
+    # （bot 的记忆按房间拍平，视觉上也别 fork 成一堆小线程）。REPLY_IN_THREAD=1 保留旧式
+    # "每条顶层消息开线程"，供偏爱线程的群显式选回。
+    thr = _thread_of(event)
+    if thr is None and settings.reply_in_thread and not _is_dm(room):
+        thr = _thread_root_of(event)
+    # 引用回复决策器：发送/占位那一刻若群里已插进别的消息（长任务期间常有），改用引用回复
+    # 指明在回哪条；房间安静就顶层直答。按对象身份比对上下文尾巴，同文本消息也不误判。
+    reply_to = None
+    if thr is None and not _is_dm(room):
+        dq = _context[rid]
+        tail_at_start = dq[-1] if dq else None
+        trigger_eid = getattr(event, "event_id", None)
+
+        def reply_to():
+            return trigger_eid if (dq and dq[-1] is not tail_at_start) else None
     try:
         if not text.strip():
             return
-        if text.strip() in RESET_CMDS:
-            if not _is_dm(room):
-                rec = projects.get_room(rid)
-            else:  # 私聊没有房间绑定，按这个 DM 最近一次路由到的项目来重置
-                pid = _last_project_by_room.get(rid)
-                rec = projects.get_project(pid) if pid else None
-            if rec:
-                runner.reset(_sess_key(rec, rid))   # 只重置本房间的会话，不动别处共用同一 repo 的会话
-                _context[rid].clear()   # 连背景一起清，别让旧对话漏进新会话
-                await send(rid, "已开启新对话 ✅", thread_root=thr)
-            else:
-                await send(rid, "还没有可重置的会话；先发个仓库地址或派个活吧。", thread_root=thr)
-            return
-
-        # 分诊/clone + 跑任务整段都开着"正在输入"，避免 DM 首次路由时房间静默
-        async with _typing(rid):
-            rec = await _dispatch(room, event, text, skip_body=skip_body)
-            if rec is None:
+        # 回执：接手就给触发消息打 👀，处理完（含报错/取消）撤掉——用户不用盯 typing 猜有没有人接
+        async with _ack(rid, getattr(event, "event_id", None)):
+            if text.strip() in RESET_CMDS:
+                if not _is_dm(room):
+                    rec = projects.get_room(rid)
+                else:  # 私聊没有房间绑定，按这个 DM 最近一次路由到的项目来重置
+                    pid = _last_project_by_room.get(rid)
+                    rec = projects.get_project(pid) if pid else None
+                if rec:
+                    runner.reset(_sess_key(rec, rid))   # 只重置本房间的会话，不动别处共用同一 repo 的会话
+                    _context[rid].clear()   # 连背景一起清，别让旧对话漏进新会话
+                    await send(rid, "已开启新对话 ✅", thread_root=thr)
+                else:
+                    await send(rid, "还没有可重置的会话；先发个仓库地址或派个活吧。", thread_root=thr)
                 return
-            if not rec.get("general"):   # 通用助手不是项目，别记成"上次项目"
-                _last_project_by_room[rid] = rec["id"]
-                _save_last_projects()   # 落盘：重启后 DM 的 /reset 与多轮延续仍能定位项目
-            await _run_on_project(room, event, text, rec, skip_body=skip_body, thread_root=thr)
+
+            # 分诊/clone + 跑任务整段都开着"正在输入"，避免 DM 首次路由时房间静默
+            async with _typing(rid):
+                rec = await _dispatch(room, event, text, skip_body=skip_body)
+                if rec is None:
+                    return
+                if not rec.get("general"):   # 通用助手不是项目，别记成"上次项目"
+                    _last_project_by_room[rid] = rec["id"]
+                    _save_last_projects()   # 落盘：重启后 DM 的 /reset 与多轮延续仍能定位项目
+                await _run_on_project(room, event, text, rec, skip_body=skip_body,
+                                      thread_root=thr, reply_to=reply_to)
     except ClaudeCancelled:
         try:
-            await send(rid, "🛑 已停止。", thread_root=thr)
+            await send(rid, "🛑 已停止。", thread_root=thr,
+                       reply_to=reply_to() if callable(reply_to) else None)
         except Exception:
             pass
     except Exception as e:
         log.exception("处理失败")
         try:
-            await send(rid, f"出错了：{e}", thread_root=thr)
+            await send(rid, f"出错了：{e}", thread_root=thr,
+                       reply_to=reply_to() if callable(reply_to) else None)
         except Exception:
             pass
 
@@ -314,7 +350,7 @@ async def handle_summarize(room: MatrixRoom, event: RoomMessageText, body: str):
         "- 还有哪些待办 / 未决问题、各自在等谁\n"
         "- 若提到具体任务或 bug，点出来\n"
         "控制在十几行内、分点写，别逐条复述。\n\n对话：\n" + convo)
-    async with _typing(rid):
+    async with _ack(rid, getattr(event, "event_id", None)), _typing(rid):
         try:
             ans = (await runner.quick(prompt)).strip()
         except Exception as e:

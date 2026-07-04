@@ -1,4 +1,4 @@
-"""把一条消息归到哪个项目：群按绑定、DM 按内容分诊（强信号 + 轻量 LLM + 兜底）。"""
+"""把一条消息归到哪个项目：群按绑定（未绑定落通用助手）、DM 按内容分诊（强信号 + 轻量 LLM + 兜底）。"""
 import re
 
 from nio import MatrixRoom, RoomMessageText
@@ -83,9 +83,13 @@ async def _triage(text: str, known: list[dict], context: str = "") -> str | None
 
 
 
-def _general_rec() -> dict:
-    """不绑项目的"通用助手"伪记录：在隔离的 _scratch 目录里答一般性问题。"""
-    return {"id": _GENERAL_ID, "general": True, "path": settings.claude_workdir}
+def _general_rec(unbound_room: bool = False) -> dict:
+    """不绑项目的"通用助手"伪记录：在隔离的 _scratch 目录里答一般性问题。
+    unbound_room=True 表示这是个还没绑定仓库的群：照聊，但系统提示里带上绑定指引（见 tasks）。"""
+    rec = {"id": _GENERAL_ID, "general": True, "path": settings.claude_workdir}
+    if unbound_room:
+        rec["unbound_room"] = True
+    return rec
 
 
 
@@ -97,12 +101,11 @@ async def _dispatch(room: MatrixRoom, event: RoomMessageText, text: str,
     分诊带背景时把它剔掉，别让 _triage 把同一条消息看两遍。"""
     rid = room.room_id
 
-    if not _is_dm(room):  # 群：用房间绑定
-        rec = projects.get_room(rid)
+    if not _is_dm(room):  # 群：绑定了按项目干活；没绑定也别闭门谢客——当通用助手照聊（闲聊/答疑），
+        rec = projects.get_room(rid)   # 系统提示里带绑定指引，真要派仓库的活时引导 /bind
         if rec:
             return await projects.ensure_project(rec)  # 校验/按需修复本地 checkout
-        await send(rid, "这个群还没绑定仓库。发一下 Gitea 仓库地址（或 /bind <仓库URL>），我就开工。")
-        return None
+        return _general_rec(unbound_room=True)
 
     # DM：自动分诊到对应项目。每条路由都要过 ensure_project——本地 checkout 可能被删/没 clone，
     # 不校验 Claude 会在空目录里干活。

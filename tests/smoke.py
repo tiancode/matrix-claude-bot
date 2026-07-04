@@ -2492,14 +2492,19 @@ def _drain_and_run(coro):
 
 
 class _CapClient:
-    """记下所有 room_send 的完整 content（不只 body），供线程/编辑/附件断言。"""
+    """记下所有 room_send 的完整 content（不只 body）与 redact，供线程/编辑/附件/回执断言。"""
     def __init__(self):
         self.sent = []
         self.uploaded = []
+        self.redacted = []
         self.rooms = {}
 
     async def room_typing(self, *a, **k):
         return None
+
+    async def room_redact(self, rid, eid, **k):
+        self.redacted.append(eid)
+        return types.SimpleNamespace(event_id="$rd%d" % len(self.redacted))
 
     async def join(self, rid):
         self.rooms[rid] = types.SimpleNamespace(room_id=rid)   # 模拟 join 后房间进入 client.rooms
@@ -2516,30 +2521,36 @@ class _CapClient:
         return types.SimpleNamespace(content_uri="mxc://ex.org/up%d" % len(self.uploaded)), None
 
 
-# ---------- 新增能力 1) 线程化回复 ----------
+# ---------- 新增能力 1) 线程 / 引用回复 helper ----------
 def test_thread_helpers_and_send():
     set_identity()
-    assert bot._thread_root_of(make_event("hi", event_id="$root1")) == "$root1"     # 不在线程→自身作根
+    assert bot._thread_of(make_event("hi", event_id="$root1")) is None              # 顶层消息不算在线程里
+    assert bot._thread_root_of(make_event("hi", event_id="$root1")) == "$root1"     # 旧式模式：自身作根
     in_thread = types.SimpleNamespace(event_id="$x", source={"content": {
         "m.relates_to": {"rel_type": "m.thread", "event_id": "$realroot"}}})
-    assert bot._thread_root_of(in_thread) == "$realroot"                            # 已在线程→沿用根
+    assert bot._thread_of(in_thread) == "$realroot"                                 # 已在线程→沿用根
+    assert bot._thread_root_of(in_thread) == "$realroot"
     rel = bot._thread_rel("$r", "$prev")
     assert rel["rel_type"] == "m.thread" and rel["event_id"] == "$r"
     assert rel["m.in_reply_to"]["event_id"] == "$prev" and rel["is_falling_back"] is True
     assert bot._thread_rel(None) is None
+    assert bot._reply_rel("$q") == {"m.in_reply_to": {"event_id": "$q"}}            # 引用回复关系
+    assert bot._reply_rel(None) is None
 
     c = _CapClient(); state.client = c
     asyncio.run(bot.send("!r:ex.org", "答复", thread_root="$root"))
     assert c.sent[0]["m.relates_to"]["rel_type"] == "m.thread"                      # 传了 root → 挂线程
     assert c.sent[0]["m.relates_to"]["event_id"] == "$root"
     c.sent.clear()
+    asyncio.run(bot.send("!r:ex.org", "答复", reply_to="$q"))                       # 引用回复：非线程
+    assert c.sent[0]["m.relates_to"] == {"m.in_reply_to": {"event_id": "$q"}}
+    c.sent.clear()
     asyncio.run(bot.send("!r:ex.org", "答复"))
     assert "m.relates_to" not in c.sent[0]                                          # 不传 → 顶层
 
 
-def test_group_task_reply_threaded():
-    set_identity()
-    c = _CapClient(); state.client = c
+def _task_fixtures():
+    """群任务测试共用桩：绑定 rec + ensure + 返回"搞定"的 fake ask。"""
     rec = {"id": "h/o/r", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
     bot.projects.get_room = lambda rid: rec
     async def fake_ensure(info):
@@ -2549,16 +2560,118 @@ def test_group_task_reply_threaded():
                        on_delta=None, cancel_key=None):
         return "搞定"
     bot.runner.ask = fake_ask
+    return rec
+
+
+def test_group_task_reply_threaded():
+    """REPLY_IN_THREAD=1 旧式模式：群任务答复挂进提问那条的线程。"""
+    set_identity()
+    c = _CapClient(); state.client = c
+    _task_fixtures()
     room = FakeRoom("!g2:ex.org", 3)
     ev = make_event("@claude-bot 干活", mentions=["@claudebot:ex.org"], event_id="$Q")
-    orig = settings.stream_replies; settings.stream_replies = False
+    orig = (settings.stream_replies, settings.reply_in_thread)
+    settings.stream_replies = False; settings.reply_in_thread = True
     try:
         asyncio.run(bot.handle_task(room, ev, "干活"))
     finally:
-        settings.stream_replies = orig
+        settings.stream_replies, settings.reply_in_thread = orig
     ans = [m for m in c.sent if m.get("body") == "搞定"]
     assert ans and ans[0]["m.relates_to"]["rel_type"] == "m.thread"
     assert ans[0]["m.relates_to"]["event_id"] == "$Q"                              # 群里挂到提问那条
+
+
+def test_group_flat_reply_and_smart_quote():
+    """默认（REPLY_IN_THREAD=0）：安静群顶层直答不 fork 线程；发送时群里已插进新消息 → 自动改
+    引用回复指向触发消息；用户自己在线程里说话 → 跟进该线程。"""
+    set_identity()
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    room = FakeRoom("!flat:ex.org", 3)
+    rid = room.room_id
+    orig = (settings.stream_replies, settings.reply_in_thread)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    try:
+        # ① 安静群：任务期间没人插话 → 顶层直答，无任何 m.relates_to
+        bot._context[rid].clear()
+        bot._context[rid].append((time.time(), "Alice", "干活A"))   # 触发消息已入上下文（on_message 干的）
+        asyncio.run(bot.handle_task(
+            room, make_event("@claude-bot 干活A", mentions=[state.MY_ID], event_id="$QA"), "干活A"))
+        ans = [m for m in c.sent if m.get("body") == "搞定"]
+        assert ans and "m.relates_to" not in ans[0]
+
+        # ② 任务期间群里插进了别的消息 → 答复改用引用回复指明在回哪条
+        c.sent.clear()
+        async def ask_interrupted(key, prompt, cwd=None, system_prompt=None, lock_key=None,
+                                  prepare=None, on_delta=None, cancel_key=None):
+            bot._context[rid].append((time.time(), "Bob", "插一句别的"))
+            return "搞定"
+        bot.runner.ask = ask_interrupted
+        bot._context[rid].append((time.time(), "Alice", "干活B"))
+        asyncio.run(bot.handle_task(
+            room, make_event("@claude-bot 干活B", mentions=[state.MY_ID], event_id="$QB"), "干活B"))
+        ans = [m for m in c.sent if m.get("body") == "搞定"]
+        assert ans and ans[0]["m.relates_to"] == {"m.in_reply_to": {"event_id": "$QB"}}
+
+        # ③ 用户自己在线程里说话 → 答复跟进该线程（不看 REPLY_IN_THREAD）
+        c.sent.clear()
+        _task_fixtures()
+        in_thread = types.SimpleNamespace(
+            body="@claude-bot 干活C", sender="@alice:ex.org", event_id="$QC",
+            server_timestamp=int(time.time() * 1000),
+            source={"content": {"m.relates_to": {"rel_type": "m.thread", "event_id": "$TR"},
+                                "m.mentions": {"user_ids": [state.MY_ID]}}})
+        asyncio.run(bot.handle_task(room, in_thread, "干活C"))
+        ans = [m for m in c.sent if m.get("body") == "搞定"]
+        assert ans and ans[0]["m.relates_to"]["rel_type"] == "m.thread"
+        assert ans[0]["m.relates_to"]["event_id"] == "$TR"
+    finally:
+        settings.stream_replies, settings.reply_in_thread = orig
+        bot._context[rid].clear()
+
+
+def test_group_unbound_chat_general():
+    """未绑定仓库的群：不再回绝"还没绑定仓库"，落到通用助手照聊；系统提示带绑定指引，会话按房间隔离。"""
+    set_identity()
+    c = _CapClient(); state.client = c
+    bot.projects.get_room = lambda rid: None                       # 未绑定
+    captured = {}
+    async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
+                       on_delta=None, cancel_key=None):
+        captured["key"], captured["sp"] = key, system_prompt
+        return "哈哈，好的"
+    bot.runner.ask = fake_ask
+    room = FakeRoom("!ub:ex.org", 3)
+    ev = make_event("@claude-bot 讲个笑话", mentions=[state.MY_ID], event_id="$ub1")
+    orig = (settings.stream_replies, settings.reply_in_thread)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    try:
+        asyncio.run(bot.handle_task(room, ev, "讲个笑话"))
+    finally:
+        settings.stream_replies, settings.reply_in_thread = orig
+    assert any((m.get("body") or "") == "哈哈，好的" for m in c.sent)               # 真的答了
+    assert not any("还没绑定仓库" in (m.get("body") or "") for m in c.sent)         # 不再一口回绝
+    assert captured["key"].startswith(dispatch._GENERAL_ID)                        # 通用助手会话、按房间隔离
+    assert "还没绑定仓库" in captured["sp"] and "/bind" in captured["sp"]           # 指引进了系统提示
+
+
+def test_task_ack_reaction():
+    """收到任务先给触发消息打 👀 reaction 回执，处理完 redact 撤掉。"""
+    set_identity()
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    room = FakeRoom("!ack:ex.org", 3)
+    ev = make_event("@claude-bot 干活", mentions=[state.MY_ID], event_id="$ACK")
+    orig = (settings.stream_replies, settings.reply_in_thread)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    try:
+        asyncio.run(bot.handle_task(room, ev, "干活"))
+    finally:
+        settings.stream_replies, settings.reply_in_thread = orig
+    reacts = [m for m in c.sent if (m.get("m.relates_to") or {}).get("rel_type") == "m.annotation"]
+    assert reacts and reacts[0]["m.relates_to"]["event_id"] == "$ACK"              # 打在触发消息上
+    assert reacts[0]["m.relates_to"]["key"] == "👀"
+    assert c.redacted == ["$e1"]                                                   # 处理完撤掉（回执是第 1 条发送）
 
 
 # ---------- 新增能力 2) /help + 进房欢迎 ----------
@@ -3064,8 +3177,11 @@ def test_summarize_excludes_command_variants():
 TESTS = [
     ("启动+群任务全链路", test_startup_and_task_flow),
     ("零项目DM落通用助手", test_dm_no_projects_falls_to_general),
-    ("线程化回复 helper+send", test_thread_helpers_and_send),
-    ("群任务答复挂线程", test_group_task_reply_threaded),
+    ("线程/引用回复 helper+send", test_thread_helpers_and_send),
+    ("群任务答复挂线程(旧式)", test_group_task_reply_threaded),
+    ("群答复默认平铺+插话时引用回复", test_group_flat_reply_and_smart_quote),
+    ("未绑定群当通用助手聊", test_group_unbound_chat_general),
+    ("任务回执 👀 打上/撤掉", test_task_ack_reaction),
     ("/help + 进房欢迎", test_help_and_welcome),
     ("/summarize 小结最近对话", test_summarize_command),
     ("/cancel 停当前任务", test_cancel_command),
