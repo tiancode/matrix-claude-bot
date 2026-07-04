@@ -177,6 +177,11 @@ async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
         sender_name = room.user_name(event.sender) or event.sender
         if not await followup_is_for_me(room.room_id, sender_name, body):
             log.info("[%s] 续话窗口命中但语义判断非对我说，跳过", room.room_id)
+            # 语义闸判"这句不是在跟我说"——但它可能是在跟旁人说、话里却有值得纠正的错/求助。
+            # 别直接沉默：软窗口把这条从"没点名 → 直接进主动判断"的老路上截走了，这里补回那一次机会，
+            # 交给主动插话闸（自带冷却+PASS 倾向，不会刷屏）判断该不该插一句。
+            if settings.proactive and not is_self:
+                await maybe_proactive(room, event, body)
             return
     if not is_self:   # 弱信号只出现在群里（DM 恒 strong），确认接活后再续窗口
         _mark_engaged(room.room_id, event.sender)

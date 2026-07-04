@@ -39,27 +39,37 @@ def _third_party_spoke_since(rid: str, ts: float, sender_name: str) -> bool:
 
 
 def _in_followup_window(rid: str, sender: str, sender_name: str, content: dict) -> bool:
-    """群里"对话延续窗口"：sender 在 group_followup_window 秒内点过名/续过话，且这条没 @ 别人、
-    且窗口内没有第三人插话 → 免重复 @ 也当成接着说（弱信号，交由上层再过语义闸后进任务流程）。"""
+    """群里"对话延续窗口"：sender 近期点过名/续过话、且这条没 @ 别人 → 当成可能接着跟 bot 说
+    （弱信号，交由上层再过语义闸后进任务流程）。两级时限，都靠上层语义闸兜底：
+      · 硬窗口（group_followup_window，默认 180s）内：再加"窗口内没第三人插话"这道零成本预筛
+        （有旁人开口 → 对话多半转向别人，直接不认，省一次判断）。
+      · 软窗口（followup_semantic_window，默认 30 min）内、硬窗口外：不再按"有没有旁人""过了几分钟"
+        硬性一刀切——全部放行给语义闸，让它结合最近对话（含中途旁人的话、时间间隔）逐条判断"是不是
+        还在跟我说"。这样"讲个故事"后隔几十分钟又说"再讲一个"也能被接住。软窗口全靠语义闸把关，
+        故仅在 followup_semantic_gate 开着时才放开。"""
     if settings.group_followup_window <= 0:
         return False
     ts = _group_engaged.get((rid, sender), 0.0)
-    if time.time() - ts > settings.group_followup_window:
+    if ts <= 0:
         return False
-    if _addresses_other_user(content):
+    if _addresses_other_user(content):     # @了别人 → 在跟别人说，两级窗口都不认
         return False
-    # 窗口内有旁人开口 → 对话很可能已转向别人，别再把你这句当成对我说（零成本堵最常见的误触发）
-    if _third_party_spoke_since(rid, ts, sender_name):
-        return False
-    return True
+    age = time.time() - ts
+    if age <= settings.group_followup_window:
+        # 硬窗口内有旁人开口 → 对话很可能已转向别人，别再把你这句当成对我说（零成本堵最常见的误触发）
+        return not _third_party_spoke_since(rid, ts, sender_name)
+    # 硬窗口外：只要语义闸开着且没超软窗口，就放给语义闸结合上下文逐条定夺（不再靠死时间/旁人预筛）
+    return settings.followup_semantic_gate and age <= settings.followup_semantic_window
 
 
 
 def _mark_engaged(rid: str, sender: str) -> None:
-    """记下"这个人刚和 bot 聊过"，并顺手清掉过期项防字典无限增长。"""
+    """记下"这个人刚和 bot 聊过"，并顺手清掉过期项防字典无限增长。清理阈值取两级窗口里更长的那个
+    （软窗口），否则记录 180s 就被删、活不到软窗口，跨几十分钟的续话永远走不到语义闸。"""
     now = time.time()
     _group_engaged[(rid, sender)] = now
-    cutoff = now - max(settings.group_followup_window, 1)
+    horizon = max(settings.group_followup_window, settings.followup_semantic_window, 1)
+    cutoff = now - horizon
     for k in [k for k, v in _group_engaged.items() if v < cutoff]:
         del _group_engaged[k]
 
