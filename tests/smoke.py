@@ -117,7 +117,7 @@ def test_startup_and_task_flow():
                 await asyncio.gather(*pending, return_exceptions=True)
 
     async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
-                       on_delta=None, cancel_key=None):
+                       on_delta=None, cancel_key=None, **_kw):
         captured["prompt"], captured["key"], captured["lock_key"] = prompt, key, lock_key
         return "已改好并提了 PR：https://gitea.example.com/team/app/pulls/7"
 
@@ -1266,6 +1266,17 @@ def test_context_thread_scoping():
         assert addressing._third_party_spoke_since(rid, t0, "Alice") is False
         bot._context[rid].append((t0 + 2, "Bob", "主时间线插一句", None))  # 顶层第三人
         assert addressing._third_party_spoke_since(rid, t0, "Alice") is True
+
+        # bot 自己的答复也要带线程标记（_track_reply 走 send/流式定稿两条路都传 thread_root），
+        # 否则线程里的答复被当顶层、串进主时间线背景，且线程范围反而看不到它
+        import matrix_io
+        bot._context[rid].clear()
+        matrix_io._track_reply(rid, "线程里的答复", "$root2")
+        matrix_io._track_reply(rid, "顶层的答复")            # 缺省 → None
+        assert state._ctx_thread(bot._context[rid][0]) == "$root2"
+        assert state._ctx_thread(bot._context[rid][1]) is None
+        assert "线程里的答复" not in bot._format_context(rid)              # 顶层背景不含线程答复
+        assert "线程里的答复" in bot._format_context(rid, thread="$root2")  # 线程范围能看到
     finally:
         settings.context_lines = orig
         bot._context[rid].clear()
@@ -1315,7 +1326,7 @@ def test_run_drops_dispatched_on_resume():
         def running(self, k): return 0
         def session_ts(self, k): return 111.0 if self.live else None   # 首轮无会话，派完才有
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
-                      prepare=None, on_delta=None, cancel_key=None):
+                      prepare=None, on_delta=None, cancel_key=None, **_kw):
             caught.append(prompt)
             self.live = True
             return "ok"
@@ -1339,6 +1350,54 @@ def test_run_drops_dispatched_on_resume():
     assert "路过没派的闲聊" in caught[0]
     assert "改 A" not in caught[1]           # ← 残留去掉了：派过的消息不再从背景重复喂
     assert "路过没派的闲聊" in caught[1]      # 没派过的仍照常带
+
+
+# ---------- 32e) resume 运行时失效回退全新开：清 dispatched 标记，别让被剔的消息永久两头落空 ----------
+def test_dispatched_cleared_on_resume_failure():
+    import types
+    set_identity()
+    rid = "!dispfail:ex.org"
+    room = FakeRoom(rid, 2)
+    bot._context[rid].clear()
+    caught = []
+
+    class R:
+        def __init__(self): self.turn = 0
+        def busy(self, k): return False
+        def running(self, k): return 0
+        def session_ts(self, k): return 111.0 if self.turn > 0 else None
+        async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
+                      prepare=None, on_delta=None, cancel_key=None, on_reset=None, **_kw):
+            caught.append(prompt)
+            self.turn += 1
+            if self.turn == 2 and on_reset:   # 第二轮模拟 --resume 被判失效 → runner 回退全新开、回调 on_reset
+                on_reset()
+            return "ok"
+
+    class FC:
+        async def room_send(self, *a, **k): return types.SimpleNamespace(event_id="$x")
+
+    rec = {"id": "p", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
+    orig = (tasks.runner, state.client)
+    tasks.runner, state.client = R(), FC()
+    try:
+        bot._context[rid].append((time.time(), "Alice", "改 A", None))
+        asyncio.run(bot._run_on_project(room, make_event("改 A", event_id="$e1"), "改 A", rec, skip_body="改 A"))
+        assert state._ctx_dispatched(bot._context[rid][0]) is True     # 改 A 已标 dispatched
+
+        bot._context[rid].append((time.time(), "Alice", "改 B", None))
+        # 第二轮续接：拼背景时 drop_dispatched 会剔「改 A」（单轮降级不可免）；但 ask 里 --resume 失效
+        # → on_reset 触发 → _clear_dispatched 把标记清掉
+        asyncio.run(bot._run_on_project(room, make_event("改 B", event_id="$e2"), "改 B", rec, skip_body="改 B"))
+        assert state._ctx_dispatched(bot._context[rid][0]) is False    # on_reset 已清掉改 A 的标记
+
+        bot._context[rid].append((time.time(), "Alice", "改 C", None))
+        asyncio.run(bot._run_on_project(room, make_event("改 C", event_id="$e3"), "改 C", rec, skip_body="改 C"))
+    finally:
+        (tasks.runner, state.client) = orig
+        bot._context[rid].clear()
+    assert "改 A" not in caught[1]   # 第二轮（on_reset 之前拼的）确实剔了改 A —— 单轮降级
+    assert "改 A" in caught[2]       # ★关键：resume 失败没让改 A 永久丢，第三轮背景把它带回来了
 
 
 # ---------- 33) 发送被限流：退避重试而非直接丢块 ----------
@@ -1393,7 +1452,7 @@ def test_run_on_project_skips_media_line():
         def running(self, k): return 0
         def session_ts(self, k): return None      # 无续接会话 → 背景照常全带（不剔派过的）
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
-                      on_delta=None, cancel_key=None):
+                      on_delta=None, cancel_key=None, **_kw):
             captured["prompt"] = prompt
             return "ok"
 
@@ -1428,7 +1487,7 @@ def test_queue_receipt_when_busy():
         def running(self, k): return self.n_running
         def session_ts(self, k): return None
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
-                      on_delta=None, cancel_key=None):
+                      on_delta=None, cancel_key=None, **_kw):
             return "ok"
 
     class FC:
@@ -2905,7 +2964,7 @@ def _task_fixtures():
         return rec
     bot.projects.ensure_project = fake_ensure
     async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
-                       on_delta=None, cancel_key=None, fork_from=None):
+                       on_delta=None, cancel_key=None, fork_from=None, **_kw):
         return "搞定"
     bot.runner.ask = fake_ask
     return rec
@@ -2951,7 +3010,7 @@ def test_group_flat_reply_and_smart_quote():
         # ② 任务期间群里插进了别的消息 → 答复改用引用回复指明在回哪条
         c.sent.clear()
         async def ask_interrupted(key, prompt, cwd=None, system_prompt=None, lock_key=None,
-                                  prepare=None, on_delta=None, cancel_key=None):
+                                  prepare=None, on_delta=None, cancel_key=None, **_kw):
             bot._context[rid].append((time.time(), "Bob", "插一句别的"))
             return "搞定"
         bot.runner.ask = ask_interrupted
@@ -2985,7 +3044,7 @@ def test_group_unbound_chat_general():
     bot.projects.get_room = lambda rid: None                       # 未绑定
     captured = {}
     async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
-                       on_delta=None, cancel_key=None):
+                       on_delta=None, cancel_key=None, **_kw):
         captured["key"], captured["sp"] = key, system_prompt
         return "哈哈，好的"
     bot.runner.ask = fake_ask
@@ -3076,7 +3135,7 @@ def test_thread_scoped_session_forks():
     captured = []
 
     async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
-                       on_delta=None, cancel_key=None, fork_from=None):
+                       on_delta=None, cancel_key=None, fork_from=None, **_kw):
         captured.append((key, fork_from, prompt))
         return "线程里搞定"
     bot.runner.ask = fake_ask
@@ -3268,7 +3327,7 @@ def test_autonomous_tasks_cancellable_by_room():
 
     class R:
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
-                      prepare=None, on_delta=None, cancel_key=None):
+                      prepare=None, on_delta=None, cancel_key=None, **_kw):
             seen.append(cancel_key); return "干完了，没开 PR"
 
     orig = (heartbeat.runner, pr_followup.runner, state.client)
@@ -3389,7 +3448,7 @@ def test_stream_task_error_finalizes_placeholder():
         def running(self, k): return 0
         def session_ts(self, k): return None
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
-                      prepare=None, on_delta=None, cancel_key=None):
+                      prepare=None, on_delta=None, cancel_key=None, **_kw):
             if on_delta:
                 await on_delta("看了一半代码", "Bash")     # 先造出占位消息（停在"正在干活"）
             raise RuntimeError("claude 退出码 1: boom")     # 再异常退出
@@ -3624,6 +3683,7 @@ TESTS = [
     ("背景缓冲按线程分范围", test_context_thread_scoping),
     ("续接剔掉派过的用户消息", test_context_drop_dispatched),
     ("端到端 续接背景不重复派过的", test_run_drops_dispatched_on_resume),
+    ("resume 失效回退清 dispatched 不丢上下文", test_dispatched_cleared_on_resume_failure),
     ("发送限流退避重试", test_send_retries_on_rate_limit),
     ("会话失效匹配收紧", test_session_error_matching_tightened),
     ("媒体行不在 prompt 重复", test_run_on_project_skips_media_line),

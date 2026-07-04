@@ -8,8 +8,8 @@ from nio import MatrixRoom, RoomMessageText
 
 from config import settings
 import state
-from state import (_context, _sess_key, _mark_dispatched, _last_project_by_room,
-                   _save_last_projects, _project_last_active)
+from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
+                   _last_project_by_room, _save_last_projects, _project_last_active)
 from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
                        _thread_of, _thread_root_of, _ack, _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
@@ -287,7 +287,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             try:
                 answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
                                           lock_key=lock_key, prepare=prepare,
-                                          on_delta=_relay, cancel_key=rid, **fork_kw)
+                                          on_delta=_relay, cancel_key=rid,
+                                          on_reset=lambda: _clear_dispatched(rid), **fork_kw)
             except ClaudeCancelled:
                 await live.finalize("🛑 已停止。", track=False)
                 return
@@ -306,7 +307,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             try:
                 answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
                                           lock_key=lock_key, prepare=prepare, cancel_key=rid,
-                                          **fork_kw)
+                                          on_reset=lambda: _clear_dispatched(rid), **fork_kw)
             except ClaudeCancelled:
                 await send(rid, "🛑 已停止。", thread_root=thread_root, reply_to=_reply_eid())
                 return

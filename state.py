@@ -70,6 +70,18 @@ def _mark_dispatched(rid: str, sender: str, body: str) -> None:
             return
 
 
+def _clear_dispatched(rid: str) -> None:
+    """清掉该房间背景里所有 dispatched 标记（还原成不带标记的四元组）。会话被判失效、就地全新开时
+    调用：那些「本以为已在会话里」的消息其实随着旧会话没了，标记必须作废，否则续接轮会一直把它们
+    从背景剔掉、可它们又不在新会话里 → 永久两头落空。清过后它们照常回到背景（顶多重复喂，不丢）。"""
+    dq = _context.get(rid)
+    if not dq:
+        return
+    for i, it in enumerate(dq):
+        if _ctx_dispatched(it):
+            dq[i] = (it[0], it[1], it[2], _ctx_thread(it))   # 去掉第 5 元 → dispatched 归 False
+
+
 def _spawn(coro):
     t = asyncio.create_task(coro)
     _tasks.add(t)

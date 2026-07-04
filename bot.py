@@ -172,7 +172,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
 async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
                                cleaned: str, body: str, is_self: bool):
     """续话窗口命中（弱信号）时的接活闸：语义闸确认"确实在接着跟我说"才派活并续窗口；
-    判为"不是对我说"则安静跳过——不接、也不主动插话，避免"没话找话"。"""
+    判为"不是对我说"则不接，转交主动插话闸判断该不该纠错/帮忙（软窗口把这条从"没点名→直接
+    进主动判断"的老路截走了，这里补回那次机会），它拿不准会 __PASS__，不会没话找话。"""
     if settings.followup_semantic_gate:
         sender_name = room.user_name(event.sender) or event.sender
         if not await followup_is_for_me(room.room_id, sender_name, body):

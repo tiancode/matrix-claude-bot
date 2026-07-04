@@ -331,7 +331,7 @@ class ClaudeRunner:
     async def ask(self, key: str, prompt: str, cwd: str | None = None,
                   system_prompt: str | None = None, lock_key: str | None = None,
                   prepare=None, on_delta=None, cancel_key: str | None = None,
-                  fork_from: str | None = None) -> str:
+                  fork_from: str | None = None, on_reset=None) -> str:
         """带工具、带会话上下文地干活；cwd=该项目的仓库目录。
 
         key:        会话维度（项目+房间[+线程]），不同房间/私聊用户互不串台。
@@ -343,6 +343,8 @@ class ClaudeRunner:
         fork_from:  key 还没有会话时，从这个父会话 key 分叉（--resume 父 + --fork-session）：
                     新会话继承分叉点之前的全部历史、之后与父互相隔离（线程会话从房间会话分叉用）。
                     公共前缀逐字节相同，缓存 TTL 内还能命中 prompt cache。父会话也不存在就全新开。
+        on_reset:   续接的 sid 被 claude 判失效、就地清掉会话改全新开时回调一次（无参）。调用方据此
+                    作废「本以为在这条会话里、其实已丢」的派生状态（如背景缓冲的 dispatched 标记）。
         """
         lock_key = lock_key or key
         ckey = cancel_key or lock_key
@@ -428,6 +430,13 @@ class ClaudeRunner:
                     # fork 场景失效的是【父】会话（--resume 的是它）：清父，别让房间任务再撞尸体；
                     # 普通 resume 失效清自己。然后全新开一条。
                     self.reset(fork_from if fork else key)
+                    if on_reset is not None:
+                        # 会话没了 → 那条 prompt 是照「续接」裁过的（可能已剔掉派过的消息），如今要全新
+                        # 开：通知调用方作废相关派生状态，别让被剔的消息永久两头落空（背景+新会话都没）。
+                        try:
+                            on_reset()
+                        except Exception:
+                            log.exception("on_reset 回调失败（继续全新开）")
                     epoch = self._epoch.get(key, 0)
                     rc, payload, err, meta = await _once(None)
                     if token.cancelled:

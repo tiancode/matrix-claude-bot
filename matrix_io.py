@@ -155,17 +155,19 @@ async def send(room_id: str, text: str, track: bool = False, thread_root: str | 
                                  _thread_rel(thread_root, prev))
     # 整条都发出去才并入上下文：半截投递不该被当成"已完整说过"喂回后续 prompt
     if any_ok and all_ok and track:
-        _track_reply(room_id, text)
+        _track_reply(room_id, text, thread_root)
 
 
 
-def _track_reply(room_id: str, text: str) -> None:
-    """把一条已发出的完整答复并入上下文 + 历史（流式定稿走这里，不再二次发送）。"""
+def _track_reply(room_id: str, text: str, thread_root: str | None = None) -> None:
+    """把一条已发出的完整答复并入上下文 + 历史（流式定稿走这里，不再二次发送）。
+    thread_root：这条答复发进了哪个线程（None=顶层）——背景按线程分范围，bot 自己的答复也得带上
+    线程标记，否则线程里的答复会被当顶层、串进主时间线背景（且线程范围反而看不到它）。"""
     dq = _context[room_id]
     ts = time.time()
     if dq:
         ts = max(ts, dq[-1][0])
-    dq.append((ts, state.MY_NAME or "bot", text))
+    dq.append((ts, state.MY_NAME or "bot", text, thread_root))
     transcript.append(room_id, state.MY_NAME or "bot", text, ts=ts)
 
 
@@ -290,7 +292,7 @@ class _LiveReply:
                                                 "body": "（部分内容发送失败，上面的回复可能不完整）"},
                                      _thread_rel(self.thread_root, prev))
         if track and all_ok:
-            _track_reply(self.rid, redact(final_text))
+            _track_reply(self.rid, redact(final_text), self.thread_root)
 
 
 
