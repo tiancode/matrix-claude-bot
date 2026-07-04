@@ -8,7 +8,8 @@ from nio import MatrixRoom, RoomMessageText
 
 from config import settings
 import state
-from state import _context, _sess_key, _last_project_by_room, _save_last_projects, _project_last_active
+from state import (_context, _sess_key, _mark_dispatched, _last_project_by_room,
+                   _save_last_projects, _project_last_active)
 from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
                        _thread_of, _thread_root_of, _ack, _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
@@ -219,7 +220,12 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     else:
         cur_body = (skip_body if skip_body is not None
                     else _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {})))
-        ctx = _format_context(rid, skip=(sender, cur_body), drop_sender=state.MY_NAME or None)
+        # 已有可续接的房间会话（--resume 会带上历次派过的消息）→ 背景里就别再喂「以前派过的用户消息」；
+        # 没有会话（首轮/reset/过期）→ 背景是唯一来源，drop_dispatched=False 照常全带。
+        resuming = runner.session_ts(_sess_key(rec, rid)) is not None
+        ctx = _format_context(rid, skip=(sender, cur_body), drop_sender=state.MY_NAME or None,
+                              drop_dispatched=resuming)
+        _mark_dispatched(rid, sender, cur_body)   # 这条这轮要派出去 → 进会话，下轮当背景时剔掉它
     if ctx:
         prompt = (
             "【所在会话最近的对话，仅供背景参考；带时间，可能跨较长时间，自行判断哪些与当前任务相关】\n"

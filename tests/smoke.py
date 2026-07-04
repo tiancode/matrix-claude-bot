@@ -1271,6 +1271,76 @@ def test_context_thread_scoping():
         bot._context[rid].clear()
 
 
+# ---------- 32c) 续接时把「以前派过的用户消息」从背景剔掉（已在 --resume 里，别重复喂）----------
+def test_context_drop_dispatched():
+    import state
+    set_identity()
+    rid = "!disp:ex.org"
+    bot._context[rid].clear()
+    orig = settings.context_lines
+    settings.context_lines = 20
+    try:
+        t = time.time()
+        bot._context[rid].append((t, "Alice", "以前派过的活", None))
+        bot._context[rid].append((t, "Bob", "路过没派的闲聊", None))
+        state._mark_dispatched(rid, "Alice", "以前派过的活")   # 标记「这条派过给 Claude 了」
+        assert state._ctx_dispatched(bot._context[rid][0]) is True    # 就近命中并置真
+        assert state._ctx_dispatched(bot._context[rid][1]) is False
+        assert state._ctx_dispatched((0, "x", "y")) is False          # 短元组容忍 → False
+        assert state._ctx_dispatched((0, "x", "y", None)) is False
+
+        # 续接（drop_dispatched=True）：派过的消失，没派的闲聊仍在
+        resumed = bot._format_context(rid, drop_dispatched=True)
+        assert "以前派过的活" not in resumed and "路过没派的闲聊" in resumed
+        # 全新/首轮（默认 False）：背景是唯一来源，派过的也照常带
+        fresh = bot._format_context(rid, drop_dispatched=False)
+        assert "以前派过的活" in fresh and "路过没派的闲聊" in fresh
+    finally:
+        settings.context_lines = orig
+        bot._context[rid].clear()
+
+
+# ---------- 32d) 端到端：续接轮的 prompt 背景里不再重复「上一轮派过的消息」 ----------
+def test_run_drops_dispatched_on_resume():
+    import types
+    set_identity()
+    rid = "!dispe2e:ex.org"
+    room = FakeRoom(rid, 2)
+    bot._context[rid].clear()
+    caught = []
+
+    class R:
+        def __init__(self): self.live = False
+        def busy(self, k): return False
+        def running(self, k): return 0
+        def session_ts(self, k): return 111.0 if self.live else None   # 首轮无会话，派完才有
+        async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
+                      prepare=None, on_delta=None, cancel_key=None):
+            caught.append(prompt)
+            self.live = True
+            return "ok"
+
+    class FC:
+        async def room_send(self, *a, **k): return types.SimpleNamespace(event_id="$x")
+
+    rec = {"id": "p", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
+    orig = (tasks.runner, state.client)
+    tasks.runner, state.client = R(), FC()
+    try:
+        bot._context[rid].append((time.time(), "Bob", "路过没派的闲聊", None))
+        bot._context[rid].append((time.time(), "Alice", "改 A", None))
+        asyncio.run(bot._run_on_project(room, make_event("改 A", event_id="$e1"), "改 A", rec, skip_body="改 A"))
+        bot._context[rid].append((time.time(), "Alice", "改 B", None))
+        asyncio.run(bot._run_on_project(room, make_event("改 B", event_id="$e2"), "改 B", rec, skip_body="改 B"))
+    finally:
+        (tasks.runner, state.client) = orig
+        bot._context[rid].clear()
+    # 首轮无会话 → 背景照常带上闲聊；次轮续接 → 上一轮派过的「改 A」不再进背景，闲聊仍在
+    assert "路过没派的闲聊" in caught[0]
+    assert "改 A" not in caught[1]           # ← 残留去掉了：派过的消息不再从背景重复喂
+    assert "路过没派的闲聊" in caught[1]      # 没派过的仍照常带
+
+
 # ---------- 33) 发送被限流：退避重试而非直接丢块 ----------
 def test_send_retries_on_rate_limit():
     set_identity()
@@ -1321,6 +1391,7 @@ def test_run_on_project_skips_media_line():
     class R:
         def busy(self, k): return False
         def running(self, k): return 0
+        def session_ts(self, k): return None      # 无续接会话 → 背景照常全带（不剔派过的）
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
                       on_delta=None, cancel_key=None):
             captured["prompt"] = prompt
@@ -1355,6 +1426,7 @@ def test_queue_receipt_when_busy():
         def __init__(self): self.is_busy = False; self.n_running = 0
         def busy(self, k): return self.is_busy
         def running(self, k): return self.n_running
+        def session_ts(self, k): return None
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
                       on_delta=None, cancel_key=None):
             return "ok"
@@ -3315,6 +3387,7 @@ def test_stream_task_error_finalizes_placeholder():
     class R:
         def busy(self, k): return False
         def running(self, k): return 0
+        def session_ts(self, k): return None
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None,
                       prepare=None, on_delta=None, cancel_key=None):
             if on_delta:
@@ -3549,6 +3622,8 @@ TESTS = [
     ("_human_gap 25h 不塌成 1 天", test_human_gap_precision),
     ("CONTEXT_LINES=0 不带背景", test_context_lines_zero_means_none),
     ("背景缓冲按线程分范围", test_context_thread_scoping),
+    ("续接剔掉派过的用户消息", test_context_drop_dispatched),
+    ("端到端 续接背景不重复派过的", test_run_drops_dispatched_on_resume),
     ("发送限流退避重试", test_send_retries_on_rate_limit),
     ("会话失效匹配收紧", test_session_error_matching_tightened),
     ("媒体行不在 prompt 重复", test_run_on_project_skips_media_line),

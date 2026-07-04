@@ -3,7 +3,7 @@ import re
 import time
 
 from config import settings
-from state import _context, _ctx_thread
+from state import _context, _ctx_thread, _ctx_dispatched
 
 
 _HTML_TAGS = ["a", "b", "blockquote", "br", "caption", "code", "del", "details",
@@ -126,7 +126,8 @@ def _safe_name(s: str, fallback: str) -> str:
 
 
 def _format_context(room_id: str, skip: tuple[str, str] | None = None,
-                    drop_sender: str | None = None, thread: str | None = None) -> str:
+                    drop_sender: str | None = None, thread: str | None = None,
+                    drop_dispatched: bool = False) -> str:
     """把最近对话渲染成带时间的文本；跨度大处插"间隔"提示，让 Claude 自行判断旧话题是否相关。
 
     skip=(sender, body)：当前任务会单独给出，这里从背景里剔除它，免得喂两遍。
@@ -135,11 +136,14 @@ def _format_context(room_id: str, skip: tuple[str, str] | None = None,
     thread：只渲染该范围的消息——None=顶层主时间线（不含任何线程里说的话），线程根 event_id=该线程内。
     会话按线程细分，背景也按线程隔离：顶层任务的背景不该串进线程的话，反之亦然。先按范围过滤再取末 n 条，
     免得末 n 条里混着别的范围、真正同范围的反而不够。
+    drop_dispatched：续接会话时传 True——把「以前派过给 Claude 的用户消息」也剔掉（它们已在 --resume
+    里，再喂就重复）。首轮/reset/过期这类会话为空的场景传 False：背景是唯一来源，派过的也得照常带。
     """
     n = settings.context_lines
     if n <= 0:                                              # n<=0 表示不带背景
         return ""
-    items = [it for it in _context[room_id] if _ctx_thread(it) == thread][-n:]   # 先按线程范围滤，再取末 n 条
+    items = [it for it in _context[room_id]                 # 先按线程范围（+续接时剔派过的）滤，再取末 n 条
+             if _ctx_thread(it) == thread and not (drop_dispatched and _ctx_dispatched(it))][-n:]
     if skip and items:
         for i in range(len(items) - 1, -1, -1):   # 从最近往前找到这条任务并删掉
             if items[i][1:3] == skip:             # 只比 (sender, body)，第 4 元线程标记不参与
