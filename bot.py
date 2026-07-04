@@ -54,7 +54,7 @@ from matrix_io import (send, _is_dm, _LiveReply, _emit_files, _within_allowed,  
                        _resolve_reply_author, _edit_message)
 from addressing import (_is_addressed, _address_kind, _has_trigger, _strip_trigger,  # noqa: F401
                         _strip_reply_fallback, _strip_self_mentions, _mark_engaged, _looks_actionable)
-from dispatch import _dispatch, _triage, TRIAGE_GENERAL  # noqa: F401
+from dispatch import _dispatch  # noqa: F401
 from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, do_bind,  # noqa: F401
                    handle_unbind, _backfill_cmd, _auto_backfill, _run_on_project, _extract_pr,
                    RESET_CMDS, HELP_CMDS, SUMMARY_CMDS, CANCEL_CMDS, STATUS_CMDS, UNBIND_CMDS,

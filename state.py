@@ -36,7 +36,7 @@ _context: dict[str, deque] = defaultdict(lambda: deque(maxlen=max(4, settings.co
 _last_proactive: dict[str, float] = defaultdict(float)
 _sent_events: deque = deque(maxlen=4096)        # 自己发出的 event_id：防自激 + 识别"回复了 bot"（重启清空）
 _foreign_events: deque = deque(maxlen=4096)     # 查证过"不是 bot 发的"的 event_id：防重复向服务器拉取
-_last_project_by_room: dict[str, str] = {}      # room_id -> proj_id，供 DM /reset 定位会话
+_last_project_by_room: dict[str, str] = {}      # room_id -> proj_id，房间在弄哪个项目（自驱心跳/Gitea 健康度找汇报口）
 _project_last_active: dict[str, float] = defaultdict(float)   # proj_id -> 上次有人派活的时刻，自驱心跳据此避让
 _group_engaged: dict[tuple[str, str], float] = {}   # (room_id, user) -> 上次点名/续话时刻：群里"对话延续窗口"用
 
