@@ -1468,11 +1468,15 @@ def test_prepare_runs_only_on_fresh_session():
         await r.ask("pk", "hi", prepare=prep)       # 第一轮：本 key 无会话 → 新任务 → 该跑 prepare
         first = n["prep"]
         await r.ask("pk", "again", prepare=prep)    # 第二轮：上轮已存 sid（--resume 续接）→ 不该再 reset
-        return first, n["prep"]
+        second = n["prep"]
+        # 第三轮：fork 出的新线程（新 key、无自身会话，但从 pk 分叉）——续接父对话上下文，不该 reset
+        await r.ask("pk|thread", "fork it", prepare=prep, fork_from="pk")
+        return first, second, n["prep"]
 
-    first, second = asyncio.run(run())
+    first, second, forked = asyncio.run(run())
     assert first == 1        # 新会话跑了一次 prepare
     assert second == 1       # 续接轮没再跑（还是 1，不是 2）——工作树不在对话中途被抽走
+    assert forked == 1       # fork 新线程也没跑（还是 1）——分叉续接父上下文，别把父没提交的活 reset 掉
 
 
 # ---------- 41) 触发词按词边界匹配（claude 不命中 claudette），CJK 词按子串 ----------

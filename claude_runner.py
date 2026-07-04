@@ -401,15 +401,18 @@ class ClaudeRunner:
                     raise ClaudeCancelled()
                 epoch = self._epoch.get(key, 0)
                 sid, expired = self._sid(key)
-                fresh = sid is None            # 本 key 没有可续接的会话 = 这是「新任务」，不是续接轮
                 fork = False
                 if sid is None and fork_from:      # 本 key 还没会话：从父会话分叉（父也没有就全新开）
                     parent_sid, _ = self._sid(fork_from)
                     if parent_sid:
                         sid, fork = parent_sid, True
-                # prepare（把工作树拉回干净 base）只在「新任务」跑一次：续接同一场对话（--resume）时
+                # 「新任务」= 拿不到任何可续接的会话（自己的没有、也没从父会话分叉到）。fork 出的新线程
+                # 是接着父对话往下走（--resume 父 sid），跟续接轮同理：算续接、不算新任务，故这里判 fresh
+                # 必须在上面的 fork 解析【之后】——否则 fork 时 sid 还是 None 会被误判成新任务而 reset。
+                fresh = sid is None
+                # prepare（把工作树拉回干净 base）只在「新任务」跑一次：续接同一场对话（含 fork 分叉）时
                 # 跳过，否则上一轮还没提交的活会被这一轮 reset 冲掉。reset 跟会话生命周期走、不跟每条
-                # 消息走（线程首条算新会话→会 reset；续接轮不会）。
+                # 消息走（全新任务的首条→会 reset；续接轮和 fork 出的新线程都不会）。
                 if prepare is not None and fresh:
                     try:
                         await prepare()
