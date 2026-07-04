@@ -7,7 +7,7 @@ from nio import MatrixRoom, RoomMessageText
 
 from config import settings
 from state import _last_proactive
-from matrix_io import send, _is_dm, _thread_root_of
+from matrix_io import send, _is_dm, _thread_of, _thread_root_of
 from fmt import _format_context
 from addressing import _looks_actionable
 from projects import projects
@@ -53,9 +53,13 @@ async def maybe_proactive(room: MatrixRoom, event: RoomMessageText, body: str):
         else:
             ans = (await runner.quick(prompt)).strip()
         if ans and "__PASS__" not in ans:
-            # 主动插话也挂进"被它纠正/回应"的那条消息的线程，群里不打断别的话题。
-            thr = _thread_root_of(event) if settings.reply_in_thread and not _is_dm(room) else None
-            await send(rid, ans, track=True, thread_root=thr)
+            # 主动插话没人点名，必须指明在回哪条：对方在线程里就跟进线程，否则用引用回复
+            # （REPLY_IN_THREAD=1 的旧式群保持挂线程）。
+            thr = _thread_of(event) if not _is_dm(room) else None
+            if thr is None and settings.reply_in_thread and not _is_dm(room):
+                thr = _thread_root_of(event)
+            reply = getattr(event, "event_id", None) if (thr is None and not _is_dm(room)) else None
+            await send(rid, ans, track=True, thread_root=thr, reply_to=reply)
             spoke = True
             log.info("[%s] 主动插话 %d 字", rid, len(ans))
     except Exception:
