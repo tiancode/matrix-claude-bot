@@ -22,15 +22,36 @@ def _addresses_other_user(content: dict) -> bool:
 
 
 
-def _in_followup_window(rid: str, sender: str, content: dict) -> bool:
-    """群里"对话延续窗口"：sender 在 group_followup_window 秒内点过名/续过话，且这条没 @ 别人 →
-    免重复 @ 也当成接着说，直接进任务流程（不是只读的主动插话判断）。"""
+def _third_party_spoke_since(rid: str, ts: float, sender_name: str) -> bool:
+    """窗口起点 ts 之后，群里有没有"第三人"（非本人、非 bot）发过言。有则说明对话已转向别人，
+    "还在跟我续话"这个假设不再成立，作废窗口。数据取自内存背景缓冲 _context（存的是显示名）；
+    缓冲为空时（如单测直连 _is_addressed）判无第三人，保持原纯时间窗行为。"""
+    bot_name = state.MY_NAME or "bot"   # 与 _track_reply 落上下文时用的名字一致，别把 bot 自己的答复当第三人
+    for item in list(state._context.get(rid, ())):
+        t, name = item[0], item[1]
+        if t <= ts:
+            continue
+        if name == sender_name or name == bot_name:
+            continue
+        return True
+    return False
+
+
+
+def _in_followup_window(rid: str, sender: str, sender_name: str, content: dict) -> bool:
+    """群里"对话延续窗口"：sender 在 group_followup_window 秒内点过名/续过话，且这条没 @ 别人、
+    且窗口内没有第三人插话 → 免重复 @ 也当成接着说（弱信号，交由上层再过语义闸后进任务流程）。"""
     if settings.group_followup_window <= 0:
         return False
     ts = _group_engaged.get((rid, sender), 0.0)
     if time.time() - ts > settings.group_followup_window:
         return False
-    return not _addresses_other_user(content)
+    if _addresses_other_user(content):
+        return False
+    # 窗口内有旁人开口 → 对话很可能已转向别人，别再把你这句当成对我说（零成本堵最常见的误触发）
+    if _third_party_spoke_since(rid, ts, sender_name):
+        return False
+    return True
 
 
 
@@ -94,8 +115,12 @@ def _strip_self_mentions(text: str) -> str:
 
 
 
-def _is_addressed(room: MatrixRoom, event: RoomMessageText) -> tuple[bool, str]:
-    """返回 (是否点名机器人, 去掉@/触发词/引用块后的正文)。
+def _address_kind(room: MatrixRoom, event: RoomMessageText) -> tuple[str, str]:
+    """返回 (点名强度, 去掉@/触发词/引用块后的正文)。强度：
+      "strong" 明确点名（单聊 / 触发词 / @我 / 回复我）——直接派活；
+      "weak"   仅靠"对话延续窗口"命中（没点名、只是刚聊过又接着说）——弱信号，上层应再过一道
+               轻量语义闸确认确实在跟我说，防"没话找话"的误触发；
+      ""       没点名。
 
     群里认真正的点名（m.mentions / 富文本@pill / 显式 @名字）和直接回复 bot 的消息，
     都不把引用块内容算进点名，避免别人引用你的消息时误触发。
@@ -106,7 +131,7 @@ def _is_addressed(room: MatrixRoom, event: RoomMessageText) -> tuple[bool, str]:
 
     # 单聊默认必回
     if settings.reply_in_dm and _is_dm(room):
-        return True, task_text.strip()
+        return "strong", task_text.strip()
 
     # 直接回复 bot 之前发的消息 → 视为点名
     in_reply_to = (content.get("m.relates_to", {})
@@ -115,7 +140,7 @@ def _is_addressed(room: MatrixRoom, event: RoomMessageText) -> tuple[bool, str]:
 
     # 触发词（拉丁词按词边界，免得 claude 命中 claudette 并把词切碎）
     if _has_trigger(task_text):
-        return True, _strip_trigger(task_text).strip()
+        return "strong", _strip_trigger(task_text).strip()
 
     # 真正的点名（剔除富文本 <mx-reply> 引用块，只看正文 @pill）
     mentioned = state.MY_ID in content.get("m.mentions", {}).get("user_ids", [])
@@ -132,14 +157,23 @@ def _is_addressed(room: MatrixRoom, event: RoomMessageText) -> tuple[bool, str]:
                 break
 
     if mentioned or replied_to_bot:
-        return True, _strip_self_mentions(task_text).strip()
+        return "strong", _strip_self_mentions(task_text).strip()
 
     # 对话延续窗口：刚和 bot 聊过的人，短时间内免重复 @ 接着说也当成点名（多轮不必每句点名）。
     # 但若这条是【回复别人的消息】（in_reply_to 非 bot），说明在跟别人说，不算续话。
-    if not in_reply_to and _in_followup_window(room.room_id, event.sender, content):
-        return True, task_text.strip()
+    sender_name = room.user_name(event.sender) or event.sender
+    if not in_reply_to and _in_followup_window(room.room_id, event.sender, sender_name, content):
+        return "weak", task_text.strip()
 
-    return False, task_text.strip()
+    return "", task_text.strip()
+
+
+
+def _is_addressed(room: MatrixRoom, event: RoomMessageText) -> tuple[bool, str]:
+    """是否该应答（strong/weak 都算点名）+ 清洗后的正文。区分强弱由 _address_kind 提供，
+    media / 兼容调用只需布尔结论走这里。"""
+    kind, cleaned = _address_kind(room, event)
+    return bool(kind), cleaned
 
 
 
