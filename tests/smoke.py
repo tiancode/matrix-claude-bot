@@ -81,6 +81,9 @@ def test_startup_and_task_flow():
         def add_event_callback(self, cb, ev_type):
             self._cbs.append((cb, ev_type))
 
+        def add_to_device_callback(self, cb, ev_type):   # 开 E2E 后 main() 会注册 SAS 验证回调
+            self._cbs.append((cb, ev_type))
+
         async def get_displayname(self, uid):
             return types.SimpleNamespace(displayname="claude-bot")
 
@@ -126,6 +129,10 @@ def test_startup_and_task_flow():
     async def fake_ensure(info):   # checkout 视作已在，直接返回（群分派会过 ensure 校验）
         return rec
 
+    # 这些全局补丁必须在 finally 里还原：否则 get_room 一直被钉成返回 rec，
+    # 会污染后续 DM 用例（DM 分派现在也查 get_room）。
+    orig_bot = (bot.AsyncClient, bot._login, bot.projects.get_room,
+                bot.projects.ensure_project, bot.runner.ask)
     bot.AsyncClient = FakeClient
     bot._login = fake_login
     bot.projects.get_room = lambda rid: rec
@@ -145,6 +152,8 @@ def test_startup_and_task_flow():
         settings.pr_followup_enabled = orig_pf
         settings.proactive_heartbeat_enabled = orig_hb
         settings.issue_intake_enabled = orig_ii
+        (bot.AsyncClient, bot._login, bot.projects.get_room,
+         bot.projects.ensure_project, bot.runner.ask) = orig_bot
 
     assert state.MY_ID == "@claudebot:ex.org" and state.MY_NAME == "claude-bot"
     assert captured["key"] == "gitea.example.com/team/app|!g:ex.org"    # 会话按项目+房间（不串台）
@@ -725,7 +734,7 @@ def test_group_dispatch_repairs_checkout():
     bot.projects.get_room = lambda rid: rec
     bot.projects.ensure_project = fake_ensure
     try:
-        out = asyncio.run(bot._dispatch(room, make_event("干活"), "干活"))
+        out = asyncio.run(bot._dispatch(room))
     finally:
         (bot.projects.get_room, bot.projects.ensure_project) = orig
     assert out is rec and called.get("info") is rec    # 绑定群派活前过了 ensure（丢了会重 clone）
@@ -992,65 +1001,6 @@ def test_media_prune():
     assert os.listdir(d) == ["g2"], os.listdir(d)
 
 
-# ---------- 23) DM 分诊路由也要过 ensure_project（否则会在丢失的 checkout 上干活） ----------
-def test_dm_routing_ensures_checkout():
-    set_identity()
-    room = FakeRoom("!dmroute:ex.org", 2)                  # 2 人 → DM
-    app = {"id": "h/o/app", "owner": "o", "repo": "app",
-           "path": "/gone", "base": "main", "host": "https://h"}
-    ensured = []
-
-    async def fake_ensure(info):
-        ensured.append(info)
-        return info
-
-    class R:                                               # 让轻量分诊命中 app
-        async def quick(self, prompt):
-            return "h/o/app"
-
-    orig = (bot.projects.list_projects, bot.projects.ensure_project,
-            bot.projects.get_project, dispatch.runner)
-    bot.projects.list_projects = lambda: [app]
-    bot.projects.ensure_project = fake_ensure
-    bot.projects.get_project = lambda pid: app if pid == "h/o/app" else None
-    dispatch.runner = R()
-    try:
-        out = asyncio.run(bot._dispatch(room, make_event("帮我看看那个东西"), "帮我看看那个东西"))
-    finally:
-        (bot.projects.list_projects, bot.projects.ensure_project,
-         bot.projects.get_project, dispatch.runner) = orig
-    assert out is app
-    assert ensured == [app]              # 分诊路由也过了 ensure（丢了的 checkout 会被重 clone）
-
-
-# ---------- 24) 裸仓库名匹配是兜底：排在 LLM 分诊之后，不抢在前面误路由 ----------
-def test_dm_loose_name_after_triage():
-    set_identity()
-    room = FakeRoom("!dmloose:ex.org", 2)
-    app = {"id": "h/o/app", "owner": "o", "repo": "app",
-           "path": "/x", "base": "main", "host": "https://h"}
-    order = []
-
-    async def fake_ensure(info):
-        order.append("ensure")
-        return info
-
-    async def triage_none(text, known, context=""):
-        order.append("triage")
-        return None
-
-    orig = (bot.projects.list_projects, bot.projects.ensure_project, dispatch._triage)
-    bot.projects.list_projects = lambda: [app]
-    bot.projects.ensure_project = fake_ensure
-    dispatch._triage = triage_none
-    try:
-        out = asyncio.run(bot._dispatch(room, make_event("那个 app 跑不起来了"), "那个 app 跑不起来了"))
-    finally:
-        (bot.projects.list_projects, bot.projects.ensure_project, dispatch._triage) = orig
-    assert out is app                     # 裸仓库名兜底命中
-    assert order == ["triage", "ensure"]  # 先分诊、放弃后才用裸名兜底
-
-
 # ---------- 25) 主动插话判定 PASS 时只占用短冷却，不整段沉默 ----------
 def test_proactive_pass_keeps_short_cooldown():
     set_identity()
@@ -1160,38 +1110,6 @@ def test_fence_language_preserved():
     cont = [c for c in chunks if c.startswith("```")]      # 续块开头即重开的围栏
     assert cont and all(c.startswith("```python") for c in cont), \
         "分块续块重开围栏时丢了语言标记"
-
-
-# ---------- 28) DM 多轮：分诊/裸名都没命中时沿用上次项目，不再每条反问 ----------
-def test_dm_last_project_fallback():
-    set_identity()
-    rid = "!dmstick:ex.org"
-    room = FakeRoom(rid, 2)                       # DM
-    appA = {"id": "h/o/appA", "owner": "o", "repo": "appA",
-            "path": "/x", "base": "main", "host": "https://h"}
-    ensured = []
-
-    async def fake_ensure(info):
-        ensured.append(info)
-        return info
-
-    async def triage_none(text, known, context=""):
-        return None
-
-    orig = (bot.projects.list_projects, bot.projects.ensure_project,
-            bot.projects.get_project, dispatch._triage)
-    bot.projects.list_projects = lambda: [appA]
-    bot.projects.ensure_project = fake_ensure
-    bot.projects.get_project = lambda pid: appA if pid == "h/o/appA" else None
-    dispatch._triage = triage_none
-    bot._last_project_by_room[rid] = "h/o/appA"           # 上一轮已路由到 appA
-    try:                                                  # 延续消息没提任何项目名/链接
-        out = asyncio.run(bot._dispatch(room, make_event("再补个单元测试吧"), "再补个单元测试吧"))
-    finally:
-        (bot.projects.list_projects, bot.projects.ensure_project,
-         bot.projects.get_project, dispatch._triage) = orig
-        bot._last_project_by_room.pop(rid, None)
-    assert out is appA and ensured == [appA]              # 沿用上次项目而不是反问
 
 
 # ---------- 29) 群里"@bot 仓库URL 任务"一条消息：先绑再派，不再答非所问 ----------
@@ -1517,67 +1435,109 @@ def test_trigger_word_boundary():
         settings.trigger_phrase = orig
 
 
-# ---------- 43) DM 一般性问题：分诊判 GENERAL 时当通用助手答，不反问"哪个项目" ----------
-def test_dm_general_question():
+# ---------- 43) 未绑定私聊 → 通用助手，且带"引导绑定"标记（私聊不再按内容自动分诊） ----------
+def test_dm_unbound_is_general_with_bind_hint():
     set_identity()
-    room = FakeRoom("!dmgen:ex.org", 2)                   # DM
-    app = {"id": "h/o/app", "owner": "o", "repo": "app",
-           "path": "/x", "base": "main", "host": "https://h"}
-    asked = []
-
-    async def triage_general(text, known, context=""):
-        return bot.TRIAGE_GENERAL
-
-    class FC:
-        async def room_send(self, r, mt, content, **k):
-            asked.append(content["body"])
-            return types.SimpleNamespace(event_id="$x")
-
-    orig = (bot.projects.list_projects, dispatch._triage, state.client)
-    bot.projects.list_projects = lambda: [app]
-    dispatch._triage = triage_general
-    state.client = FC()
+    room = FakeRoom("!dmgen:ex.org", 2)                   # 未绑定 DM
+    orig = bot.projects.get_room
+    bot.projects.get_room = lambda r: None
     try:
-        out = asyncio.run(bot._dispatch(room, make_event("用 Python 写个快排"), "用 Python 写个快排"))
+        out = asyncio.run(bot._dispatch(room))
     finally:
-        (bot.projects.list_projects, dispatch._triage, state.client) = orig
-    assert out is not None and out.get("general") is True   # 返回通用助手 rec
-    assert out["path"] == settings.claude_workdir            # 在隔离 scratch 目录答
-    assert not any("哪个项目" in m for m in asked)           # 没有反问
+        bot.projects.get_room = orig
+    assert out.get("general") is True                     # 当通用助手答
+    assert out.get("unbound_room") is True                # 系统提示会引导 /bind（私聊和群一个待遇）
+    assert out["path"] == settings.claude_workdir          # 在隔离 scratch 目录答
 
 
-# ---------- 43b) DM 发 /bind：给引导，不把 "/bind http://…" 当任务喂给 Claude ----------
-def test_dm_bind_gets_guidance():
+# ---------- 43b) DM 发 /bind <URL>：真绑定（私聊也能绑）；/bind 不带地址：给用法引导 ----------
+def test_dm_bind_binds_and_needs_url():
     set_identity()
     state._synced = True
     rid = "!dmbind:ex.org"
     room = FakeRoom(rid, 2)                     # DM
     bot._context[rid].clear()
-    sent, task_calls, pend = [], [], []
+    sent, bound, pend = [], [], []
+    orig_host = settings.gitea_host
 
     class FC:
         async def room_send(self, r, mt, content, **k):
             sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
 
-    async def fake_task(*a, **k):
-        task_calls.append(a)
-
-    orig = (state.client, state._spawn, bot.handle_task)
+    orig = (state.client, state._spawn, bot.do_bind, bot.projects.get_room)
+    settings.gitea_host = "https://gitea.example.com"
     state.client = FC()
     state._spawn = lambda coro: pend.append(coro)
-    bot.handle_task = fake_task
+    bot.do_bind = lambda room, repo, ev, task: bound.append(repo)   # 同步桩：调用即记账
+    bot.projects.get_room = lambda rid: None
     try:
-        async def go():
-            await bot.on_message(room, make_event(
-                "/bind https://gitea.example.com/o/r", event_id="$dmb"))
+        async def go(body, eid):
+            del pend[:]; del sent[:]
+            await bot.on_message(room, make_event(body, event_id=eid))
             for c in pend:
-                await c
-        asyncio.run(go())
+                if hasattr(c, "__await__"):
+                    await c
+                elif hasattr(c, "close"):
+                    c.close()
+        asyncio.run(go("/bind https://gitea.example.com/o/r", "$dmb1"))
+        assert bound and bound[-1]["repo"] == "r"          # DM /bind 真的绑定了
+        assert not any("私聊不用绑定" in m for m in sent)   # 不再是"私聊不用绑定"
+
+        del bound[:]
+        asyncio.run(go("/bind", "$dmb2"))
+        assert bound == []                                  # 没带仓库地址 → 不绑
+        assert any("仓库地址" in m for m in sent)           # 给出用法引导
     finally:
-        (state.client, state._spawn, bot.handle_task) = orig
+        (state.client, state._spawn, bot.do_bind, bot.projects.get_room) = orig
+        settings.gitea_host = orig_host
         bot._context[rid].clear()
-    assert any("私聊不用绑定" in m for m in sent)   # 得到引导
-    assert task_calls == []                          # 没被当任务派给 Claude
+
+
+# ---------- 43c) 私聊绑定后：直接落到绑定项目（过 ensure）；/unbind 解绑回到未绑定闲聊 ----------
+def test_dm_binding_routes_and_unbinds():
+    set_identity()
+    rid = "!dmbound:ex.org"
+    room = FakeRoom(rid, 2)                     # DM
+    app = {"id": "h/o/app", "owner": "o", "repo": "app",
+           "path": "/x", "base": "main", "host": "https://h"}
+    ensured = []
+
+    async def fake_ensure(info):
+        ensured.append(info)
+        return info
+
+    orig = (bot.projects.get_room, bot.projects.ensure_project)
+    bot.projects.get_room = lambda r: app if r == rid else None
+    bot.projects.ensure_project = fake_ensure
+    try:
+        # 绑定了 → 直接落到 app（过 ensure 校验/修复 checkout），私聊不再按内容分诊
+        out = asyncio.run(bot._dispatch(room))
+        assert out is app and ensured == [app]
+    finally:
+        (bot.projects.get_room, bot.projects.ensure_project) = orig
+
+    # /unbind：解绑并给回执
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    unbound = []
+
+    async def fake_unbind(r):
+        unbound.append(r); return True
+
+    orig2 = (state.client, bot.projects.get_room, bot.projects.unbind)
+    state.client = FC()
+    bot.projects.get_room = lambda r: app if r == rid else None
+    bot.projects.unbind = fake_unbind
+    try:
+        asyncio.run(bot.handle_unbind(room))
+    finally:
+        (state.client, bot.projects.get_room, bot.projects.unbind) = orig2
+    assert unbound == [rid]                               # 真的解绑了这条私聊
+    assert any("解绑" in m for m in sent)                 # 有回执
 
 
 # ---------- 42) 会话 session_id 落盘：重启（新 runner）后仍能恢复，多轮不断 ----------
@@ -2949,28 +2909,6 @@ def test_live_reply_streams_and_finalizes():
     assert edits and edits[-1]["m.new_content"]["body"] == "最终答复"             # 编辑成最终答复
 
 
-def test_dm_no_projects_falls_to_general():
-    """还没有任何已知项目时，DM 的一般性问题也该落到通用助手答，而不是反问"发个仓库地址"。"""
-    set_identity()
-    room = FakeRoom("!dmnone:ex.org", 2)                   # 2 人 → DM
-    sent = []
-
-    async def cap_send(rid, text, *a, **k):
-        sent.append(text)
-
-    orig = (bot.projects.list_projects, dispatch.send)
-    bot.projects.list_projects = lambda: []                # 零项目
-    dispatch.send = cap_send
-    try:
-        out = asyncio.run(bot._dispatch(room, make_event("怎么用 python 写快速排序"),
-                                        "怎么用 python 写快速排序"))
-    finally:
-        (bot.projects.list_projects, dispatch.send) = orig
-    assert out and out.get("general") is True              # 当通用助手答
-    assert out["id"] == dispatch._GENERAL_ID
-    assert not sent                                        # 不再反问"发个 Gitea 仓库地址"
-
-
 # ---------- /status：项目 / 任务 / 在跟 PR / 主动性一屏可见 ----------
 def test_status_command():
     import tempfile
@@ -3303,35 +3241,6 @@ def test_followup_ignores_own_reviews():
         _reset_ledger()
 
 
-# ---------- DM 分诊：当前这条不重复出现在分诊背景里 ----------
-def test_dispatch_triage_skips_current():
-    set_identity()
-    room = FakeRoom("!dm2:ex.org", 2)
-    rid = room.room_id
-    bot._context[rid].clear()
-    known = [{"id": "h/o/app", "owner": "o", "repo": "app", "host": "http://h", "path": "/x", "base": "main"},
-             {"id": "h/o/web", "owner": "o", "repo": "web", "host": "http://h", "path": "/y", "base": "main"}]
-    captured = {}
-
-    async def fake_triage(text, kn, context=""):
-        captured["ctx"] = context
-        return dispatch.TRIAGE_GENERAL
-
-    orig = (dispatch._triage, bot.projects.list_projects)
-    dispatch._triage = fake_triage
-    bot.projects.list_projects = lambda: known
-    try:
-        body = "这个流程整体该怎么设计比较好"
-        bot._context[rid].append((time.time(), "Alice", "早些的消息"))
-        bot._context[rid].append((time.time(), "Alice", body))    # on_message 已把当前消息垫进背景
-        rec = asyncio.run(bot._dispatch(room, make_event(body), body))
-        assert rec and rec.get("general")
-        assert "早些的消息" in captured["ctx"]                    # 背景还在
-        assert body not in captured["ctx"]                        # 但当前这条被剔掉，不喂两遍
-    finally:
-        dispatch._triage, bot.projects.list_projects = orig
-
-
 # ---------- /summarize、/catchup（含带参数形式）不混进小结素材 ----------
 def test_summarize_excludes_command_variants():
     import tasks
@@ -3366,7 +3275,6 @@ def test_summarize_excludes_command_variants():
 
 TESTS = [
     ("启动+群任务全链路", test_startup_and_task_flow),
-    ("零项目DM落通用助手", test_dm_no_projects_falls_to_general),
     ("线程/引用回复 helper+send", test_thread_helpers_and_send),
     ("群任务答复挂线程(旧式)", test_group_task_reply_threaded),
     ("群答复默认平铺+插话时引用回复", test_group_flat_reply_and_smart_quote),
@@ -3409,13 +3317,10 @@ TESTS = [
     ("媒体失败无caption 明确回错误", test_media_failure_notifies_when_addressed),
     ("媒体文件名消毒", test_media_safe_name),
     ("媒体滚动删旧", test_media_prune),
-    ("DM 分诊路由过 ensure", test_dm_routing_ensures_checkout),
-    ("裸仓库名兜底在分诊之后", test_dm_loose_name_after_triage),
     ("主动 PASS 只占短冷却", test_proactive_pass_keeps_short_cooldown),
     ("主动插话预筛开关", test_proactive_require_hint_toggle),
     ("已绑群裸 URL 给换绑提示", test_group_rebind_hint),
     ("分块续块保留语言标记", test_fence_language_preserved),
-    ("DM 分诊失败沿用上次项目", test_dm_last_project_fallback),
     ("群 URL+任务同条消息先绑再派", test_group_url_with_task_binds),
     ("_is_dm 只认恰好 2 人", test_is_dm_requires_exactly_two),
     ("_human_gap 25h 不塌成 1 天", test_human_gap_precision),
@@ -3430,8 +3335,9 @@ TESTS = [
     ("派活前清回干净 base", test_prepare_worktree_resets),
     ("触发词按词边界匹配", test_trigger_word_boundary),
     ("会话落盘重启可恢复", test_sessions_persisted_across_restart),
-    ("DM 一般性问题当通用助手答", test_dm_general_question),
-    ("DM /bind 给引导不派活", test_dm_bind_gets_guidance),
+    ("未绑定私聊=通用助手+引导绑定", test_dm_unbound_is_general_with_bind_hint),
+    ("DM /bind 真绑定·无地址给引导", test_dm_bind_binds_and_needs_url),
+    ("私聊绑定后直接路由+/unbind 解绑", test_dm_binding_routes_and_unbinds),
     ("项目长期记忆 跨会话留存", test_project_memory),
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),
@@ -3464,7 +3370,6 @@ TESTS = [
     ("取消协程 子进程组被杀", test_run_kills_group_on_cancel),
     ("重启后回复 bot 仍算点名", test_reply_to_bot_after_restart),
     ("PR 跟进忽略自己的评论", test_followup_ignores_own_reviews),
-    ("分诊背景剔除当前消息", test_dispatch_triage_skips_current),
     ("/summarize 剔除命令变体", test_summarize_excludes_command_variants),
 ]
 

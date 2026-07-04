@@ -54,10 +54,10 @@ from matrix_io import (send, _is_dm, _LiveReply, _emit_files, _within_allowed,  
                        _resolve_reply_author, _edit_message)
 from addressing import (_is_addressed, _address_kind, _has_trigger, _strip_trigger,  # noqa: F401
                         _strip_reply_fallback, _strip_self_mentions, _mark_engaged, _looks_actionable)
-from dispatch import _dispatch, _triage, TRIAGE_GENERAL  # noqa: F401
+from dispatch import _dispatch  # noqa: F401
 from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, do_bind,  # noqa: F401
-                   _backfill_cmd, _auto_backfill, _run_on_project, _extract_pr,
-                   RESET_CMDS, HELP_CMDS, SUMMARY_CMDS, CANCEL_CMDS, STATUS_CMDS,
+                   handle_unbind, _backfill_cmd, _auto_backfill, _run_on_project, _extract_pr,
+                   RESET_CMDS, HELP_CMDS, SUMMARY_CMDS, CANCEL_CMDS, STATUS_CMDS, UNBIND_CMDS,
                    _HELP_TEXT, _WELCOME)
 from pr_followup import _followup_one, _pr_followup_loop  # noqa: F401
 from heartbeat import _heartbeat_one, _heartbeat_loop  # noqa: F401
@@ -118,10 +118,13 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     if low.startswith("/status") or stripped in STATUS_CMDS:
         state._spawn(handle_status(room))
         return
-    # 私聊发 /bind 没意义：DM 不绑房间、按内容自动分诊。别把 "/bind http://…" 放进任务分诊
-    # 让 Claude 对着它自由发挥——直接给句引导。
-    if _is_dm(room) and low.startswith("/bind"):
-        state._spawn(send(room.room_id, "私聊不用绑定，我按内容自动分诊；直接说要干什么就行。"))
+    if low in UNBIND_CMDS:                 # 解绑（群 / 私聊通用）
+        state._spawn(handle_unbind(room))
+        return
+    # /bind 但没带可解析的仓库地址：无论群 / 私聊都提示怎么用（私聊过去直接拒绝，现在也支持绑定了）
+    if low.startswith("/bind") and not parse_repo_url(body):
+        state._spawn(send(room.room_id,
+                          "发个仓库地址我来绑，比如 `/bind https://gitea.example.com/owner/repo`。"))
         return
 
     # 重启后 _sent_events 已清空：被回复的若是 bot 的旧消息，先向服务器补认，寻址才认得出
@@ -129,15 +132,17 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     kind, cleaned = _address_kind(room, event)   # "strong"=明确点名 / "weak"=仅续话窗口命中 / ""=没点名
     addressed = bool(kind)
 
-    # 绑定仓库：仅群聊；/bind 显式，或未绑定群里"仅一条仓库 URL"。DM 交给 handle_task 自动分诊。
+    # 绑定仓库：/bind 永远显式绑；纯仓库 URL 自动绑——群里限"未绑定 + 纯链接/被点名"，私聊里纯链接直接(重)绑。
+    # 混在长句里的 URL 不算绑定，交给 handle_task → 自动分诊去路由。
     repo = parse_repo_url(body)
-    if repo and not _is_dm(room):
+    if repo:
+        dm = _is_dm(room)
         is_bind = body.strip().lower().startswith("/bind")
         rest = re.sub(r"\S*://\S+|git@\S+", "", body.strip(), count=1).strip()
         just_url = len(rest) <= 3   # 去掉 URL 后基本没剩内容才自动绑定，闲聊带链接不算
         bound = projects.get_room(room.room_id)
-        # 未绑定群里：纯链接自动绑；被点名时（哪怕同条还带了任务）也先绑再派；/bind 永远显式绑。
-        if is_bind or (not bound and (just_url or addressed)):
+        # /bind 永远绑；私聊里纯链接直接(重)绑（DM 是个人的，换绑不怕误触）；群里未绑定 + 纯链接/被点名才绑。
+        if is_bind or (just_url and dm) or (not dm and not bound and (just_url or addressed)):
             task_text = body.strip()
             if is_bind:
                 task_text = task_text[len("/bind"):].strip()
@@ -145,8 +150,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
             task_text = _strip_self_mentions(task_text).strip()   # 去掉 @bot，别把点名混进任务正文
             state._spawn(do_bind(room, repo, event, task_text))
             return
-        # 群已绑别的仓库：裸 URL 不自动换绑（防误触），给个提示而非静默
-        if just_url and bound and proj_id(repo) != bound["id"]:
+        # 群已绑别的仓库：裸 URL 不自动换绑（防误触），给个提示而非静默（私聊上面已直接换绑，不到这）
+        if not dm and just_url and bound and proj_id(repo) != bound["id"]:
             state._spawn(send(room.room_id,
                               f"这个群已绑定 {bound['owner']}/{bound['repo']}；要换绑请用 /bind <仓库URL>。"))
             return
