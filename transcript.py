@@ -19,7 +19,7 @@ import re
 import time
 
 from config import settings
-from storage import atomic_write_text
+from storage import atomic_write_text, store_root, throttled
 
 log = logging.getLogger("matrix-claude.transcript")
 
@@ -33,9 +33,8 @@ _last_prune: dict[str, float] = {}
 
 
 def _root() -> str:
-    # 跟随 settings.store_path（自检指到临时目录不污染真实 store）；必须绝对路径——
-    # bot 进程 cwd 是 live dir、Claude 子进程 cwd 是 clone dir，相对路径会两头对不上。
-    return os.path.abspath(os.path.join(settings.store_path, "transcripts"))
+    # store/transcripts/ 的绝对路径。为什么必须绝对：见 storage.store_root。
+    return store_root("transcripts")
 
 
 def _safe(room: str) -> str:
@@ -116,11 +115,8 @@ def _prune(room: str) -> None:
 
 
 def _maybe_prune(room: str) -> None:
-    now = time.time()
-    if now - _last_prune.get(room, 0) < _PRUNE_EVERY:
-        return
-    _last_prune[room] = now
-    _prune(room)
+    if throttled(_last_prune, room, _PRUNE_EVERY):   # 同一房间最多每 _PRUNE_EVERY 秒整理一次
+        _prune(room)
 
 
 def append(room: str, sender: str, body: str,

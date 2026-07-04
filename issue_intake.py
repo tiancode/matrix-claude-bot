@@ -23,6 +23,9 @@ import issue_ledger
 import pr_ledger
 import memory
 import inflight
+# reconcile_gone 是 PR / 工单共用的「连续 ≥N 轮 404 才销账」状态机，落在 pr_followup（先加载、
+# 无反向依赖，不成环）；issue_intake 本就 import pr_ledger，再取一个跟进侧工具不算越界。
+from pr_followup import reconcile_gone
 
 log = logging.getLogger("matrix-claude.issue")
 
@@ -94,24 +97,16 @@ async def _sweep_closed():
     """在册工单里已被关闭的（PR 合并自动关 / 人工关）→ 销账；项目已不在册的也一并清掉。
     工单查不到时分辨"网络抖动（下轮再试）"和"工单真没了（被删 / 转移，连续 ≥3 轮 404 才销账并知会）"。"""
     for entry in issue_ledger.active():
-        pid, n, room = entry["pid"], entry["number"], entry.get("room") or ""
+        pid, n = entry["pid"], entry["number"]   # 房间由 reconcile_gone 从 entry 自取
         rec = projects.get_project(pid)
         if not rec:
             issue_ledger.remove(pid, n)
             continue
         info = await gitea.issue_info(rec, n)
         if info is None:
-            if await gitea.issue_gone(rec, n):
-                gone = entry.get("gone_rounds", 0) + 1
-                if gone >= 3:
-                    issue_ledger.remove(pid, n)
-                    if room:
-                        await send(room, f"⚠️ 工单 #{n} 在 Gitea 上已不存在（被删 / 转移），停止跟进。")
-                    log.info("[%s] 工单 #%d 连续 %d 轮 404，销账", pid, n, gone)
-                else:
-                    issue_ledger.update(pid, n, gone_rounds=gone)
-            elif entry.get("gone_rounds"):
-                issue_ledger.update(pid, n, gone_rounds=0)   # 抖动而非真没了：清零重新计
+            # 查不到：连续 ≥3 轮确切 404 才销账、网络抖动不计入并清零。状态机见 pr_followup.reconcile_gone。
+            await reconcile_gone(entry, rec, gone_check=gitea.issue_gone, ledger=issue_ledger,
+                                 noun="工单", reason="被删 / 转移", log=log)
             continue
         if entry.get("gone_rounds"):
             issue_ledger.update(pid, n, gone_rounds=0)        # 成功查到一次 → 清零

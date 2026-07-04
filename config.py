@@ -23,10 +23,6 @@ def _b(key, default=False):
     return v.lower() in ("1", "true", "yes", "on")
 
 
-def _list(key):
-    return [x.strip() for x in _s(key).replace("，", ",").split(",") if x.strip()]
-
-
 class Settings:
     # Matrix 账号
     homeserver   = _s("MATRIX_HOMESERVER", "https://matrix.org")

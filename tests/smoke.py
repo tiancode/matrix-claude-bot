@@ -2056,20 +2056,17 @@ def test_project_memory():
 
 def _reset_ledger():
     import pr_ledger
-    pr_ledger._data = {}
-    pr_ledger._loaded = False
+    pr_ledger._led.reset()
 
 
 def _reset_issue_ledger():
     import issue_ledger
-    issue_ledger._data = {}
-    issue_ledger._loaded = False
+    issue_ledger._led.reset()
 
 
 def _reset_inflight():
     import inflight
-    inflight._data = {}
-    inflight._loaded = False
+    inflight._led.reset()
 
 
 # ---------- 自驱心跳：PASS 不打扰；有建议→提议；autopilot→派执行 ----------
@@ -2719,7 +2716,6 @@ def test_gitea_health_status_and_alert():
 # ---------- Gitea 健康度：/status 命令确实带上这条（异常态） ----------
 def test_status_shows_gitea_health():
     import tempfile
-    import pr_ledger
     import gitea
     set_identity()
     _reset_gitea_health()

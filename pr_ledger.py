@@ -2,20 +2,13 @@
 
 每条记 PR 来自哪个项目、哪个房间（好把后续进展回报到原处）、已处理到第几条评审、
 自动改了几次（设上限防 CI 反复失败时无限重跑）。持久化到 store/pr_ledger.json，重启不丢账。
-进程内单线程访问（asyncio），改完即原子落盘。
+进程内单线程访问（asyncio），改完即原子落盘。共享的 load/save/active/update/remove 见 ledger.JsonLedger。
 """
-import json
-import logging
 import os
 import time
 
 from config import settings
-from storage import atomic_write_json
-
-log = logging.getLogger("matrix-claude.pr_ledger")
-
-_data: dict[str, dict] = {}
-_loaded = False
+from ledger import JsonLedger
 
 
 def _path() -> str:
@@ -26,62 +19,29 @@ def _key(pid: str, number: int) -> str:
     return f"{pid}#{number}"
 
 
-def _load() -> None:
-    global _data, _loaded
-    _loaded = True
-    try:
-        with open(_path()) as f:
-            d = json.load(f)
-        if isinstance(d, dict):
-            _data = {k: v for k, v in d.items() if isinstance(v, dict)}
-    except (OSError, json.JSONDecodeError):
-        _data = {}
-
-
-def _save() -> None:
-    try:
-        atomic_write_json(_path(), _data)
-    except OSError as e:
-        log.warning("PR 台账落盘失败: %s", e)
-
-
-def _ensure() -> None:
-    if not _loaded:
-        _load()
+_led = JsonLedger(_path, "PR 台账", "matrix-claude.pr_ledger")
 
 
 def record(pid: str, number: int, url: str, room: str) -> bool:
     """登记一条新开的 PR；已在册返回 False（不重复记），新登记返回 True。"""
-    _ensure()
-    k = _key(pid, number)
-    if k in _data:
-        return False
     # gone_rounds: 连续查到 404 的轮数（成功一次即清零，≥3 轮才销账，防抖动误销）；
     # conflict_seen / merge_fail_seen: 冲突 / 自动合并失败告警的水位（记 head sha，同一版本只吭一次）。
-    _data[k] = {"pid": pid, "number": number, "url": url, "room": room,
-                "branch": "", "seen_review": 0, "review_fixes": 0, "ci_fixes": 0,
-                "ci_seen": "", "gone_rounds": 0, "conflict_seen": "", "merge_fail_seen": "",
-                "created_ts": time.time(), "last_check_ts": 0.0}
-    _save()
-    return True
+    return _led.add(_key(pid, number), {
+        "pid": pid, "number": number, "url": url, "room": room,
+        "branch": "", "seen_review": 0, "review_fixes": 0, "ci_fixes": 0,
+        "ci_seen": "", "gone_rounds": 0, "conflict_seen": "", "merge_fail_seen": "",
+        "created_ts": time.time(), "last_check_ts": 0.0})
 
 
 def active() -> list[dict]:
     """在册（未销账）的全部 PR。"""
-    _ensure()
-    return list(_data.values())
+    return _led.active()
 
 
 def update(pid: str, number: int, **fields) -> None:
-    _ensure()
-    k = _key(pid, number)
-    if k in _data:
-        _data[k].update(fields)
-        _save()
+    _led.update(_key(pid, number), **fields)
 
 
 def remove(pid: str, number: int) -> None:
     """销账（合并 / 关闭后）。"""
-    _ensure()
-    if _data.pop(_key(pid, number), None) is not None:
-        _save()
+    _led.remove(_key(pid, number))
