@@ -18,22 +18,19 @@ import re
 import time
 
 from config import settings
-from storage import atomic_write_text
+from storage import atomic_write_text, store_root
 
 log = logging.getLogger("matrix-claude.memory")
 
 # 只挡路径分隔符 / 控制字符（保留中文等 Unicode，文件名才能见名知意）
 _BAD = re.compile(r"[/\\\x00-\x1f]+")
 _WS = re.compile(r"\s+")
-_DEFAULT_RECALL_BUDGET = 6000   # 注入系统提示的事实正文字符预算（MEMORY.md 索引始终全量注入）
 _INDEX = "MEMORY.md"
 
 
 def _root() -> str:
-    # 跟随 settings.store_path（自检会把它指到临时目录，真实 store 不被污染）；
-    # 必须取绝对路径——bot 进程 cwd 是 live dir，Claude 子进程 cwd 是 clone dir，
-    # 相对路径会让 Claude 把记忆写进 clone 的 store、bot 却从 live 的 store 读，永远对不上。
-    return os.path.abspath(os.path.join(settings.store_path, "memory"))
+    # store/memory/ 的绝对路径。为什么必须绝对：见 storage.store_root。
+    return store_root("memory")
 
 
 def _safe(seg: str, fallback: str = "_") -> str:
@@ -104,7 +101,7 @@ def recall(project_id: str, budget: int | None = None) -> str:
     字符预算内尽量带，超预算的剩下条数会标注出来，提示 Claude 按需去目录里读。
     """
     if budget is None:
-        budget = getattr(settings, "memory_recall_budget", _DEFAULT_RECALL_BUDGET)
+        budget = settings.memory_recall_budget   # config 恒有此属性，默认 6000
     d = proj_dir(project_id)
     if not os.path.isdir(d):
         return ""
@@ -149,7 +146,7 @@ def recall(project_id: str, budget: int | None = None) -> str:
 
 def augment_system_prompt(system_prompt: str, project_id: str) -> str:
     """把项目长期记忆拼到系统提示之后（开新会话时注入一次）。任何异常都不影响主流程。"""
-    if not getattr(settings, "memory_enabled", True):
+    if not settings.memory_enabled:
         return system_prompt
     try:
         d = ensure(project_id)

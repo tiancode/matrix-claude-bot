@@ -205,13 +205,6 @@ class Projects:
         pid = self._rooms.get(room_id)
         return self._projects.get(pid) if pid else None
 
-    def first_room_for(self, pid: str) -> str | None:
-        """绑定到该项目的第一个群房间（给自驱心跳找个"汇报口"）；没有返回 None。"""
-        for room, p in self._rooms.items():
-            if p == pid:
-                return room
-        return None
-
     def rooms_for(self, pid: str) -> list[str]:
         """绑定到该项目的所有房间 id（自驱心跳/健康度挑汇报口用，可据此在群/私聊间优选）。"""
         return [room for room, p in self._rooms.items() if p == pid]

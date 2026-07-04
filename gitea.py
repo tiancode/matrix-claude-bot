@@ -186,12 +186,6 @@ async def pr_reviews(rec: dict, number: int) -> list:
     return d if st == 200 and isinstance(d, list) else []
 
 
-async def review_comments(rec: dict, number: int, review_id: int) -> list:
-    """某条评审下的行级评论（body + 文件/行号），给 Claude 处理评审意见时当上下文。"""
-    st, d = await _aget(f"{_repo_api(rec)}/pulls/{number}/reviews/{review_id}/comments")
-    return d if st == 200 and isinstance(d, list) else []
-
-
 async def ci_state(rec: dict, sha: str) -> str | None:
     """提交的合并 CI 状态：success / failure / error / pending / ""（真没配 CI）。
     查询失败（网络抖动 / 非 200）返回 None——务必与"没配 CI"的 "" 区分开：调用方遇 None 应保守跳过，

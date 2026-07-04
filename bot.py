@@ -51,7 +51,7 @@ import gitea
 # re-export：保持 `bot.X` 可用（测试按这些名字访问内部实现）
 from fmt import (_split, _to_html, _format_context, _human_gap, _safe_name)  # noqa: F401
 from matrix_io import (send, _is_dm, _LiveReply, _emit_files, _within_allowed,  # noqa: F401
-                       _thread_of, _thread_root_of, _thread_rel, _reply_rel, _ack,
+                       _thread_of, _thread_root_of, _thread_rel, _reply_rel,
                        _resolve_reply_author, _edit_message)
 from addressing import (_is_addressed, _address_kind, _has_trigger, _strip_trigger,  # noqa: F401
                         _strip_reply_fallback, _strip_self_mentions, _mark_engaged, _looks_actionable)

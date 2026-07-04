@@ -17,6 +17,37 @@ import memory
 
 log = logging.getLogger("matrix-claude.pr")
 
+# 连续这么多轮「确切 404」才把台账条目销账。为什么必须 >1：单次 404 常是 Gitea 抖动 /
+# 反向代理瞬断，一次就销会误杀其实还活着的 PR / 工单；连续多轮都 404 才敢定性「真没了」。
+_GONE_ROUNDS_LIMIT = 3
+
+
+async def reconcile_gone(entry: dict, rec: dict, *, gone_check, ledger, noun: str,
+                         reason: str, log: logging.Logger) -> None:
+    """PR 跟进 / 工单接活共用的「连续 ≥N 轮确切 404 才销账」状态机（两边台账 API 同形，故收敛成一处）。
+
+    gone_check: async (rec, number) -> bool 的确切-404 判定（gitea.pr_gone / gitea.issue_gone）；
+    ledger: 有 remove/update(pid, number, **fields) 的台账模块（pr_ledger / issue_ledger）；
+    noun / reason: 通知文案里的名词与括注（PR「被删 / 仓库改名」 vs 工单「被删 / 转移」）；
+    log: 各自的 logger（保持 PR / 工单日志分流不变）。
+
+    确切 404 才累加轮数，攒够 _GONE_ROUNDS_LIMIT 轮才销账并知会房间；非 404 的查不到（网络抖动）
+    不计入、并把之前攒的轮数清零，免得一次断网就把台账条目误销。调用前须保证 rec 非 None。
+    """
+    pid, n = entry["pid"], entry["number"]
+    if await gone_check(rec, n):
+        gone = entry.get("gone_rounds", 0) + 1
+        if gone >= _GONE_ROUNDS_LIMIT:
+            ledger.remove(pid, n)
+            room = entry.get("room") or ""
+            if room:
+                await send(room, f"⚠️ {noun} #{n} 在 Gitea 上已不存在（{reason}），停止跟进。")
+            log.info("[%s] %s #%d 连续 %d 轮 404，销账", pid, noun, n, gone)
+        else:
+            ledger.update(pid, n, gone_rounds=gone)
+    elif entry.get("gone_rounds"):
+        ledger.update(pid, n, gone_rounds=0)   # 抖动而非真没了：清零重新计
+
 
 async def _followup_dispatch(rec: dict, entry: dict, detail: str):
     """在该 PR 的分支上处理评审 / CI 并推送，结果回报到原房间；续原会话、不新开 PR。"""
@@ -45,20 +76,11 @@ async def _followup_dispatch(rec: dict, entry: dict, detail: str):
 
 
 async def _handle_missing(entry: dict):
-    """pr_info 查不到时定性：只有连续 ≥3 轮确切 404（PR 被删 / 仓库改名）才销账并知会房间；
-    网络抖动（404 之外的查不到）不计入、并把之前攒的轮数清零，免得一次断网就把台账条目误销。"""
-    pid, n, room = entry["pid"], entry["number"], entry["room"]
-    rec = projects.get_project(pid)
-    if rec and await gitea.pr_gone(rec, n):
-        gone = entry.get("gone_rounds", 0) + 1
-        if gone >= 3:
-            pr_ledger.remove(pid, n)
-            await send(room, f"⚠️ PR #{n} 在 Gitea 上已不存在（被删 / 仓库改名），停止跟进。")
-            log.info("[%s] PR #%d 连续 %d 轮 404，销账", pid, n, gone)
-        else:
-            pr_ledger.update(pid, n, gone_rounds=gone)
-    elif entry.get("gone_rounds"):
-        pr_ledger.update(pid, n, gone_rounds=0)   # 抖动而非真没了：清零重新计
+    """pr_info 查不到时定性：连续 ≥3 轮确切 404 才销账、网络抖动不计入并清零。状态机见 reconcile_gone。"""
+    rec = projects.get_project(entry["pid"])
+    if rec:   # 调用方 _followup_one 已保证 rec 非 None，这里冗余守一下
+        await reconcile_gone(entry, rec, gone_check=gitea.pr_gone, ledger=pr_ledger,
+                             noun="PR", reason="被删 / 仓库改名", log=log)
 
 
 async def _followup_one(entry: dict):
