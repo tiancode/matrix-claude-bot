@@ -7,7 +7,7 @@ import time
 from config import settings
 import state
 from state import _sess_key, _last_project_by_room, _project_last_active
-from matrix_io import send, _typing
+from matrix_io import send, _typing, _is_dm
 from tasks import _employee_prompt, _extract_pr
 from projects import projects
 from claude_runner import runner, ClaudeCancelled
@@ -18,10 +18,17 @@ log = logging.getLogger("matrix-claude.heartbeat")
 
 
 def _project_home_room(pid: str) -> str | None:
-    """自驱心跳的"汇报口"：优先群绑定房间，否则最近路由到该项目的 DM 房间。"""
-    room = projects.first_room_for(pid)
-    if room:
-        return room
+    """自驱心跳的"汇报口"：绑该项目的房间里【优先群】——团队仓库的自驱汇报别塞进某个私聊
+    （同一仓库可能既绑了群又绑了私聊）；没有群就退回任一绑定房间，再没有就退回登记簿里的房间。"""
+    def _is_group(rid: str) -> bool:
+        room = state.client.rooms.get(rid) if state.client else None
+        return bool(room) and not _is_dm(room)
+    bound = projects.rooms_for(pid)
+    home = next((r for r in bound if _is_group(r)), None)
+    if home:
+        return home
+    if bound:
+        return bound[0]
     for r, p in _last_project_by_room.items():
         if p == pid:
             return r

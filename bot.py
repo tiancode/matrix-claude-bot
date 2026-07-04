@@ -132,17 +132,18 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     kind, cleaned = _address_kind(room, event)   # "strong"=明确点名 / "weak"=仅续话窗口命中 / ""=没点名
     addressed = bool(kind)
 
-    # 绑定仓库：/bind 永远显式绑；纯仓库 URL 自动绑——群里限"未绑定 + 纯链接/被点名"，私聊里纯链接直接(重)绑。
-    # 混在长句里的 URL 不算绑定，交给 handle_task → 自动分诊去路由。
+    # 绑定仓库：/bind 永远显式绑；私聊里【任何】带仓库 URL 的消息都绑到它——私聊已没有别的路由方式
+    # （分诊已删），URL 后面若还带话就绑完接着当任务派；群里限"未绑定 + 纯链接/被点名"才自动绑，
+    # 混着链接闲聊的不绑（防误触，群是公共的）。
     repo = parse_repo_url(body)
     if repo:
         dm = _is_dm(room)
         is_bind = body.strip().lower().startswith("/bind")
         rest = re.sub(r"\S*://\S+|git@\S+", "", body.strip(), count=1).strip()
-        just_url = len(rest) <= 3   # 去掉 URL 后基本没剩内容才自动绑定，闲聊带链接不算
+        just_url = len(rest) <= 3   # 去掉 URL 后基本没剩内容才自动绑定（群里用；私聊任何带 URL 都绑）
         bound = projects.get_room(room.room_id)
-        # /bind 永远绑；私聊里纯链接直接(重)绑（DM 是个人的，换绑不怕误触）；群里未绑定 + 纯链接/被点名才绑。
-        if is_bind or (just_url and dm) or (not dm and not bound and (just_url or addressed)):
+        # /bind 永远绑；私聊里带 URL 就(重)绑（个人房间，换绑不怕误触）；群里未绑定 + 纯链接/被点名才绑。
+        if is_bind or dm or (not bound and (just_url or addressed)):
             task_text = body.strip()
             if is_bind:
                 task_text = task_text[len("/bind"):].strip()

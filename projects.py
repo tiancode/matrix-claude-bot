@@ -212,6 +212,10 @@ class Projects:
                 return room
         return None
 
+    def rooms_for(self, pid: str) -> list[str]:
+        """绑定到该项目的所有房间 id（自驱心跳/健康度挑汇报口用，可据此在群/私聊间优选）。"""
+        return [room for room, p in self._rooms.items() if p == pid]
+
     # ---- 登记 / 绑定 ----
     def _pid_lock(self, pid: str) -> asyncio.Lock:
         return self._pid_locks.setdefault(pid, asyncio.Lock())

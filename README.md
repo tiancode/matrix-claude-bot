@@ -56,7 +56,7 @@ cp .env.example .env   # 填 Matrix 账号 + GITEA_HOST / GITEA_TOKEN
 
 然后：
 1. 把 bot 拉进群（谁邀请都进），群里发一个 Gitea 仓库地址（或 `/bind <URL>`）→ 自动 clone 绑定；
-2. @它派活。改代码的活它会开 PR 并盯到合并；纯问答/闲聊直接回（没绑仓库也行）。私聊不用绑定，它按内容自动分诊到项目；
+2. @它派活。改代码的活它会开 PR 并盯到合并；纯问答/闲聊直接回（没绑仓库也行）。私聊同理：发仓库地址或 `/bind` 定住一个仓库再派活，`/unbind` 解绑，不绑也能闲聊/答疑；
 3. 想不打字：Gitea 上把 issue 指派给它的账号，它每 5 分钟收一次单。
 
 常驻运行（systemd user，用你自己的用户跑，才能用到 `claude` 的登录态）：
@@ -152,7 +152,7 @@ journalctl --user -u matrix-claude -f
 | `fmt.py` | 纯文本/富文本格式化（分块、代码围栏自洽、消毒 HTML） |
 | `matrix_io.py` | 收发：分块、线程/引用回复、reaction 回执、流式占位与编辑、附件上传 |
 | `addressing.py` | 该不该应答：点名/回复/触发词/续话窗口 |
-| `dispatch.py` | 消息归哪个项目：群按绑定（未绑定落通用助手）、DM 按内容分诊 |
+| `dispatch.py` | 消息归哪个项目：群/私聊都按绑定，未绑定落通用助手（系统提示引导 /bind） |
 | `tasks.py` | 在项目上跑任务并回发 + 全部元命令 |
 | `pr_followup.py` / `pr_ledger.py` | PR 跟进循环 / PR 台账（对结果负责的状态底座） |
 | `issue_intake.py` / `issue_ledger.py` | 工单接活循环 / 工单台账（防重复接单） |
