@@ -394,7 +394,7 @@ async def handle_summarize(room: MatrixRoom, event: RoomMessageText, body: str):
     n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else settings.summary_lines
     recs = transcript.tail(rid, n) if settings.transcript_enabled else []
     if not recs:   # 没开/没历史记录就退回内存背景缓冲
-        recs = [{"ts": ts, "sender": s, "body": b} for ts, s, b in list(_context[rid])[-n:]]
+        recs = [{"ts": ts, "sender": s, "body": b} for ts, s, b, *_ in list(_context[rid])[-n:]]
 
     def _is_summary_cmd(b) -> bool:   # 去掉 /summarize、/catchup（含带参数形式）命令本身
         b = (b or "").strip().lower()

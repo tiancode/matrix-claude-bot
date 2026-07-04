@@ -6,7 +6,7 @@ from nio import MatrixRoom, RoomMessageText
 
 from config import settings
 import state
-from state import _sent_events, _group_engaged
+from state import _sent_events, _group_engaged, _ctx_thread
 from matrix_io import _is_dm
 
 
@@ -25,11 +25,15 @@ def _addresses_other_user(content: dict) -> bool:
 def _third_party_spoke_since(rid: str, ts: float, sender_name: str) -> bool:
     """窗口起点 ts 之后，群里有没有"第三人"（非本人、非 bot）发过言。有则说明对话已转向别人，
     "还在跟我续话"这个假设不再成立，作废窗口。数据取自内存背景缓冲 _context（存的是显示名）；
-    缓冲为空时（如单测直连 _is_addressed）判无第三人，保持原纯时间窗行为。"""
+    缓冲为空时（如单测直连 _is_addressed）判无第三人，保持原纯时间窗行为。
+    续话窗口只在顶层主时间线成立（线程内消息带 in_reply_to，不走续话），故只看顶层消息——
+    别让线程里别人说的话（与主时间线隔离）误作废你在主聊天里的续话窗口。"""
     bot_name = state.MY_NAME or "bot"   # 与 _track_reply 落上下文时用的名字一致，别把 bot 自己的答复当第三人
     for item in list(state._context.get(rid, ())):
         t, name = item[0], item[1]
         if t <= ts:
+            continue
+        if _ctx_thread(item) is not None:   # 线程里的话不算主时间线的第三人插话
             continue
         if name == sender_name or name == bot_name:
             continue

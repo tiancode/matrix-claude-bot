@@ -3,7 +3,7 @@ import re
 import time
 
 from config import settings
-from state import _context
+from state import _context, _ctx_thread
 
 
 _HTML_TAGS = ["a", "b", "blockquote", "br", "caption", "code", "del", "details",
@@ -126,24 +126,29 @@ def _safe_name(s: str, fallback: str) -> str:
 
 
 def _format_context(room_id: str, skip: tuple[str, str] | None = None,
-                    drop_sender: str | None = None) -> str:
+                    drop_sender: str | None = None, thread: str | None = None) -> str:
     """把最近对话渲染成带时间的文本；跨度大处插"间隔"提示，让 Claude 自行判断旧话题是否相关。
 
     skip=(sender, body)：当前任务会单独给出，这里从背景里剔除它，免得喂两遍。
     drop_sender：派任务时传 bot 自己的名字——它过往的回复在 Claude 的续接会话里已经有了，
     再塞进背景纯属重复投喂、还容易让模型对着自己的旧话打转。
+    thread：只渲染该范围的消息——None=顶层主时间线（不含任何线程里说的话），线程根 event_id=该线程内。
+    会话按线程细分，背景也按线程隔离：顶层任务的背景不该串进线程的话，反之亦然。先按范围过滤再取末 n 条，
+    免得末 n 条里混着别的范围、真正同范围的反而不够。
     """
     n = settings.context_lines
-    items = list(_context[room_id])[-n:] if n > 0 else []   # n<=0 表示不带背景（不能用切片，[-0:] 会取到全部）
+    if n <= 0:                                              # n<=0 表示不带背景
+        return ""
+    items = [it for it in _context[room_id] if _ctx_thread(it) == thread][-n:]   # 先按线程范围滤，再取末 n 条
     if skip and items:
         for i in range(len(items) - 1, -1, -1):   # 从最近往前找到这条任务并删掉
-            if items[i][1:] == skip:
+            if items[i][1:3] == skip:             # 只比 (sender, body)，第 4 元线程标记不参与
                 del items[i]
                 break
     if drop_sender:
         items = [it for it in items if it[1] != drop_sender]
     lines, prev_ts = [], None
-    for ts, sender, body in items:
+    for ts, sender, body, *_ in items:
         if prev_ts is not None and ts - prev_ts > _CTX_GAP_SECS:
             lines.append(f"—— 间隔{_human_gap(ts - prev_ts)} ——")
         body = (body or "").strip()

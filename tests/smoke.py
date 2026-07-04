@@ -162,7 +162,7 @@ def test_startup_and_task_flow():
     assert "【当前要你处理的任务】" in captured["prompt"]               # 任务带上下文区块
     assert "Alice" in captured["prompt"] and "[" in captured["prompt"]  # 带时间戳的群上下文
     assert "修一下登录 token" not in captured["prompt"].split("【当前要你处理的任务】")[0]  # 当前任务不在背景里重复
-    assert any(s == "claude-bot" for _, s, _ in bot._context["!g:ex.org"])  # bot 回复入上下文
+    assert any(s == "claude-bot" for _, s, *_ in bot._context["!g:ex.org"])  # bot 回复入上下文
 
 
 # ---------- 2) 认 reply / 点名 ----------
@@ -215,10 +215,10 @@ def test_track_and_monotonic():
     asyncio.run(bot.send(rid, "状态：⏳ 绑定中"))             # 默认不 track
     asyncio.run(bot.send(rid, "真正的答复", track=True))      # track
 
-    bodies = [b for _, _, b in bot._context[rid]]
+    bodies = [b for _, _, b, *_ in bot._context[rid]]
     assert "状态：⏳ 绑定中" not in bodies                     # 状态消息不进上下文
     assert "真正的答复" in bodies                             # 答复进上下文
-    ts = [t for t, _, _ in bot._context[rid]]
+    ts = [t for t, *_ in bot._context[rid]]
     assert ts == sorted(ts)                                   # 时间单调，不倒挂
 
 
@@ -842,7 +842,7 @@ def test_send_failure_logged():
         bot.log.removeHandler(h)
         state.client = orig_client
     assert any("失败" in m for m in records)                       # 失败留了日志
-    assert "答复内容" not in [b for _, _, b in bot._context[rid]]  # 没发出去就不进上下文
+    assert "答复内容" not in [b for _, _, b, *_ in bot._context[rid]]  # 没发出去就不进上下文
 
 
 # ---------- 16) _detect_base 探测失败时选实际存在的分支，不盲目回退 main ----------
@@ -954,7 +954,7 @@ def test_media_download_and_dispatch():
     assert files, "媒体没落盘"
     with open(files[0], "rb") as f:
         assert f.read() == b"hello-log-bytes"                      # 内容正确写盘
-    assert any(files[0] in b for _, _, b in bot._context[rid])     # 上下文带本地路径
+    assert any(files[0] in b for _, _, b, *_ in bot._context[rid])     # 上下文带本地路径
     assert files[0] in captured.get("text", "")                    # 派活时把路径喂给 Claude
 
 
@@ -988,7 +988,7 @@ def test_media_oversize_skipped():
     finally:
         (settings.media_root, settings.media_max_mb, state.client, media.handle_task) = orig
     assert called["dl"] == 0                                       # 超限不下载
-    assert any("超过上限" in b for _, _, b in bot._context[rid])   # 上下文有标注
+    assert any("超过上限" in b for _, _, b, *_ in bot._context[rid])   # 上下文有标注
 
 
 # ---------- 20b) DM 文件处理失败且无 caption：明确回错误，不沉默 return ----------
@@ -1227,6 +1227,50 @@ def test_context_lines_zero_means_none():
         bot._context[rid].clear()
 
 
+# ---------- 32b) 背景缓冲按线程分范围：线程的话不串进主时间线，反之亦然 ----------
+def test_context_thread_scoping():
+    import state
+    set_identity()
+    rid = "!ctxthr:ex.org"
+    root = "$thread_root"
+    bot._context[rid].clear()
+    orig = settings.context_lines
+    settings.context_lines = 20
+    try:
+        # 顶层三条 + 线程内两条（第 4 元 = 线程根）+ 一条老式 3 元组（应按顶层算）
+        bot._context[rid].append((time.time(), "Alice", "顶层：讲个故事", None))
+        bot._context[rid].append((time.time(), "claude-bot", "从前有座山", None))
+        bot._context[rid].append((time.time(), "Alice", "线程里：改下这个函数", root))
+        bot._context[rid].append((time.time(), "claude-bot", "改好了", root))
+        bot._context[rid].append((time.time(), "Bob", "老式三元组算顶层"))   # 3 元组 → _ctx_thread=None
+
+        # 顶层范围（默认）：只见顶层，绝不含线程里的话
+        top = bot._format_context(rid)
+        assert "讲个故事" in top and "从前有座山" in top and "老式三元组算顶层" in top
+        assert "改下这个函数" not in top and "改好了" not in top   # ← 漏补上了：线程的话不进主时间线背景
+
+        # 线程范围：只见该线程，不含顶层
+        thr = bot._format_context(rid, thread=root)
+        assert "改下这个函数" in thr and "改好了" in thr
+        assert "讲个故事" not in thr and "老式三元组算顶层" not in thr
+
+        # _ctx_thread 容忍 3 元组（无标记）→ None
+        assert state._ctx_thread((0, "x", "y")) is None
+        assert state._ctx_thread((0, "x", "y", root)) == root
+
+        # 续话窗口的"第三人插话"只看顶层：线程里 Bob 说话不该作废主聊天的续话窗口
+        import addressing
+        bot._context[rid].clear()
+        t0 = time.time()
+        bot._context[rid].append((t0 + 1, "Bob", "线程里插一句", root))   # 线程内第三人
+        assert addressing._third_party_spoke_since(rid, t0, "Alice") is False
+        bot._context[rid].append((t0 + 2, "Bob", "主时间线插一句", None))  # 顶层第三人
+        assert addressing._third_party_spoke_since(rid, t0, "Alice") is True
+    finally:
+        settings.context_lines = orig
+        bot._context[rid].clear()
+
+
 # ---------- 33) 发送被限流：退避重试而非直接丢块 ----------
 def test_send_retries_on_rate_limit():
     set_identity()
@@ -1249,7 +1293,7 @@ def test_send_retries_on_rate_limit():
     finally:
         state.client = orig
     assert calls["n"] == 2                                # 重试后发出
-    assert "答复" in [b for _, _, b in bot._context[rid]]  # 最终成功 → 入上下文
+    assert "答复" in [b for _, _, b, *_ in bot._context[rid]]  # 最终成功 → 入上下文
     bot._context[rid].clear()
 
 
@@ -1373,7 +1417,7 @@ def test_media_oversize_undeclared_streamed():
     finally:
         (settings.media_root, settings.media_max_mb, settings.media_enabled,
          state.client, bot.handle_task) = orig
-    assert any("超过上限" in b for _, _, b in bot._context[rid])
+    assert any("超过上限" in b for _, _, b, *_ in bot._context[rid])
     bot._context[rid].clear()
 
 
@@ -3135,7 +3179,7 @@ def test_livereply_finalize_edit_fallback():
     asyncio.run(live.on_delta("part", "Bash"))            # 生成占位消息
     asyncio.run(live.finalize("最终答案", track=True))
     assert any("最终答案" in b for b in sent)              # 占位编辑失败 → 答案作为新消息发出
-    assert any(b == "最终答案" for _, s, b in bot._context[rid])   # 且照常入上下文
+    assert any(b == "最终答案" for _, s, b, *_ in bot._context[rid])   # 且照常入上下文
 
 
 # ---------- 自驱 / PR 跟进任务的取消维度是房间：/cancel 才停得下来 ----------
@@ -3504,6 +3548,7 @@ TESTS = [
     ("_is_dm 只认恰好 2 人", test_is_dm_requires_exactly_two),
     ("_human_gap 25h 不塌成 1 天", test_human_gap_precision),
     ("CONTEXT_LINES=0 不带背景", test_context_lines_zero_means_none),
+    ("背景缓冲按线程分范围", test_context_thread_scoping),
     ("发送限流退避重试", test_send_retries_on_rate_limit),
     ("会话失效匹配收紧", test_session_error_matching_tightened),
     ("媒体行不在 prompt 重复", test_run_on_project_skips_media_line),

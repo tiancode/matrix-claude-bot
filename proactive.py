@@ -59,7 +59,8 @@ async def maybe_proactive(room: MatrixRoom, event: RoomMessageText, body: str):
     _last_proactive[rid] = now   # 先占满冷却窗口，防止并发消息同时触发判断
     spoke = False
     try:
-        ctx = _format_context(rid)
+        # 按触发消息所在范围取背景：线程里触发就只看该线程、顶层触发就只看主时间线，别互相串台
+        ctx = _format_context(rid, thread=_thread_of(event))
         prompt = (
             "下面是一个 Matrix 群里最近的对话。你是群里的助手。\n"
             "判断你现在是否应该主动插话：\n"

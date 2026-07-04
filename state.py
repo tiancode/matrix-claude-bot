@@ -33,12 +33,19 @@ _synced = False     # 初始 sync 完成前不处理回放的历史/积压消息
 # ---- in-place 容器（不重绑，可被各模块 import 同一对象共享）----
 _tasks: set = set()
 _context: dict[str, deque] = defaultdict(lambda: deque(maxlen=max(4, settings.context_lines * 2)))
+# ↑ 每条是 (ts, sender, body, thread)：thread=线程根 event_id / None=顶层主时间线。会话按线程细分
+# （见 _sess_key），背景也跟着按线程分范围——顶层任务的背景不该串进线程里说的话（取值用 _ctx_thread）。
 _last_proactive: dict[str, float] = defaultdict(float)
 _sent_events: deque = deque(maxlen=4096)        # 自己发出的 event_id：防自激 + 识别"回复了 bot"（重启清空）
 _foreign_events: deque = deque(maxlen=4096)     # 查证过"不是 bot 发的"的 event_id：防重复向服务器拉取
 _last_project_by_room: dict[str, str] = {}      # room_id -> proj_id，房间在弄哪个项目（自驱心跳/Gitea 健康度找汇报口）
 _project_last_active: dict[str, float] = defaultdict(float)   # proj_id -> 上次有人派活的时刻，自驱心跳据此避让
 _group_engaged: dict[tuple[str, str], float] = {}   # (room_id, user) -> 上次点名/续话时刻：群里"对话延续窗口"用
+
+
+def _ctx_thread(item) -> str | None:
+    """取背景条目 _context 的线程标记（第 4 元）。容忍老式 3 元组（没标记）→ 按顶层(None)算。"""
+    return item[3] if len(item) > 3 else None
 
 
 def _spawn(coro):

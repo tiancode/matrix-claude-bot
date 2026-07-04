@@ -93,7 +93,7 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     sender_name = room.user_name(event.sender) or event.sender
     # 用本地接收时刻而非 event.server_timestamp：与 send() 里 bot 回复同一时钟，
     # _format_context 的"间隔"提示才不会因收/发两端时钟偏差算错。
-    _context[room.room_id].append((time.time(), sender_name, body))
+    _context[room.room_id].append((time.time(), sender_name, body, _thread_of(event)))
     transcript.append(room.room_id, sender_name, body, event_id=event.event_id)  # 落盘逐字记录，供回溯
 
     # 用自己账号跑时：消息照进上下文，但无触发词不当派活（否则会去回你发给别人的话）。
