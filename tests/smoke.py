@@ -2506,6 +2506,11 @@ class _CapClient:
         self.redacted.append(eid)
         return types.SimpleNamespace(event_id="$rd%d" % len(self.redacted))
 
+    async def room_get_event(self, rid, eid):
+        # 线程起点回捞用：返回一条可辨认的假根消息
+        return types.SimpleNamespace(event=types.SimpleNamespace(
+            body=f"root-of-{eid}", sender="@alice:ex.org"))
+
     async def join(self, rid):
         self.rooms[rid] = types.SimpleNamespace(room_id=rid)   # 模拟 join 后房间进入 client.rooms
         return None
@@ -2557,7 +2562,7 @@ def _task_fixtures():
         return rec
     bot.projects.ensure_project = fake_ensure
     async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
-                       on_delta=None, cancel_key=None):
+                       on_delta=None, cancel_key=None, fork_from=None):
         return "搞定"
     bot.runner.ask = fake_ask
     return rec
@@ -2672,6 +2677,102 @@ def test_task_ack_reaction():
     assert reacts and reacts[0]["m.relates_to"]["event_id"] == "$ACK"              # 打在触发消息上
     assert reacts[0]["m.relates_to"]["key"] == "👀"
     assert c.redacted == ["$e1"]                                                   # 处理完撤掉（回执是第 1 条发送）
+
+
+def test_runner_fork_session():
+    """runner 层的会话分叉：key 无会话且给了 fork_from → --resume 父会话 + --fork-session，
+    新会话存线程 key、父会话不动；第二次直接 resume 线程会话；父会话失效 → 清父、全新开。"""
+    set_identity()
+    rec = {"id": "h/o/r"}
+    assert state._sess_key(rec, "!r") == "h/o/r|!r"                    # 不带线程 = 老格式
+    assert state._sess_key(rec, "!r", "$T") == "h/o/r|!r|$T"           # 线程维度
+    cmd = claude_runner.runner._cmd("hi", "SID", True, fork=True)
+    assert cmd[cmd.index("--resume") + 1] == "SID" and "--fork-session" in cmd
+    assert "--fork-session" not in claude_runner.runner._cmd("hi", "SID", True)    # 不 fork 不带
+
+    r = claude_runner.ClaudeRunner()
+    r._sessions["proj|room"] = ("SID-PARENT", time.time())
+    cmds = []
+
+    async def fake_run(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+        cmds.append(cmd)
+        return 0, json.dumps({"result": "ok", "session_id": "SID-FORKED"}).encode(), b""
+    r._run = fake_run
+    assert asyncio.run(r.ask("proj|room|$T", "hi", fork_from="proj|room")) == "ok"
+    c = cmds[0]
+    assert c[c.index("--resume") + 1] == "SID-PARENT" and "--fork-session" in c    # 从父分叉
+    assert r._sessions["proj|room|$T"][0] == "SID-FORKED"              # 新会话存线程 key
+    assert r._sessions["proj|room"][0] == "SID-PARENT"                 # 父会话原样
+    cmds.clear()
+    asyncio.run(r.ask("proj|room|$T", "again", fork_from="proj|room"))
+    c = cmds[0]
+    assert c[c.index("--resume") + 1] == "SID-FORKED" and "--fork-session" not in c  # 第二次直接续
+    cmds.clear()
+    asyncio.run(r.ask("p2|room|$T", "hi", fork_from="p2|room"))        # 父不存在 → 全新开
+    assert "--resume" not in cmds[0] and "--fork-session" not in cmds[0]
+
+    r2 = claude_runner.ClaudeRunner()                                  # 父会话失效：清父、全新开
+    r2._sessions["p3|room"] = ("SID-DEAD", time.time())
+
+    async def fail_then_ok(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+        if "--resume" in cmd:
+            return 1, b"", b"No conversation found with session ID SID-DEAD"
+        return 0, json.dumps({"result": "ok", "session_id": "SID-NEW"}).encode(), b""
+    r2._run = fail_then_ok
+    assert asyncio.run(r2.ask("p3|room|$T", "hi", fork_from="p3|room")) == "ok"
+    assert "p3|room" not in r2._sessions                               # 失效的是父，父被清
+    assert r2._sessions["p3|room|$T"][0] == "SID-NEW"
+
+
+def test_thread_scoped_session_forks():
+    """用户线程里的任务：会话细分到线程并从房间会话 fork；背景不带房间近况、只补线程起点；
+    线程里 /reset 只重置该线程；顶层任务不受影响。"""
+    set_identity()
+    c = _CapClient(); state.client = c
+    rec = _task_fixtures()
+    captured = []
+
+    async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
+                       on_delta=None, cancel_key=None, fork_from=None):
+        captured.append((key, fork_from, prompt))
+        return "线程里搞定"
+    bot.runner.ask = fake_ask
+    room = FakeRoom("!ts:ex.org", 3)
+    rid = room.room_id
+
+    def thread_event(body, eid, root="$TROOT"):
+        return types.SimpleNamespace(
+            body=body, sender="@alice:ex.org", event_id=eid,
+            server_timestamp=int(time.time() * 1000),
+            source={"content": {"m.relates_to": {"rel_type": "m.thread", "event_id": root},
+                                "m.mentions": {"user_ids": [state.MY_ID]}}})
+    orig = (settings.stream_replies, settings.reply_in_thread, bot.runner.reset)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    try:
+        bot._context[rid].clear()
+        bot._context[rid].append((time.time(), "Bob", "房间里的无关闲聊"))   # 不该漏进线程任务
+        asyncio.run(bot.handle_task(room, thread_event("@claude-bot 线程活", "$TQ"), "线程活"))
+        key, fork_from, prompt = captured[0]
+        assert key == f"{rec['id']}|{rid}|$TROOT"                      # 会话键带线程维度
+        assert fork_from == f"{rec['id']}|{rid}"                       # 从房间会话分叉
+        assert "root-of-$TROOT" in prompt                              # 背景=线程起点（根消息）
+        assert "房间里的无关闲聊" not in prompt                          # 房间近况被隔离
+
+        captured.clear()                                               # 顶层任务：老样子，不带线程不 fork
+        asyncio.run(bot.handle_task(
+            room, make_event("@claude-bot 顶层活", mentions=[state.MY_ID], event_id="$PQ"), "顶层活"))
+        key, fork_from, _ = captured[0]
+        assert key == f"{rec['id']}|{rid}" and fork_from is None
+
+        resets = []                                                    # 线程里 /reset 只重置线程会话
+        bot.runner.reset = lambda k: resets.append(k)
+        asyncio.run(bot.handle_task(room, thread_event("/reset", "$RQ"), "/reset"))
+        assert resets == [f"{rec['id']}|{rid}|$TROOT"]
+        assert any("已重置本线程" in (m.get("body") or "") for m in c.sent)
+        assert bot._context[rid]                                       # 房间背景缓冲没被线程 reset 清掉
+    finally:
+        settings.stream_replies, settings.reply_in_thread, bot.runner.reset = orig
+        bot._context[rid].clear()
 
 
 # ---------- 新增能力 2) /help + 进房欢迎 ----------
@@ -3182,6 +3283,8 @@ TESTS = [
     ("群答复默认平铺+插话时引用回复", test_group_flat_reply_and_smart_quote),
     ("未绑定群当通用助手聊", test_group_unbound_chat_general),
     ("任务回执 👀 打上/撤掉", test_task_ack_reaction),
+    ("runner 会话分叉 fork/续/父失效", test_runner_fork_session),
+    ("线程会话细分+起点背景+线程reset", test_thread_scoped_session_forks),
     ("/help + 进房欢迎", test_help_and_welcome),
     ("/summarize 小结最近对话", test_summarize_command),
     ("/cancel 停当前任务", test_cancel_command),

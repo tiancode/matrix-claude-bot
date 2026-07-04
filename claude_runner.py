@@ -285,7 +285,8 @@ class ClaudeRunner:
         return (data.get("result") or "").strip(), data.get("session_id"), bool(data.get("is_error"))
 
     def _cmd(self, prompt: str, sid: str | None, agentic: bool,
-             system_prompt: str | None = None, stream: bool = False) -> list[str]:
+             system_prompt: str | None = None, stream: bool = False,
+             fork: bool = False) -> list[str]:
         cmd = [settings.claude_bin, "-p", prompt]
         cmd += (["--output-format", "stream-json", "--verbose"] if stream
                 else ["--output-format", "json"])
@@ -303,6 +304,8 @@ class ClaudeRunner:
             cmd += ["--append-system-prompt", sp]
         if sid:
             cmd += ["--resume", sid]
+            if fork:   # 从 sid 分叉出新会话（继承历史、各走各的），而不是续写原会话
+                cmd += ["--fork-session"]
         if agentic and settings.claude_extra_args:
             cmd += shlex.split(settings.claude_extra_args)
         return cmd
@@ -327,15 +330,19 @@ class ClaudeRunner:
     # ---- agentic：真正干活 ----
     async def ask(self, key: str, prompt: str, cwd: str | None = None,
                   system_prompt: str | None = None, lock_key: str | None = None,
-                  prepare=None, on_delta=None, cancel_key: str | None = None) -> str:
+                  prepare=None, on_delta=None, cancel_key: str | None = None,
+                  fork_from: str | None = None) -> str:
         """带工具、带会话上下文地干活；cwd=该项目的仓库目录。
 
-        key:        会话维度（项目+房间），不同房间/私聊用户互不串台。
+        key:        会话维度（项目+房间[+线程]），不同房间/私聊用户互不串台。
         lock_key:   串行维度（默认同 key）。同一份 checkout 必须串行，否则两个房间并发在同一
                     工作树里 checkout/改文件会互相踩烂——所以这里传 proj_id 按 checkout 串行。
         prepare:    进锁后、跑任务前执行的准备协程（如把工作树拉回干净 base）。
         on_delta:   传入则走 stream-json 流式；await on_delta(已产出文本, 工具名或None) 边跑边回报。
         cancel_key: /cancel 的取消维度（默认 lock_key）；被 cancel() 杀掉时抛 ClaudeCancelled。
+        fork_from:  key 还没有会话时，从这个父会话 key 分叉（--resume 父 + --fork-session）：
+                    新会话继承分叉点之前的全部历史、之后与父互相隔离（线程会话从房间会话分叉用）。
+                    公共前缀逐字节相同，缓存 TTL 内还能命中 prompt cache。父会话也不存在就全新开。
         """
         lock_key = lock_key or key
         ckey = cancel_key or lock_key
@@ -350,11 +357,12 @@ class ClaudeRunner:
             my_procs.append(proc)
             self._active.setdefault(ckey, []).append(proc)
 
-        async def _once(sid):
+        async def _once(sid, fork=False):
             """跑一次。返回 (rc, payload, err, meta)：
             rc==0 → payload=结果字符串, meta=(session_id, is_error)；rc!=0 → payload=原始 stdout 字节, meta=None。"""
             if on_delta is None:
-                rc, out, err = await self._run(self._cmd(prompt, sid, True, system_prompt), cwd, on_proc=_reg)
+                rc, out, err = await self._run(self._cmd(prompt, sid, True, system_prompt, fork=fork),
+                                               cwd, on_proc=_reg)
                 if rc != 0:
                     return rc, out, err, None
                 result, new_sid, is_err = self._parse(out)
@@ -377,7 +385,8 @@ class ClaudeRunner:
                         st["result"] = obj["result"]
                     st["is_err"] = bool(obj.get("is_error"))
             rc, err = await self._run_stream(
-                self._cmd(prompt, sid, True, system_prompt, stream=True), cwd, _reg, _on_line)
+                self._cmd(prompt, sid, True, system_prompt, stream=True, fork=fork),
+                cwd, _reg, _on_line)
             if rc != 0:
                 return rc, b"", err, None
             result = st["result"] if st["result"] is not None else st["text"]
@@ -399,12 +408,19 @@ class ClaudeRunner:
                     raise ClaudeCancelled()
                 epoch = self._epoch.get(key, 0)
                 sid, expired = self._sid(key)
-                rc, payload, err, meta = await _once(sid)
+                fork = False
+                if sid is None and fork_from:      # 本 key 还没会话：从父会话分叉（父也没有就全新开）
+                    parent_sid, _ = self._sid(fork_from)
+                    if parent_sid:
+                        sid, fork = parent_sid, True
+                rc, payload, err, meta = await _once(sid, fork)
                 if token.cancelled:
                     raise ClaudeCancelled()
                 if rc != 0 and sid and self._looks_like_session_error(
                         payload if isinstance(payload, bytes) else b"", err):
-                    self.reset(key)
+                    # fork 场景失效的是【父】会话（--resume 的是它）：清父，别让房间任务再撞尸体；
+                    # 普通 resume 失效清自己。然后全新开一条。
+                    self.reset(fork_from if fork else key)
                     epoch = self._epoch.get(key, 0)
                     rc, payload, err, meta = await _once(None)
                     if token.cancelled:
