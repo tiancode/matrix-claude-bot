@@ -337,9 +337,47 @@ def _extract_pr(answer: str, rec: dict) -> tuple[int, str] | None:
 
 
 
+async def _quoted_subject(room: MatrixRoom, event: RoomMessageText) -> str:
+    """引用回复里【被引用的那条消息】的正文（"发送者：内容"）。很多客户端发引用回复时只带
+    m.relates_to.m.in_reply_to 这个 event_id 指针，并不把引文内联进 body / formatted_body
+    （本条正文可能只剩一个 @）——于是被引用的内容对 bot 完全不可见。这里按需向服务器拉一次
+    原消息补上。线程回退（rel_type=m.thread 或 is_falling_back）不是用户主动"引用某条"，
+    不取；拉取失败 / 原消息无正文都返回空串。"""
+    content = (getattr(event, "source", None) or {}).get("content", {})
+    rel = content.get("m.relates_to") or {}
+    if rel.get("rel_type") == "m.thread" or rel.get("is_falling_back"):
+        return ""
+    eid = (rel.get("m.in_reply_to") or {}).get("event_id")
+    if not eid:
+        return ""
+    try:
+        resp = await state.client.room_get_event(room.room_id, eid)
+    except Exception:
+        log.warning("取引用消息失败 %s/%s", room.room_id, eid)
+        return ""
+    ev = getattr(resp, "event", None)
+    if ev is None:
+        return ""
+    src = getattr(ev, "source", None) or {}
+    body = _strip_reply_fallback((getattr(ev, "body", "") or ""), src.get("content") or {}).strip()
+    if not body:
+        return ""
+    sender = getattr(ev, "sender", "") or ""
+    who = "你（bot）之前说" if sender == state.MY_ID else (room.user_name(sender) or sender)
+    return f"{who}：{body[:800]}"
+
+
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                       skip_body: str | None = None):
     rid = room.room_id
+    # 引用回复：客户端常只发 m.in_reply_to 指针、不内联引文，本条正文可能只剩一个 @。把被引用的
+    # 消息拉进来——正文空时它就是要处理的主题（否则会被下面的空正文闸静默丢掉）；正文非空时作为
+    # "用户在指这条"的上文附带过去。重置类元命令不动，别把 /reset 揉进引文。
+    if text.strip() not in RESET_CMDS:
+        quoted = await _quoted_subject(room, event)
+        if quoted:
+            text = (f"我引用/回复了这条消息，请针对它回应：\n> {quoted}" if not text.strip()
+                    else f"（我引用/回复了这条消息作为上文：\n> {quoted}\n）\n\n{text.strip()}")
     # 线程策略：跟着用户走——他在线程里说话就把答复挂进那个线程，并且【会话也细分到线程】
     # （首次派活从房间会话 fork，记忆随视觉一起分叉，线程之间互不串台）；顶层消息不再强开新线程。
     # REPLY_IN_THREAD=1 保留旧式"每条顶层消息开线程"，供偏爱线程的群显式选回——但会话细分

@@ -190,6 +190,38 @@ def test_reply_addressing():
     assert a4 and t4 == "看下 CI"                                      # 普通 @pill 仍有效
 
 
+# ---------- 2.5) 引用回复：拉回被引用消息的内容（真实回归） ----------
+def test_quoted_reply_fetches_referenced_message():
+    """真实回归（!bBJJRELZSgyuyJQbum 复现）：用户引用回复某条消息只 @ 了 bot，客户端只发
+    m.in_reply_to 指针、不内联引文，本条正文剥完只剩空——被引用的内容对 bot 不可见，于是回空话。
+    修法：_quoted_subject 按 event_id 向服务器拉回原消息内容当主题；线程回退不当"引用"。"""
+    set_identity()
+    room = FakeRoom("!q:ex.org", 3)
+    quoted = make_event("给我讲一个笑话", sender="@alice:ex.org", event_id="$q1")
+
+    class FakeClient:
+        rooms = {}
+        async def room_get_event(self, rid, eid):
+            assert eid == "$q1"
+            return types.SimpleNamespace(event=quoted)
+
+    orig = getattr(state, "client", None)
+    state.client = FakeClient()
+    try:
+        # ① 真·引用回复（只带 in_reply_to 指针）→ 拉回被引用内容
+        ev = make_event("claude", in_reply_to="$q1", mentions=["@claudebot:ex.org"])
+        got = asyncio.run(tasks._quoted_subject(room, ev))
+        assert "给我讲一个笑话" in got and "Alice" in got
+        # ② 线程回退（rel_type=m.thread / is_falling_back）不是主动引用 → 不取
+        ev2 = make_event("接着改", in_reply_to="$q1")
+        ev2.source["content"]["m.relates_to"].update(rel_type="m.thread", is_falling_back=True)
+        assert asyncio.run(tasks._quoted_subject(room, ev2)) == ""
+        # ③ 压根不是引用 → 空串
+        assert asyncio.run(tasks._quoted_subject(room, make_event("hi"))) == ""
+    finally:
+        state.client = orig
+
+
 # ---------- 3) 引用回退块剥离（不误伤用户自己的 >） ----------
 def test_reply_fallback_strip():
     c = {"m.relates_to": {"m.in_reply_to": {"event_id": "$x"}}}
@@ -3824,6 +3856,7 @@ TESTS = [
     ("流式异常 占位收尾不重复报错", test_stream_task_error_finalizes_placeholder),
     ("取消协程 子进程组被杀", test_run_kills_group_on_cancel),
     ("重启后回复 bot 仍算点名", test_reply_to_bot_after_restart),
+    ("引用回复拉回被引用消息内容", test_quoted_reply_fetches_referenced_message),
     ("PR 跟进忽略自己的评论", test_followup_ignores_own_reviews),
     ("/summarize 剔除命令变体", test_summarize_excludes_command_variants),
 ]
