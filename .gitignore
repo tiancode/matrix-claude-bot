@@ -6,6 +6,9 @@ store/
 # projects/：clone 下来的仓库，其 .git/config 内嵌了 GITEA_TOKEN；还有 _scratch / _media
 projects/
 
+# 自建 homeserver 的自签名证书（每个部署各不相同，不入库）
+homeserver.crt
+
 # Python
 .venv/
 __pycache__/

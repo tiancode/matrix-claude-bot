@@ -36,6 +36,12 @@ class Settings:
     store_path   = _s("MATRIX_STORE_PATH", "./store")
     creds_path   = _s("MATRIX_CREDS_PATH", "./store/credentials.json")
     enable_e2e   = _b("MATRIX_ENABLE_E2E", False)
+    # 自建 / 自签名证书 homeserver 的 TLS：默认走系统 CA 校验（公网 homeserver 不用动）。
+    # 自签名证书两种接法：① MATRIX_CA_CERT 指向服务器证书/CA（推荐：仍做校验、仍防 MITM，
+    # 前提是证书 SAN 覆盖你连的主机名/IP）；② MATRIX_SSL_VERIFY=0 直接关校验（最省事但失去
+    # MITM 防护，仅用于可信内网/自有机器）。两者都设时以 CA 校验为准。
+    matrix_ssl_verify = _b("MATRIX_SSL_VERIFY", True)
+    matrix_ca_cert    = _s("MATRIX_CA_CERT")
 
     # 行为
     reply_in_dm    = _b("REPLY_IN_DM_ALWAYS", True)

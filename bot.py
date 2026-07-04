@@ -263,10 +263,26 @@ async def _cleanup_room(rid: str):
         log.exception("退房清理：删媒体目录失败 %s", rid)
 
 
+def _ssl_param():
+    """自建 / 自签名证书 homeserver 的 TLS 策略（详见 config.py）：
+    - 指定了 MATRIX_CA_CERT → 用这张证书/CA 做校验（推荐，仍防 MITM）；
+    - MATRIX_SSL_VERIFY=0 → 关闭校验（ssl=False，自签名最省事，失去 MITM 防护）；
+    - 否则 → None（走系统默认 CA 校验）。
+    否则 nio(aiohttp) 默认校验，遇自签名证书会一直失败重试，表现为"连不上"。"""
+    if settings.matrix_ca_cert:
+        import ssl as _ssl
+        ctx = _ssl.create_default_context(cafile=os.path.expanduser(settings.matrix_ca_cert))
+        return ctx
+    if not settings.matrix_ssl_verify:
+        log.warning("MATRIX_SSL_VERIFY=0：已关闭 homeserver TLS 证书校验（无 MITM 防护，仅可信网络可用）")
+        return False
+    return None
+
+
 def _new_client() -> AsyncClient:
     cfg = AsyncClientConfig(store_sync_tokens=True, encryption_enabled=state.E2E)
     return AsyncClient(settings.homeserver, settings.user_id,
-                       store_path=settings.store_path, config=cfg)
+                       store_path=settings.store_path, config=cfg, ssl=_ssl_param())
 
 
 async def _login():
