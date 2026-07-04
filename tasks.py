@@ -150,20 +150,44 @@ async def _auto_backfill(room_id: str):
 
 
 
+async def _thread_origin_line(room: MatrixRoom, thread_root: str) -> str:
+    """取线程根消息作为线程会话的起点背景。线程会话与房间近况隔离后，唯一必须补的上下文是
+    "这个线程在聊什么"——根消息可能从未进过房间会话（没人 @bot 时只进内存缓冲）。失败返回空串。"""
+    try:
+        resp = await state.client.room_get_event(room.room_id, thread_root)
+        ev = getattr(resp, "event", None)
+        body = (getattr(ev, "body", "") or "").strip()
+        sender = getattr(ev, "sender", "") or ""
+        if body:
+            name = room.user_name(sender) or sender
+            return f"{name}: {body[:500]}"
+    except Exception:
+        log.warning("取线程根消息失败 %s/%s", room.room_id, thread_root)
+    return ""
+
+
+
 async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, rec: dict,
                           skip_body: str | None = None, thread_root: str | None = None,
-                          reply_to=None):
+                          reply_to=None, sess_thread: str | None = None):
     """在某项目上跑任务并回发。"正在输入"由调用方 handle_task 的 _typing 统一负责。
     skip_body：当前这条消息在背景上下文里的原文，用于从背景里剔除它免得重复喂。
     媒体走的是 "[文件]…" 那行，和 event.body（文件名/caption）不一样，必须由调用方显式传。
     thread_root：用户在线程里说话（或旧式 REPLY_IN_THREAD=1）时把答复挂进该线程。
     reply_to：零参可调用，发送/占位那一刻求值——群里已插进别的消息就返回触发消息 event_id
-    （改用引用回复指明在回哪条），房间安静就返回 None（顶层直答）。"""
+    （改用引用回复指明在回哪条），房间安静就返回 None（顶层直答）。
+    sess_thread：用户自己开的线程的根 event_id → 会话细分到线程：首次派活从房间会话 fork
+    （继承分叉点前的记忆，之后与房间/其它线程互相隔离），并且不再注入房间近况背景（那正是
+    要隔离的串台源），只补一行线程起点。"""
     rid = room.room_id
     sender = room.user_name(event.sender) or event.sender
-    cur_body = (skip_body if skip_body is not None
-                else _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {})))
-    ctx = _format_context(rid, skip=(sender, cur_body), drop_sender=state.MY_NAME or None)
+    if sess_thread:   # 线程任务：背景只带线程起点；fork 前的房间历史已在父会话里，fork 后要的就是隔离
+        origin = await _thread_origin_line(room, sess_thread)
+        ctx = f"—— 本线程起点 ——\n{origin}" if origin else ""
+    else:
+        cur_body = (skip_body if skip_body is not None
+                    else _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {})))
+        ctx = _format_context(rid, skip=(sender, cur_body), drop_sender=state.MY_NAME or None)
     if ctx:
         prompt = (
             "【所在会话最近的对话，仅供背景参考；带时间，可能跨较长时间，自行判断哪些与当前任务相关】\n"
@@ -172,7 +196,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         )
     else:
         prompt = f"[来自 {sender}] {text}"
-    log.info("[%s] 任务@%s: %s", rid, rec["id"], text[:80])
+    log.info("[%s] 任务@%s%s: %s", rid, rec["id"], f" 线程{sess_thread[:12]}" if sess_thread else "",
+             text[:80])
     if rec.get("general"):   # 通用助手：每房间独立 scratch 子目录（互不串文件）、无 employee/Gitea 指引、不碰 git
         sp = settings.claude_system_prompt + (_FILE_SEND_HINT if settings.send_files_back else "")
         if rec.get("unbound_room"):   # 未绑定仓库的群：闲聊/答疑照常，但派仓库活时要引导绑定
@@ -180,7 +205,9 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                    "（改它的代码、查它的问题），引导他发一下 Gitea 仓库地址或 `/bind <仓库URL>`，"
                    "绑定后你才能拿到代码干活。")
         cwd = os.path.join(settings.claude_workdir, _safe_name(rid, "dm"))
-        lock_key, prepare = None, None   # lock_key=None → 用会话 key（按房间），各房间可并行
+        # 串行锁固定在房间维度（不带线程）：同一房间的 scratch 目录是共享的，
+        # 各线程会话并行跑会在同一目录里互相踩文件。prepare 无。
+        lock_key, prepare = _sess_key(rec, rid), None
     else:
         # 会话 key 带房间维度（互不串台）；lock_key 用 proj_id（同一 checkout 串行）；
         # 跑任务前先把工作树拉回干净 base，免得上个任务的脏树/残留分支污染这次。
@@ -189,7 +216,10 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         prepare = lambda: projects.prepare_worktree(rec)
         _project_last_active[rec["id"]] = time.time()      # 标记活跃：自驱心跳会避让最近在弄的项目
     sp = transcript.augment_system_prompt(sp, rid)   # 指给它本房间历史日志，便于回溯更早对话
-    sess = _sess_key(rec, rid)
+    sess = _sess_key(rec, rid, sess_thread)
+    # 线程首次派活：从房间会话分叉（--fork-session）。fork_from 只在线程任务时传——
+    # 显式 kwargs 组装，普通任务不带此参数（测试里的假 runner 不必都认识它）。
+    fork_kw = {"fork_from": _sess_key(rec, rid)} if sess_thread else {}
     # 在途登记：进执行/排队即记一笔，重启对账据此收尾占位/催重发（见 inflight）。摘除放 finally，
     # 覆盖成功/取消/报错所有退出路径。占位 eid 在占位创建后（首个 delta）再补录。
     inflight_key = inflight.record(rid, text, inflight.KIND_CHAT)
@@ -219,7 +249,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             try:
                 answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
                                           lock_key=lock_key, prepare=prepare,
-                                          on_delta=_relay, cancel_key=rid)
+                                          on_delta=_relay, cancel_key=rid, **fork_kw)
             except ClaudeCancelled:
                 await live.finalize("🛑 已停止。", track=False)
                 return
@@ -237,7 +267,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         else:
             try:
                 answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
-                                          lock_key=lock_key, prepare=prepare, cancel_key=rid)
+                                          lock_key=lock_key, prepare=prepare, cancel_key=rid,
+                                          **fork_kw)
             except ClaudeCancelled:
                 await send(rid, "🛑 已停止。", thread_root=thread_root, reply_to=_reply_eid())
                 return
@@ -264,10 +295,12 @@ def _extract_pr(answer: str, rec: dict) -> tuple[int, str] | None:
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                       skip_body: str | None = None):
     rid = room.room_id
-    # 线程策略：跟着用户走——他在线程里说话就把答复挂进那个线程；顶层消息不再强开新线程
-    # （bot 的记忆按房间拍平，视觉上也别 fork 成一堆小线程）。REPLY_IN_THREAD=1 保留旧式
-    # "每条顶层消息开线程"，供偏爱线程的群显式选回。
-    thr = _thread_of(event)
+    # 线程策略：跟着用户走——他在线程里说话就把答复挂进那个线程，并且【会话也细分到线程】
+    # （首次派活从房间会话 fork，记忆随视觉一起分叉，线程之间互不串台）；顶层消息不再强开新线程。
+    # REPLY_IN_THREAD=1 保留旧式"每条顶层消息开线程"，供偏爱线程的群显式选回——但会话细分
+    # 只认用户自己在线程里说话（sess_thr），旧式给顶层消息强开的线程不算。
+    sess_thr = _thread_of(event)
+    thr = sess_thr
     if thr is None and settings.reply_in_thread and not _is_dm(room):
         thr = _thread_root_of(event)
     # 引用回复决策器：发送/占位那一刻若群里已插进别的消息（长任务期间常有），改用引用回复
@@ -292,9 +325,14 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                     pid = _last_project_by_room.get(rid)
                     rec = projects.get_project(pid) if pid else None
                 if rec:
-                    runner.reset(_sess_key(rec, rid))   # 只重置本房间的会话，不动别处共用同一 repo 的会话
-                    _context[rid].clear()   # 连背景一起清，别让旧对话漏进新会话
-                    await send(rid, "已开启新对话 ✅", thread_root=thr)
+                    # 线程里发 /reset 只重置该线程的会话；顶层才重置房间会话+清背景缓冲
+                    runner.reset(_sess_key(rec, rid, sess_thr))
+                    if sess_thr:
+                        await send(rid, "已重置本线程的对话 ✅（房间和其它线程不受影响）",
+                                   thread_root=thr)
+                    else:
+                        _context[rid].clear()   # 连背景一起清，别让旧对话漏进新会话
+                        await send(rid, "已开启新对话 ✅", thread_root=thr)
                 else:
                     await send(rid, "还没有可重置的会话；先发个仓库地址或派个活吧。", thread_root=thr)
                 return
@@ -308,7 +346,7 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                     _last_project_by_room[rid] = rec["id"]
                     _save_last_projects()   # 落盘：重启后 DM 的 /reset 与多轮延续仍能定位项目
                 await _run_on_project(room, event, text, rec, skip_body=skip_body,
-                                      thread_root=thr, reply_to=reply_to)
+                                      thread_root=thr, reply_to=reply_to, sess_thread=sess_thr)
     except ClaudeCancelled:
         try:
             await send(rid, "🛑 已停止。", thread_root=thr,

@@ -47,11 +47,13 @@ def _spawn(coro):
     t.add_done_callback(_tasks.discard)
 
 
-def _sess_key(rec: dict, rid: str) -> str:
-    """Claude 多轮会话的 key：项目 + 房间双维度。
+def _sess_key(rec: dict, rid: str, thread: str | None = None) -> str:
+    """Claude 多轮会话的 key：项目 + 房间，用户在线程里说话时再细分到线程。
     只按项目会让不同群 / 不同私聊用户落到同一 repo 时共用同一条会话而互相串台
-    （B 接着 A 的对话、看见 A 说过的话）。带上房间维度后各入口的会话互相隔离。"""
-    return f"{rec['id']}|{rid}"
+    （B 接着 A 的对话、看见 A 说过的话）；房间维度隔离各入口。thread=线程根 event_id：
+    线程会话在首次派活时从房间会话 fork（继承分叉点前的记忆，之后互相隔离，见 runner.ask）。"""
+    base = f"{rec['id']}|{rid}"
+    return f"{base}|{thread}" if thread else base
 
 
 def _last_proj_file() -> str:
