@@ -119,6 +119,15 @@ class Settings:
     transcript_max_lines     = _i("TRANSCRIPT_MAX_LINES", 5000)   # 每房间行数硬上限，兜底防膨胀
     transcript_backfill_days = _i("TRANSCRIPT_BACKFILL_DAYS", 30) # 回灌（从 Matrix 拉历史）默认往回多少天
 
+    # 聊天日摘要 + 主题索引：在原始逐字日志之上再叠一层可 KB 级检索的漏斗（store/transcripts/
+    # digests/<房间>/ 下），被问"昨天中午聊过什么 / 以前讨论过某某"时先按天定位摘要、按需回原文，
+    # 不必整段读原始日志。攒够量 / 跨天残留就后台用 CLAUDE_QUICK_MODEL 把当天对话压成话题摘要。
+    digest_enabled      = _b("DIGEST_ENABLED", True)
+    digest_min_lines    = _i("DIGEST_MIN_LINES", 30)      # 水位线后攒够这么多新行才触发（路径 a）
+    digest_min_interval = _i("DIGEST_MIN_INTERVAL", 7200) # 同房间两次摘要的最小间隔（秒），别太密
+    digest_keep_days    = _i("DIGEST_KEEP_DAYS", 180)     # 摘要保留天数，超期删日文件 + 同步删索引行
+    digest_tz_hours     = _i("DIGEST_TZ_HOURS", 8)        # 日期分桶 / HH:MM 显示用的固定时区偏移（东八区）
+
     # 项目长期记忆（跨会话 / 跨重启留存，补会话 TTL 之外的"长程记忆"短板）
     memory_enabled       = _b("MEMORY_ENABLED", True)
     memory_recall_budget = _i("MEMORY_RECALL_BUDGET", 6000)   # 注入系统提示的事实正文字符预算

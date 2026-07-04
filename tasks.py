@@ -21,6 +21,7 @@ import memory
 import issue_ledger
 import pr_ledger
 import transcript
+import digest
 import inflight
 import gitea
 import gitea_health
@@ -257,7 +258,11 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         sp = memory.augment_system_prompt(sp, rec["id"])   # 注入项目长期记忆（跨会话留存）
         prepare = lambda: projects.prepare_worktree(rec)
         _project_last_active[rec["id"]] = time.time()      # 标记活跃：自驱心跳会避让最近在弄的项目
-    sp = transcript.augment_system_prompt(sp, rid)   # 指给它本房间历史日志，便于回溯更早对话
+    # 两层历史检索分工：transcript 给原始逐字日志的**指针**（逐字回溯的最终落点）；
+    # digest 再叠一层**漏斗协议**——近 7 天主题索引已注入，引导先按天定位摘要、只在需要
+    # 逐字原话时才回原始日志切片，别整篇读。
+    sp = transcript.augment_system_prompt(sp, rid)
+    sp = digest.augment_system_prompt(sp, rid)
     sess = _sess_key(rec, rid, sess_thread)
     # 线程首次派活：从房间会话分叉（--fork-session）。fork_from 只在线程任务时传——
     # 显式 kwargs 组装，普通任务不带此参数（测试里的假 runner 不必都认识它）。
