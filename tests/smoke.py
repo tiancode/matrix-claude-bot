@@ -1468,7 +1468,7 @@ def test_dm_bind_binds_and_needs_url():
     settings.gitea_host = "https://gitea.example.com"
     state.client = FC()
     state._spawn = lambda coro: pend.append(coro)
-    bot.do_bind = lambda room, repo, ev, task: bound.append(repo)   # 同步桩：调用即记账
+    bot.do_bind = lambda room, repo, ev, task: bound.append((repo, task))   # 同步桩：记 (仓库, 任务正文)
     bot.projects.get_room = lambda rid: None
     try:
         async def go(body, eid):
@@ -1480,13 +1480,19 @@ def test_dm_bind_binds_and_needs_url():
                 elif hasattr(c, "close"):
                     c.close()
         asyncio.run(go("/bind https://gitea.example.com/o/r", "$dmb1"))
-        assert bound and bound[-1]["repo"] == "r"          # DM /bind 真的绑定了
+        assert bound and bound[-1][0]["repo"] == "r"        # DM /bind 真的绑定了
         assert not any("私聊不用绑定" in m for m in sent)   # 不再是"私聊不用绑定"
 
         del bound[:]
         asyncio.run(go("/bind", "$dmb2"))
         assert bound == []                                  # 没带仓库地址 → 不绑
         assert any("仓库地址" in m for m in sent)           # 给出用法引导
+
+        # 私聊里 URL 混在句子里（分诊已删）也要绑到它，并把剩下的话当任务派下去
+        del bound[:]
+        asyncio.run(go("帮我看看 https://gitea.example.com/o/r 有什么问题", "$dmb3"))
+        assert bound and bound[-1][0]["repo"] == "r"        # 嵌在句中的 URL 也绑
+        assert "有什么问题" in bound[-1][1]                 # URL 后的话作为任务带下去
     finally:
         (state.client, state._spawn, bot.do_bind, bot.projects.get_room) = orig
         settings.gitea_host = orig_host
@@ -1532,12 +1538,70 @@ def test_dm_binding_routes_and_unbinds():
     state.client = FC()
     bot.projects.get_room = lambda r: app if r == rid else None
     bot.projects.unbind = fake_unbind
+    bot._last_project_by_room[rid] = app["id"]            # 登记簿里也留着（handle_task 会写）
     try:
         asyncio.run(bot.handle_unbind(room))
     finally:
         (state.client, bot.projects.get_room, bot.projects.unbind) = orig2
+        bot._last_project_by_room.pop(rid, None)
     assert unbound == [rid]                               # 真的解绑了这条私聊
     assert any("解绑" in m for m in sent)                 # 有回执
+    assert rid not in bot._last_project_by_room           # 登记簿一并清掉：解绑后不再被心跳/健康度推消息
+
+
+# ---------- 43d) do_bind 幂等：重复绑同一个仓库不重置会话（重发 URL 别清掉多轮上下文）----------
+def test_do_bind_same_repo_keeps_session():
+    set_identity()
+    rid = "!dmidem:ex.org"
+    room = FakeRoom(rid, 2)                     # DM
+    rec = {"id": "h/o/r", "owner": "o", "repo": "r", "base": "main", "path": "/tmp"}
+    now = {"bound": None}
+    resets = []
+
+    async def fake_bind_room(r, info):
+        now["bound"] = rec
+        return rec
+
+    class FC:
+        async def room_send(self, *a, **k):
+            return types.SimpleNamespace(event_id="$x")
+
+    orig = (bot.projects.get_room, bot.projects.bind_room, bot.runner.reset, state.client)
+    bot.projects.get_room = lambda r: now["bound"]          # 反映当前绑定
+    bot.projects.bind_room = fake_bind_room
+    bot.runner.reset = lambda k: resets.append(k)
+    state.client = FC()
+    try:
+        asyncio.run(bot.do_bind(room, {"owner": "o", "repo": "r"}))   # 首次绑 → 重置
+        asyncio.run(bot.do_bind(room, {"owner": "o", "repo": "r"}))   # 再绑同一个 → 不重置
+    finally:
+        (bot.projects.get_room, bot.projects.bind_room, bot.runner.reset, state.client) = orig
+    assert len(resets) == 1, resets            # 只有真正建立绑定那次重置了会话，重发同仓库不清上下文
+
+
+# ---------- 43e) 自驱汇报口：同一仓库既绑群又绑私聊时优先群，别把团队汇报塞进私聊 ----------
+def test_heartbeat_home_room_prefers_group():
+    import heartbeat
+    set_identity()
+    pid = "h/o/r"
+    dm_rid, grp_rid = "!hbdm:ex.org", "!hbgrp:ex.org"
+
+    class FC:
+        def __init__(self):
+            self.rooms = {dm_rid: FakeRoom(dm_rid, 2), grp_rid: FakeRoom(grp_rid, 5)}
+
+    orig_rooms = dict(bot.projects._rooms)
+    orig_client = state.client
+    bot.projects._rooms.clear()
+    bot.projects._rooms[dm_rid] = pid           # 私聊先入（dict 顺序排在群前面）
+    bot.projects._rooms[grp_rid] = pid
+    state.client = FC()
+    try:
+        home = heartbeat._project_home_room(pid)
+    finally:
+        bot.projects._rooms.clear(); bot.projects._rooms.update(orig_rooms)
+        state.client = orig_client
+    assert home == grp_rid                      # 尽管私聊在前，仍选群（非私聊）作汇报口
 
 
 # ---------- 42) 会话 session_id 落盘：重启（新 runner）后仍能恢复，多轮不断 ----------
@@ -3338,6 +3402,8 @@ TESTS = [
     ("未绑定私聊=通用助手+引导绑定", test_dm_unbound_is_general_with_bind_hint),
     ("DM /bind 真绑定·无地址给引导", test_dm_bind_binds_and_needs_url),
     ("私聊绑定后直接路由+/unbind 解绑", test_dm_binding_routes_and_unbinds),
+    ("重复绑同仓库不重置会话", test_do_bind_same_repo_keeps_session),
+    ("自驱汇报口优先群不塞私聊", test_heartbeat_home_room_prefers_group),
     ("项目长期记忆 跨会话留存", test_project_memory),
     ("PR 台账 登记/持久化/销账", test_pr_ledger),
     ("从回复抽取本项目 PR 链接", test_extract_pr),

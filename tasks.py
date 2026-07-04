@@ -58,7 +58,7 @@ _HELP_TEXT = (
     "**怎么用**\n"
     "• 群里 @我 就能聊天/问问题；要派仓库的活先绑定：发 Gitea 仓库地址，或 `/bind <仓库URL>`\n"
     "• 然后 @我 派活；刚 @过我的几分钟内不必每句都 @（对话延续窗口）\n"
-    "• 私聊直接说，我自动判断是哪个项目；老盯着一个仓库可 `/bind <URL>` 定住它、`/unbind` 解绑\n"
+    "• 私聊发个仓库地址或 `/bind <URL>` 把它定住再派活；不绑也能闲聊/答疑，`/unbind` 解绑\n"
     "• 也可以不进 Matrix：在 Gitea 上把 issue **指派给我**，我会接单、开 PR（合并自动关单）并回报进展\n"
     "• 长任务我会边干边把进度更新到同一条消息；要文件我用附件发回来\n\n"
     "**命令**（群里不必 @ 也认）\n"
@@ -76,8 +76,8 @@ _HELP_TEXT = (
 
 _WELCOME = (
     "👋 我是 Claude Code 工程师 bot。@我（群里）或直接私聊就能派活：写代码、查问题、做方案，"
-    "改代码会自动开 PR；闲聊、问一般问题也行。要派仓库的活，群里先发个 Gitea 仓库地址或 "
-    "`/bind <URL>` 绑定本群。发 `帮助` 看完整用法"
+    "改代码会自动开 PR；闲聊、问一般问题也行。要派仓库的活，先发个 Gitea 仓库地址或 "
+    "`/bind <URL>` 绑定（群和私聊都行）。发 `帮助` 看完整用法"
     "（`/help` 会被 Matrix 客户端自己吞掉，用中文词 `帮助`）。"
 )
 
@@ -111,12 +111,16 @@ async def do_bind(room: MatrixRoom, repo: dict,
                   event: RoomMessageText | None = None, task_text: str = ""):
     rid = room.room_id
     try:
+        prev = projects.get_room(rid)   # 换绑判断：还是同一个仓库就别重置会话（重发 URL 不该清掉多轮上下文）
         await send(rid, f"⏳ 正在绑定并 clone {repo['owner']}/{repo['repo']} …")
         rec = await projects.bind_room(rid, repo)
-        runner.reset(_sess_key(rec, rid))  # 换仓库 → 重置本房间在该项目上的会话
-        where = ("之后这条私聊都按它来（换仓库再发 /bind，/unbind 回到按内容自动分诊）"
-                 if _is_dm(room) else "直接在群里派活就行")
-        await send(rid, f"✅ 已绑定 {rec['owner']}/{rec['repo']}（base: {rec['base']}）。{where}。")
+        if not prev or prev["id"] != rec["id"]:   # 真的换了仓库才重置本房间在该项目上的会话
+            runner.reset(_sess_key(rec, rid))
+            where = ("之后这条私聊都按它来（换仓库再发 /bind，/unbind 回到不绑闲聊）"
+                     if _is_dm(room) else "直接在群里派活就行")
+            await send(rid, f"✅ 已绑定 {rec['owner']}/{rec['repo']}（base: {rec['base']}）。{where}。")
+        else:
+            await send(rid, f"✅ 还是绑在 {rec['owner']}/{rec['repo']}（base: {rec['base']}），直接派活就行。")
     except Exception as e:
         log.exception("绑定失败")
         await send(rid, f"绑定失败：{e}")
@@ -127,17 +131,20 @@ async def do_bind(room: MatrixRoom, repo: dict,
 
 
 async def handle_unbind(room: MatrixRoom):
-    """/unbind：解除本房间/私聊的仓库绑定。群 → 回到未绑定闲聊；私聊 → 回到按内容自动分诊。
-    只清房间→项目映射，项目记录 / 本地 clone 保留（别的房间或分诊路由可能还在用）。"""
+    """/unbind：解除本房间/私聊的仓库绑定，回到「未绑定＝通用助手陪聊」。
+    只清房间→项目映射，项目记录 / 本地 clone 保留（别的房间可能还在用）。"""
     rid = room.room_id
     bound = projects.get_room(rid)
     if not bound:
-        await send(rid, "这条私聊本来就没绑定，按内容自动分诊。" if _is_dm(room)
+        await send(rid, "这条私聊本来就没绑定，直接说要干什么就行。" if _is_dm(room)
                         else "这个群还没绑定仓库。")
         return
     await projects.unbind(rid)
+    # 项目登记簿也一并清掉，否则自驱心跳 / Gitea 健康度还会把这个房间当"在弄该项目"继续推消息
+    if _last_project_by_room.pop(rid, None) is not None:
+        _save_last_projects()
     if _is_dm(room):
-        await send(rid, f"已解绑 {bound['owner']}/{bound['repo']} ✅ 之后按内容自动分诊；"
+        await send(rid, f"已解绑 {bound['owner']}/{bound['repo']} ✅ 现在不绑任何仓库，当通用助手陪聊；"
                         f"要再定住某个仓库发 /bind <URL>。")
     else:
         await send(rid, f"已解绑 {bound['owner']}/{bound['repo']} ✅ 群回到未绑定状态"
@@ -358,9 +365,7 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
 
             # 解析/clone + 跑任务整段都开着"正在输入"，避免绑定首次 clone 时房间静默
             async with _typing(rid):
-                rec = await _dispatch(room)
-                if rec is None:
-                    return
+                rec = await _dispatch(room)   # 总返回一条 rec：绑定项目 or 通用助手（不再有 None）
                 if not rec.get("general"):   # 通用助手不是项目，别记进项目登记簿
                     _last_project_by_room[rid] = rec["id"]
                     _save_last_projects()   # 落盘：记录"这个房间在弄哪个项目"，供自驱心跳/Gitea 健康度找汇报口
