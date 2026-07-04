@@ -47,6 +47,10 @@ STATUS_CMDS = {"/status", "状态"}                                   # 也认 "
 
 
 
+UNBIND_CMDS = {"/unbind", "解绑", "取消绑定"}                        # 解除本房间/私聊的仓库绑定
+
+
+
 _HELP_TEXT = (
     "**我能干嘛**\n"
     "我是接到 Matrix 的 Claude Code 工程师：群里 @我 或私聊我就能派活——写代码、查问题、做方案，"
@@ -54,13 +58,13 @@ _HELP_TEXT = (
     "**怎么用**\n"
     "• 群里 @我 就能聊天/问问题；要派仓库的活先绑定：发 Gitea 仓库地址，或 `/bind <仓库URL>`\n"
     "• 然后 @我 派活；刚 @过我的几分钟内不必每句都 @（对话延续窗口）\n"
-    "• 私聊直接说，我自动判断是哪个项目\n"
+    "• 私聊直接说，我自动判断是哪个项目；老盯着一个仓库可 `/bind <URL>` 定住它、`/unbind` 解绑\n"
     "• 也可以不进 Matrix：在 Gitea 上把 issue **指派给我**，我会接单、开 PR（合并自动关单）并回报进展\n"
     "• 长任务我会边干边把进度更新到同一条消息；要文件我用附件发回来\n\n"
     "**命令**（群里不必 @ 也认）\n"
     "• `帮助` / `用法` 看这个——注意 `/help` 会被 Matrix 客户端当自带命令吞掉，发不到我这，\n"
     "  想发斜杠命令用中文词、或 `//help`（双斜杠发字面文本）、或 @我 带上命令\n"
-    "• `/bind <URL>` 绑定本群到仓库\n"
+    "• `/bind <URL>` 把本群 / 本私聊定到某仓库（私聊也能绑）；`/unbind` 解绑\n"
     "• `/status` 看我当前状态（项目 / 正在跑的任务 / 在跟的 PR）\n"
     "• `/summarize [N]` 小结最近 N 条对话（catch me up）\n"
     "• `/cancel` 停掉我正在跑的任务\n"
@@ -110,13 +114,34 @@ async def do_bind(room: MatrixRoom, repo: dict,
         await send(rid, f"⏳ 正在绑定并 clone {repo['owner']}/{repo['repo']} …")
         rec = await projects.bind_room(rid, repo)
         runner.reset(_sess_key(rec, rid))  # 换仓库 → 重置本房间在该项目上的会话
-        await send(rid, f"✅ 已绑定 {rec['owner']}/{rec['repo']}（base: {rec['base']}）。直接在群里派活就行。")
+        where = ("之后这条私聊都按它来（换仓库再发 /bind，/unbind 回到按内容自动分诊）"
+                 if _is_dm(room) else "直接在群里派活就行")
+        await send(rid, f"✅ 已绑定 {rec['owner']}/{rec['repo']}（base: {rec['base']}）。{where}。")
     except Exception as e:
         log.exception("绑定失败")
         await send(rid, f"绑定失败：{e}")
         return
     if task_text and event is not None:   # 绑定后若还跟了任务，接着派下去
         await handle_task(room, event, task_text)
+
+
+
+async def handle_unbind(room: MatrixRoom):
+    """/unbind：解除本房间/私聊的仓库绑定。群 → 回到未绑定闲聊；私聊 → 回到按内容自动分诊。
+    只清房间→项目映射，项目记录 / 本地 clone 保留（别的房间或分诊路由可能还在用）。"""
+    rid = room.room_id
+    bound = projects.get_room(rid)
+    if not bound:
+        await send(rid, "这条私聊本来就没绑定，按内容自动分诊。" if _is_dm(room)
+                        else "这个群还没绑定仓库。")
+        return
+    await projects.unbind(rid)
+    if _is_dm(room):
+        await send(rid, f"已解绑 {bound['owner']}/{bound['repo']} ✅ 之后按内容自动分诊；"
+                        f"要再定住某个仓库发 /bind <URL>。")
+    else:
+        await send(rid, f"已解绑 {bound['owner']}/{bound['repo']} ✅ 群回到未绑定状态"
+                        f"（可继续闲聊，派仓库活再发地址或 /bind <URL>）。")
 
 
 
@@ -319,9 +344,8 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
         # 回执：接手就给触发消息打 👀，处理完（含报错/取消）撤掉——用户不用盯 typing 猜有没有人接
         async with _ack(rid, getattr(event, "event_id", None)):
             if text.strip() in RESET_CMDS:
-                if not _is_dm(room):
-                    rec = projects.get_room(rid)
-                else:  # 私聊没有房间绑定，按这个 DM 最近一次路由到的项目来重置
+                rec = projects.get_room(rid)   # 群按房间绑定；私聊若也绑了就按绑定来
+                if rec is None and _is_dm(room):  # 未绑定私聊：按这个 DM 最近一次路由到的项目
                     pid = _last_project_by_room.get(rid)
                     rec = projects.get_project(pid) if pid else None
                 if rec:
@@ -422,10 +446,13 @@ async def handle_status(room: MatrixRoom):
     给用户一个"你现在在干嘛 / 盯着啥"的窗口，不用翻日志。"""
     rid = room.room_id
     lines = ["📊 **当前状态**"]
-    if not _is_dm(room):
-        rec = projects.get_room(rid)
-        lines.append(f"• 项目：{rec['owner']}/{rec['repo']}（base: {rec['base']}）" if rec
-                     else "• 项目：未绑定（发仓库地址或 /bind <URL>）")
+    rec = projects.get_room(rid)   # 群 / 私聊的显式绑定优先
+    if rec:
+        # 私聊绑定后固定路由到它，措辞点明可解绑；群沿用原 base 文案
+        pinned = "（已绑定，消息都归它；/unbind 回到自动分诊）" if _is_dm(room) else f"（base: {rec['base']}）"
+        lines.append(f"• 项目：{rec['owner']}/{rec['repo']}{pinned}")
+    elif not _is_dm(room):
+        lines.append("• 项目：未绑定（发仓库地址或 /bind <URL>）")
     else:
         pid = _last_project_by_room.get(rid)
         rec = projects.get_project(pid) if pid else None

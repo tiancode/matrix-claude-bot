@@ -109,16 +109,19 @@ async def _dispatch(room: MatrixRoom, event: RoomMessageText, text: str,
 
     # DM：自动分诊到对应项目。每条路由都要过 ensure_project——本地 checkout 可能被删/没 clone，
     # 不校验 Claude 会在空目录里干活。
-    repo = parse_repo_url(text)                  # 1) 消息里带仓库链接
+    repo = parse_repo_url(text)                  # 1) 消息里带仓库链接（强信号，能切换/换绑，优先于已绑定）
     if repo:
         return await projects.ensure_project(repo)
     known = projects.list_projects()
-    exact = _match_project_exact(text, known)    # 2) 强信号：owner/repo 或完整 id
+    exact = _match_project_exact(text, known)    # 2) 强信号：owner/repo 或完整 id（同样可切换已绑定）
     if exact:
         return await projects.ensure_project(exact)
-    if not known:                                # 3) 还没有任何已知项目：当通用助手答一般性问题
+    bound = projects.get_room(rid)               # 3) 这条私聊显式绑了仓库：无强信号一律落到它、跳过分诊
+    if bound:                                    #    （绑定=固定项目；切换发仓库 URL / 点名，或 /unbind 解绑）
+        return await projects.ensure_project(bound)
+    if not known:                                # 4) 还没有任何已知项目：当通用助手答一般性问题
         return _general_rec()                     #    （要做某仓库的活，欢迎语已指引发 Gitea 地址来绑定）
-    sender = room.user_name(event.sender) or event.sender    # 4) 轻量分诊（带最近对话，剔除当前这条）
+    sender = room.user_name(event.sender) or event.sender    # 5) 轻量分诊（带最近对话，剔除当前这条）
     cur = (skip_body if skip_body is not None
            else _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {})))
     pid = await _triage(text, known, _format_context(rid, skip=(sender, cur)))
@@ -128,15 +131,15 @@ async def _dispatch(room: MatrixRoom, event: RoomMessageText, text: str,
         rec = projects.get_project(pid)
         if rec:
             return await projects.ensure_project(rec)
-    loose = _match_project_by_repo_name(text, known)   # 5) 兜底：裸仓库名（分诊放弃后才用）
+    loose = _match_project_by_repo_name(text, known)   # 6) 兜底：裸仓库名（分诊放弃后才用）
     if loose:
         return await projects.ensure_project(loose)
-    last_pid = _last_project_by_room.get(rid)    # 6) 仍判不出 → 沿用这个 DM 上次的项目，
+    last_pid = _last_project_by_room.get(rid)    # 7) 仍判不出 → 沿用这个 DM 上次的项目，
     if last_pid:                                 #    别让多轮对话里每条延续消息都被反问"这是关于哪个项目的"
         rec = projects.get_project(last_pid)
         if rec:
             return await projects.ensure_project(rec)
-    lst = "\n".join(f"- {p['owner']}/{p['repo']}" for p in known)   # 7) 实在不行才反问
+    lst = "\n".join(f"- {p['owner']}/{p['repo']}" for p in known)   # 8) 实在不行才反问
     await send(rid, f"这条是关于哪个项目的？回复项目名或发仓库地址：\n{lst}")
     return None
 
