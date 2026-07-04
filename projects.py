@@ -280,12 +280,16 @@ class Projects:
         """每次派活前把工作树拉回干净的 origin/base：fetch 一次，丢弃上个任务残留的脏改动 /
         半截分支 / 未跟踪文件，免得在脏的或过期的状态上接着开工、把改动串进下一个 PR。
 
+        未提交的残留不直接删：先 auto-stash 寄存到 refs/stash（含未跟踪文件），清干净照常从
+        干净 base 开工，但「忘了提交就永久丢」变成「git stash list 随时能捞回」。
+
         必须在 runner 的 checkout 串行锁内调用（由 ask(prepare=...) 保证），别和同仓库的别的任务并发。
         best-effort：fetch/checkout 失败只告警，仍按现状把活派下去，免得离线时彻底卡死。"""
         path = rec.get("path")
         base = rec.get("base") or "main"
         if not path or not os.path.isdir(os.path.join(path, ".git")):
             return
+        await self._stash_dirty(path, rec)   # 先把脏树寄存住，别让下面的 checkout -f/reset/clean 把没提交的活删没
         await _git("fetch", "--prune", "origin", cwd=path)
         rc, _, _ = await _git("rev-parse", "--verify", "--quiet",
                               f"refs/remotes/origin/{base}", cwd=path)
@@ -298,6 +302,24 @@ class Projects:
             return
         await _git("reset", "--hard", target, cwd=path)
         await _git("clean", "-fd", cwd=path)
+
+    @staticmethod
+    async def _stash_dirty(path: str, rec: dict) -> None:
+        """派活前若工作树有未提交改动/未跟踪文件，先 auto-stash（含 -u 未跟踪）到 refs/stash，
+        免得随后的 checkout -f / reset --hard / clean -fd 把没 commit 的活永久删掉——
+        stash 不随 reset/clean 丢，用 `git stash list` 可捞回。best-effort：失败只告警照常派活。"""
+        rc, out, _ = await _git("status", "--porcelain", cwd=path)
+        if rc != 0 or not out.strip():
+            return                                     # 查不了或本就干净 → 无需寄存
+        _, br, _ = await _git("rev-parse", "--abbrev-ref", "HEAD", cwd=path)
+        label = str(rec.get("id") or rec.get("name") or "").strip()
+        msg = f"auto-park before task {label}".rstrip() + f" (was on {br.strip() or '?'})"
+        rc2, _, err = await _git("stash", "push", "--include-untracked", "-m", msg, cwd=path)
+        if rc2 != 0:
+            log.warning("prepare_worktree: auto-stash 失败，未提交的改动可能随 reset 丢失：%s",
+                        redact(err.strip())[:200])
+        else:
+            log.info("prepare_worktree: 已寄存脏工作树到 stash「%s」，git stash list 可捞回", msg)
 
     @staticmethod
     async def _detect_base(local: str) -> str:

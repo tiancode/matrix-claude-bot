@@ -1417,6 +1417,37 @@ def test_prepare_worktree_resets():
     assert any(a[0] == "checkout" and "-f" in a and "-B" in a for a in calls)  # 强制切回 base
     assert any(a[0] == "reset" and "--hard" in a for a in calls)     # 对齐 origin/base
     assert any(a[0] == "clean" for a in calls)                       # 清掉未跟踪残留
+    assert not any(a[0] == "stash" for a in calls)                   # 干净树（status 回空）不寄存
+
+
+# ---------- 40b) 脏树派活前先 auto-stash 寄存（含未跟踪），且发生在 reset --hard 之前 ----------
+def test_prepare_worktree_stashes_dirty():
+    import tempfile
+    import projects as pmod
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, ".git"))
+    calls = []
+
+    async def fake_git(*args, cwd=None):
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            return 0, " M foo.py\n?? bar.txt\n", ""   # 装成脏树 + 未跟踪文件
+        if args[:2] == ("rev-parse", "--abbrev-ref"):
+            return 0, "claude/wip\n", ""
+        return 0, "", ""
+
+    orig = pmod._git
+    pmod._git = fake_git
+    try:
+        asyncio.run(pmod.projects.prepare_worktree({"path": d, "base": "main"}))
+    finally:
+        pmod._git = orig
+    # 寄存发生了，且带 -u（含未跟踪）
+    assert any(a[0] == "stash" and "push" in a and "--include-untracked" in a for a in calls)
+    # 且寄存在 reset --hard 之前——先停住脏活，再清干净
+    stash_i = next(i for i, a in enumerate(calls) if a[0] == "stash")
+    reset_i = next(i for i, a in enumerate(calls) if a[0] == "reset" and "--hard" in a)
+    assert stash_i < reset_i
 
 
 # ---------- 41) 触发词按词边界匹配（claude 不命中 claudette），CJK 词按子串 ----------
@@ -3397,6 +3428,7 @@ TESTS = [
     ("会话 key 按项目+房间隔离", test_session_key_per_room),
     ("默认分支带斜杠不被截断", test_detect_base_slash_branch),
     ("派活前清回干净 base", test_prepare_worktree_resets),
+    ("脏树派活前先 auto-stash 寄存", test_prepare_worktree_stashes_dirty),
     ("触发词按词边界匹配", test_trigger_word_boundary),
     ("会话落盘重启可恢复", test_sessions_persisted_across_restart),
     ("未绑定私聊=通用助手+引导绑定", test_dm_unbound_is_general_with_bind_hint),
