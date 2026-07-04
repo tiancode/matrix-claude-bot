@@ -19,6 +19,10 @@ from nio import (
     AsyncClient,
     AsyncClientConfig,
     InviteMemberEvent,
+    KeyVerificationCancel,
+    KeyVerificationKey,
+    KeyVerificationMac,
+    KeyVerificationStart,
     LocalProtocolError,
     LoginResponse,
     MatrixRoom,
@@ -27,6 +31,7 @@ from nio import (
     RoomMemberEvent,
     RoomMessageMedia,
     RoomMessageText,
+    ToDeviceError,
     WhoamiResponse,
 )
 
@@ -224,6 +229,48 @@ async def on_undecrypted(room: MatrixRoom, event: MegolmEvent):
                    "稍等重发一次试试；还不行就在客户端里验证一下我这个设备。")
     except Exception:
         log.exception("发送解密失败提示失败 %s", room.room_id)
+
+
+async def on_key_verification(event):
+    """自动完成对方发起的 SAS 设备验证（emoji/数字比对），让 bot 这个设备可被验证、
+    不再一直转圈。采用"信任优先"策略：不真去核对 emoji，直接确认——bot 是你自有的可信设备，
+    在客户端点了验证就视同认可。
+
+    仅覆盖 legacy 的 to-device SAS 流程（start→accept→key→mac）。nio 0.25.2 不认
+    m.key.verification.request 起手式、也没有交叉签名能力，所以对方客户端若只走"交叉签名/
+    用户验证"而不给 SAS，本回调收不到事件；那种情况开了 E2E 后设备至少不再转圈（有密钥、
+    显示为"未验证"而非空转）。失败只记日志，绝不影响正常收发。"""
+    client = state.client
+    tx = getattr(event, "transaction_id", None)
+    try:
+        if isinstance(event, KeyVerificationStart):
+            if "emoji" not in (event.short_authentication_string or []):
+                # 对方不支持 emoji SAS，无法比对，直接取消（reject）而不是悬着让它转圈
+                await client.cancel_key_verification(tx, reject=True)
+                return
+            resp = await client.accept_key_verification(tx)
+            if isinstance(resp, ToDeviceError):
+                log.warning("接受验证失败: %s", resp)
+                return
+            sas = client.key_verifications.get(tx)
+            if sas is not None:
+                await client.to_device(sas.share_key())
+        elif isinstance(event, KeyVerificationKey):
+            # 收到对方公钥即自动确认短串匹配（信任优先，不做人工 emoji 核对）
+            await client.confirm_short_auth_string(tx)
+        elif isinstance(event, KeyVerificationMac):
+            sas = client.key_verifications.get(tx)
+            if sas is None:
+                return
+            try:
+                msg = sas.get_mac()
+            except LocalProtocolError:
+                return   # SAS 尚未双方确认，还不能发 MAC；等下一步
+            await client.to_device(msg)
+        elif isinstance(event, KeyVerificationCancel):
+            log.info("对方取消了设备验证: %s", getattr(event, "reason", ""))
+    except Exception:
+        log.exception("自动设备验证处理失败 (tx=%s)", tx)
 
 
 async def on_member(room: MatrixRoom, event: RoomMemberEvent):
@@ -475,6 +522,10 @@ async def main():
     state.client.add_event_callback(on_invite, InviteMemberEvent)
     state.client.add_event_callback(on_member, RoomMemberEvent)
     state.client.add_event_callback(on_undecrypted, MegolmEvent)  # 解不开的加密消息：要密钥+提示，别沉默
+    if state.E2E:   # 开了 E2E 才有 olm 能跑 SAS：自动完成对方发起的设备验证，别让 bot 设备一直转圈
+        state.client.add_to_device_callback(
+            on_key_verification,
+            (KeyVerificationStart, KeyVerificationKey, KeyVerificationMac, KeyVerificationCancel))
 
     # 初始同步消化积压（此时 _synced 仍 False，被 on_message 挡掉），之后才处理新消息
     await state.client.sync(timeout=30000, full_state=True)
