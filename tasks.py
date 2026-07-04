@@ -117,6 +117,8 @@ async def do_bind(room: MatrixRoom, repo: dict,
         rec = await projects.bind_room(rid, repo)
         if not prev or prev["id"] != rec["id"]:   # 真的换了仓库才重置本房间在该项目上的会话
             runner.reset(_sess_key(rec, rid))
+            _clear_dispatched(rid)   # 会话换了 → 旧 dispatched 标记指向的是没了的会话，作废它们，
+                                     # 否则新会话续接轮会误把这些跨上下文的旧消息从背景剔掉（它们不在新会话里）
             where = ("之后这条私聊都按它来（换仓库再发 /bind，/unbind 回到不绑闲聊）"
                      if _is_dm(room) else "直接在群里派活就行")
             await send(rid, f"✅ 已绑定 {rec['owner']}/{rec['repo']}（base: {rec['base']}）。{where}。")
@@ -214,6 +216,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     要隔离的串台源），只补一行线程起点。"""
     rid = room.room_id
     sender = room.user_name(event.sender) or event.sender
+    mark_after = None   # 顶层任务：等派活【成功】后再把这条标 dispatched（见下方 log「完成」处），
+                        # 别在 ask 之前抢标——否则取消/报错、根本没进会话的消息也被标，下轮反被剔出背景
     if sess_thread:   # 线程任务：背景只带线程起点；fork 前的房间历史已在父会话里，fork 后要的就是隔离
         origin = await _thread_origin_line(room, sess_thread)
         ctx = f"—— 本线程起点 ——\n{origin}" if origin else ""
@@ -225,7 +229,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         resuming = runner.session_ts(_sess_key(rec, rid)) is not None
         ctx = _format_context(rid, skip=(sender, cur_body), drop_sender=state.MY_NAME or None,
                               drop_dispatched=resuming)
-        _mark_dispatched(rid, sender, cur_body)   # 这条这轮要派出去 → 进会话，下轮当背景时剔掉它
+        mark_after = (sender, cur_body)   # 成功派活后再标 dispatched（见下方），进了会话才算数
     if ctx:
         prompt = (
             "【所在会话最近的对话，仅供背景参考；带时间，可能跨较长时间，自行判断哪些与当前任务相关】\n"
@@ -314,6 +318,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             answer = await _emit_files(room, answer, cwd, thread_root)
             await send(rid, answer, track=True, thread_root=thread_root, reply_to=_reply_eid())
         log.info("[%s] 完成 %d 字", rid, len(answer))
+        if mark_after:   # 走到这里 = ask 成功、答复已发：这条确实进了会话，现在才标 dispatched，下轮背景剔掉它
+            _mark_dispatched(rid, *mark_after)
         if not rec.get("general"):   # 回复里若开了本项目的 PR，记进台账，由跟进循环盯到合并
             pr = _extract_pr(answer, rec)
             if pr and pr_ledger.record(rec["id"], pr[0], pr[1], rid):
@@ -343,15 +349,18 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
     if thr is None and settings.reply_in_thread and not _is_dm(room):
         thr = _thread_root_of(event)
     # 引用回复决策器：发送/占位那一刻若群里已插进别的消息（长任务期间常有），改用引用回复
-    # 指明在回哪条；房间安静就顶层直答。按对象身份比对上下文尾巴，同文本消息也不误判。
+    # 指明在回哪条；房间安静就顶层直答。用尾条的 (ts,sender,body) 作稳定标识比对：别用对象身份——
+    # _mark_dispatched 会把这条触发消息就地换成带 dispatched 标记的新元组，身份变了但并非新消息，
+    # 用身份比会把每条顶层群回复都误判成「群里插了话」而强行引用回复。(ts,sender,body) 对同文本
+    # 消息也不误判（各自 append 时的 ts 不同）。
     reply_to = None
     if thr is None and not _is_dm(room):
         dq = _context[rid]
-        tail_at_start = dq[-1] if dq else None
+        tail_at_start = tuple(dq[-1][:3]) if dq else None
         trigger_eid = getattr(event, "event_id", None)
 
         def reply_to():
-            return trigger_eid if (dq and dq[-1] is not tail_at_start) else None
+            return trigger_eid if (dq and tuple(dq[-1][:3]) != tail_at_start) else None
     try:
         if not text.strip():
             return

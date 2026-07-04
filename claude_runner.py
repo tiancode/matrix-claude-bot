@@ -412,6 +412,14 @@ class ClaudeRunner:
                 # 是接着父对话往下走（--resume 父 sid），跟续接轮同理：算续接、不算新任务，故这里判 fresh
                 # 必须在上面的 fork 解析【之后】——否则 fork 时 sid 还是 None 会被误判成新任务而 reset。
                 fresh = sid is None
+                if expired and on_reset is not None:
+                    # 拿到锁时才发现会话已过 TTL → 本轮要全新开；但拼 prompt 那刻会话还在，调用方可能已按
+                    # 「续接」裁掉派过的消息（drop_dispatched）。这里 sid 从一开始就是 None，走不到下面
+                    # 「resume 被拒」的回调，必须在此单独通知，别让被裁的消息两头落空（背景没、新会话也没）。
+                    try:
+                        on_reset()
+                    except Exception:
+                        log.exception("on_reset 回调失败（继续全新开）")
                 # prepare（把工作树拉回干净 base）只在「新任务」跑一次：续接同一场对话（含 fork 分叉）时
                 # 跳过，否则上一轮还没提交的活会被这一轮 reset 冲掉。reset 跟会话生命周期走、不跟每条
                 # 消息走（全新任务的首条→会 reset；续接轮和 fork 出的新线程都不会）。

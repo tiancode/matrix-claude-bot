@@ -7,7 +7,7 @@ from nio import MatrixRoom, RoomMessageText
 from config import settings
 import state
 from state import _sent_events, _group_engaged, _ctx_thread
-from matrix_io import _is_dm
+from matrix_io import _is_dm, _thread_of
 
 
 ACTIONABLE_HINTS = ("?", "？", "帮", "求", "怎么", "如何", "能不能", "可以吗",
@@ -175,8 +175,12 @@ def _address_kind(room: MatrixRoom, event: RoomMessageText) -> tuple[str, str]:
 
     # 对话延续窗口：刚和 bot 聊过的人，短时间内免重复 @ 接着说也当成点名（多轮不必每句点名）。
     # 但若这条是【回复别人的消息】（in_reply_to 非 bot），说明在跟别人说，不算续话。
+    # 且这条必须在【主时间线】：线程里的消息属另一场对话，不能当顶层续话——用线程关系(_thread_of)判，
+    # 别只靠 in_reply_to，因为有的客户端/桥接发 m.thread 时不带 m.in_reply_to 回退块，会漏判成顶层，
+    # 结果拿顶层上下文去判这条线程消息「是不是找我」（连它本身都不在渲染的上下文里）。
     sender_name = room.user_name(event.sender) or event.sender
-    if not in_reply_to and _in_followup_window(room.room_id, event.sender, sender_name, content):
+    if (not in_reply_to and _thread_of(event) is None
+            and _in_followup_window(room.room_id, event.sender, sender_name, content)):
         return "weak", task_text.strip()
 
     return "", task_text.strip()

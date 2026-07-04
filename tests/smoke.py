@@ -651,6 +651,36 @@ def test_followup_semantic_window():
         bot._context[rid].clear()
 
 
+# ---------- 8b'') 线程里的消息不当顶层 weak 续话（哪怕客户端没发 m.in_reply_to 回退块）----------
+def test_thread_msg_not_top_level_weak():
+    import types
+    set_identity()
+    rid = "!thrfollow:ex.org"
+    room = FakeRoom(rid, 3)
+    orig = (settings.group_followup_window, settings.followup_semantic_window)
+    settings.group_followup_window = 180
+    settings.followup_semantic_window = 1800
+    bot._group_engaged.clear()
+    bot._context[rid].clear()
+    try:
+        bot._mark_engaged(rid, "@alice:ex.org")   # alice 在主时间线刚 @ 过
+        # 顶层裸消息 → weak（对照组）
+        k, _ = bot._address_kind(room, make_event("接着讲", sender="@alice:ex.org"))
+        assert k == "weak"
+        # 线程里的消息（m.thread，且【不带】m.in_reply_to 回退）：老代码只看 in_reply_to 会漏判成顶层 weak，
+        # 拿顶层上下文误判「是不是找我」。现在用线程关系稳健排除 → 归 ""（不当顶层续话）
+        thr_ev = types.SimpleNamespace(
+            body="接着讲", sender="@alice:ex.org", event_id="$t1",
+            server_timestamp=int(time.time() * 1000),
+            source={"content": {"m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}}})
+        k, _ = bot._address_kind(room, thr_ev)
+        assert k == ""
+    finally:
+        settings.group_followup_window, settings.followup_semantic_window = orig
+        bot._group_engaged.clear()
+        bot._context[rid].clear()
+
+
 # ---------- 8c) 续话语义闸：__NO__ 拦下、__YES__/出错放行 ----------
 def test_followup_semantic_gate():
     import proactive
@@ -1398,6 +1428,38 @@ def test_dispatched_cleared_on_resume_failure():
         bot._context[rid].clear()
     assert "改 A" not in caught[1]   # 第二轮（on_reset 之前拼的）确实剔了改 A —— 单轮降级
     assert "改 A" in caught[2]       # ★关键：resume 失败没让改 A 永久丢，第三轮背景把它带回来了
+
+
+# ---------- 32f) dispatched 只在派活【成功】后才标：取消/报错没进会话的消息不该被标（否则下轮误剔）----------
+def test_dispatched_not_marked_on_cancel():
+    import types, claude_runner
+    set_identity()
+    rid = "!dispcancel:ex.org"
+    room = FakeRoom(rid, 2)
+    bot._context[rid].clear()
+
+    class R:
+        def busy(self, k): return False
+        def running(self, k): return 0
+        def session_ts(self, k): return None
+        async def ask(self, key, prompt, **_kw):
+            raise claude_runner.ClaudeCancelled()   # 模拟 /cancel：ask 抛取消，这条根本没进会话
+
+    class FC:
+        async def room_send(self, *a, **k): return types.SimpleNamespace(event_id="$x")
+
+    rec = {"id": "p", "owner": "o", "repo": "r", "path": "/tmp", "base": "main", "host": "https://h"}
+    orig = (tasks.runner, state.client, settings.stream_replies)
+    tasks.runner, state.client = R(), FC()
+    settings.stream_replies = False
+    try:
+        bot._context[rid].append((time.time(), "Alice", "改 X", None))
+        asyncio.run(bot._run_on_project(room, make_event("改 X", event_id="$e1"), "改 X", rec, skip_body="改 X"))
+        marked = state._ctx_dispatched(bot._context[rid][0])   # 取消后先读，别等 finally 清了再读
+    finally:
+        (tasks.runner, state.client, settings.stream_replies) = orig
+        bot._context[rid].clear()
+    assert marked is False   # 被取消、没进会话 → 不该标 dispatched
 
 
 # ---------- 33) 发送被限流：退避重试而非直接丢块 ----------
@@ -2999,13 +3061,16 @@ def test_group_flat_reply_and_smart_quote():
     orig = (settings.stream_replies, settings.reply_in_thread)
     settings.stream_replies = False; settings.reply_in_thread = False
     try:
-        # ① 安静群：任务期间没人插话 → 顶层直答，无任何 m.relates_to
+        # ① 安静群：任务期间没人插话 → 顶层直答，无任何 m.relates_to。
+        # 上下文里存的是 on_message 落的【原始正文】（带@），与 _run_on_project 里 cur_body 一致，
+        # 于是 _mark_dispatched 会命中这条尾消息、就地换成带 dispatched 标记的新元组——回归点：引用回复
+        # 决策器若用对象身份比对尾条，会因这次换元组误判成「群里插了话」而错误引用回复。
         bot._context[rid].clear()
-        bot._context[rid].append((time.time(), "Alice", "干活A"))   # 触发消息已入上下文（on_message 干的）
+        bot._context[rid].append((time.time(), "Alice", "@claude-bot 干活A"))   # on_message 存的原始正文
         asyncio.run(bot.handle_task(
             room, make_event("@claude-bot 干活A", mentions=[state.MY_ID], event_id="$QA"), "干活A"))
         ans = [m for m in c.sent if m.get("body") == "搞定"]
-        assert ans and "m.relates_to" not in ans[0]
+        assert ans and "m.relates_to" not in ans[0]   # 安静群仍顶层直答（_mark_dispatched 换元组不该触发引用）
 
         # ② 任务期间群里插进了别的消息 → 答复改用引用回复指明在回哪条
         c.sent.clear()
@@ -3124,6 +3189,30 @@ def test_runner_fork_session():
     assert asyncio.run(r2.ask("p3|room|$T", "hi", fork_from="p3|room")) == "ok"
     assert "p3|room" not in r2._sessions                               # 失效的是父，父被清
     assert r2._sessions["p3|room|$T"][0] == "SID-NEW"
+
+
+def test_runner_on_reset_fires_on_expired_session():
+    """会话在拿到锁前已过 TTL → ask 全新开（sid 一开始就是 None，走不到「resume 被拒」分支）；
+    on_reset 仍须回调，否则调用方按「续接」预判裁掉的背景消息两头落空。全新 key（本无会话）则不回调。"""
+    set_identity()
+    r = claude_runner.ClaudeRunner()
+    r._sessions["proj|room"] = ("SID-OLD", time.time() - 10 ** 9)      # 早已过期的会话
+
+    async def fake_run(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+        return 0, json.dumps({"result": "ok", "session_id": "SID-NEW"}).encode(), b""
+    r._run = fake_run
+
+    fired = {"n": 0}
+    ans = asyncio.run(r.ask("proj|room", "hi",
+                            on_reset=lambda: fired.__setitem__("n", fired["n"] + 1)))
+    assert "ok" in ans                                                # 过期会前缀「已开启新对话」，故只查包含
+    assert fired["n"] == 1                                             # 过期→全新开 → on_reset 触发一次
+    assert r._sessions["proj|room"][0] == "SID-NEW"                    # 新会话已存下
+
+    fresh = {"n": 0}                                                  # 全新 key：本就没会话可续，不该回调
+    assert asyncio.run(r.ask("brandnew|room", "hi",
+                             on_reset=lambda: fresh.__setitem__("n", fresh["n"] + 1))) == "ok"
+    assert fresh["n"] == 0
 
 
 def test_thread_scoped_session_forks():
@@ -3635,6 +3724,7 @@ TESTS = [
     ("未绑定群当通用助手聊", test_group_unbound_chat_general),
     ("任务回执 👀 打上/撤掉", test_task_ack_reaction),
     ("runner 会话分叉 fork/续/父失效", test_runner_fork_session),
+    ("runner 会话过期全新开触发 on_reset", test_runner_on_reset_fires_on_expired_session),
     ("线程会话细分+起点背景+线程reset", test_thread_scoped_session_forks),
     ("/help + 进房欢迎", test_help_and_welcome),
     ("/summarize 小结最近对话", test_summarize_command),
@@ -3656,6 +3746,7 @@ TESTS = [
     ("续话窗口第三人插话作废+强弱分级", test_followup_window_third_party_invalidates),
     ("_address_kind 强/弱信号分级", test_address_kind_strong_vs_weak),
     ("续话软窗口 硬窗外交给语义闸", test_followup_semantic_window),
+    ("线程消息不当顶层weak续话", test_thread_msg_not_top_level_weak),
     ("续话语义闸 NO拦下/YES/出错放行", test_followup_semantic_gate),
     ("/reset 清空背景上下文", test_reset_clears_context),
     ("重试仅限会话失效", test_retry_only_on_session_error),
@@ -3684,6 +3775,7 @@ TESTS = [
     ("续接剔掉派过的用户消息", test_context_drop_dispatched),
     ("端到端 续接背景不重复派过的", test_run_drops_dispatched_on_resume),
     ("resume 失效回退清 dispatched 不丢上下文", test_dispatched_cleared_on_resume_failure),
+    ("dispatched 只在成功后标 取消不标", test_dispatched_not_marked_on_cancel),
     ("发送限流退避重试", test_send_retries_on_rate_limit),
     ("会话失效匹配收紧", test_session_error_matching_tightened),
     ("媒体行不在 prompt 重复", test_run_on_project_skips_media_line),
