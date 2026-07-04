@@ -312,8 +312,8 @@ class Projects:
         if rc != 0 or not out.strip():
             return                                     # 查不了或本就干净 → 无需寄存
         _, br, _ = await _git("rev-parse", "--abbrev-ref", "HEAD", cwd=path)
-        label = str(rec.get("id") or rec.get("name") or "").strip()
-        msg = f"auto-park before task {label}".rstrip() + f" (was on {br.strip() or '?'})"
+        label = str(rec.get("id") or rec.get("name") or "").strip() or "?"
+        msg = f"auto-park before task {label} (was on {br.strip() or '?'})"
         rc2, _, err = await _git("stash", "push", "--include-untracked", "-m", msg, cwd=path)
         if rc2 != 0:
             log.warning("prepare_worktree: auto-stash 失败，未提交的改动可能随 reset 丢失：%s",
