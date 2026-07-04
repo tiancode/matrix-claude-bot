@@ -399,20 +399,25 @@ class ClaudeRunner:
                 # 那条 B 该走的路：不能等它默默开跑。
                 if token.cancelled:
                     raise ClaudeCancelled()
-                if prepare is not None:
-                    try:
-                        await prepare()
-                    except Exception:
-                        log.exception("任务前置准备失败（继续按现状跑）")
-                if token.cancelled:   # prepare 本身可能耗时，跑完再验一次，别白起子进程
-                    raise ClaudeCancelled()
                 epoch = self._epoch.get(key, 0)
                 sid, expired = self._sid(key)
+                fresh = sid is None            # 本 key 没有可续接的会话 = 这是「新任务」，不是续接轮
                 fork = False
                 if sid is None and fork_from:      # 本 key 还没会话：从父会话分叉（父也没有就全新开）
                     parent_sid, _ = self._sid(fork_from)
                     if parent_sid:
                         sid, fork = parent_sid, True
+                # prepare（把工作树拉回干净 base）只在「新任务」跑一次；续接同一场对话（--resume）时不跑，
+                # 否则同一场对话里上一轮还没提交的活会被这一轮的 reset 冲掉。reset 跟会话生命周期走、
+                # 不跟每条消息走（线程首条也算新会话→会 reset；续接轮不会）。git fetch 可数十秒，
+                # 排队期被 /cancel 也要能在起子进程前了断，故跑完再验一次 cancelled。
+                if prepare is not None and fresh:
+                    try:
+                        await prepare()
+                    except Exception:
+                        log.exception("任务前置准备失败（继续按现状跑）")
+                    if token.cancelled:
+                        raise ClaudeCancelled()
                 rc, payload, err, meta = await _once(sid, fork)
                 if token.cancelled:
                     raise ClaudeCancelled()

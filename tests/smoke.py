@@ -1450,6 +1450,31 @@ def test_prepare_worktree_stashes_dirty():
     assert stash_i < reset_i
 
 
+# ---------- 40c) prepare（拉回干净 base）只在新会话跑一次，续接同一场对话时不再 reset ----------
+def test_prepare_runs_only_on_fresh_session():
+    async def run():
+        r = claude_runner.ClaudeRunner()
+        r._sessions.clear()          # 从干净会话表起，别被别的用例落盘到 store 的会话串进来
+
+        async def fake_run(cmd, cwd=None, on_proc=None):
+            return 0, json.dumps({"result": "ok", "session_id": "sid1",
+                                  "is_error": False}).encode(), b""
+        r._run = fake_run
+        n = {"prep": 0}
+
+        async def prep():
+            n["prep"] += 1
+
+        await r.ask("pk", "hi", prepare=prep)       # 第一轮：本 key 无会话 → 新任务 → 该跑 prepare
+        first = n["prep"]
+        await r.ask("pk", "again", prepare=prep)    # 第二轮：上轮已存 sid（--resume 续接）→ 不该再 reset
+        return first, n["prep"]
+
+    first, second = asyncio.run(run())
+    assert first == 1        # 新会话跑了一次 prepare
+    assert second == 1       # 续接轮没再跑（还是 1，不是 2）——工作树不在对话中途被抽走
+
+
 # ---------- 41) 触发词按词边界匹配（claude 不命中 claudette），CJK 词按子串 ----------
 def test_trigger_word_boundary():
     orig = settings.trigger_phrase
@@ -3429,6 +3454,7 @@ TESTS = [
     ("默认分支带斜杠不被截断", test_detect_base_slash_branch),
     ("派活前清回干净 base", test_prepare_worktree_resets),
     ("脏树派活前先 auto-stash 寄存", test_prepare_worktree_stashes_dirty),
+    ("prepare 只在新会话跑·续接不重置", test_prepare_runs_only_on_fresh_session),
     ("触发词按词边界匹配", test_trigger_word_boundary),
     ("会话落盘重启可恢复", test_sessions_persisted_across_restart),
     ("未绑定私聊=通用助手+引导绑定", test_dm_unbound_is_general_with_bind_hint),
