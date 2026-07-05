@@ -60,6 +60,12 @@ def test_heartbeat_schedule_window():
 
         settings.proactive_heartbeat_weekdays_only = False
         assert heartbeat._in_heartbeat_window(1704592800.0)        # 关掉工作日限制 → 周日也算
+
+        settings.proactive_heartbeat_weekdays_only = True          # 跨零点时段（如夜班 22~6）
+        settings.proactive_heartbeat_start_hour = 22
+        settings.proactive_heartbeat_end_hour = 6
+        assert heartbeat._in_heartbeat_window(1704121200.0)        # 周一 23:00 → 落在 22~6 内
+        assert not heartbeat._in_heartbeat_window(1704074400.0)    # 周一 10:00 → 不在 22~6 内
     finally:
         (settings.proactive_heartbeat_weekdays_only, settings.proactive_heartbeat_start_hour,
          settings.proactive_heartbeat_end_hour, settings.proactive_heartbeat_tz_hours) = orig
@@ -463,7 +469,8 @@ def test_status_command():
         async def room_send(self, r, mt, content, **k):
             sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
 
-    orig = (bot.projects.get_room, state.client)
+    orig = (bot.projects.get_room, state.client, settings.proactive_heartbeat_weekdays_only,
+            settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour)
     bot.projects.get_room = lambda rid: rec
     state.client = FC()
     try:
@@ -472,8 +479,20 @@ def test_status_command():
         out = "\n".join(sent)
         assert "o/r" in out and "PR #7" in out            # 项目 + 在跟的 PR
         assert "没有正在跑的任务" in out and "自驱心跳" in out
+
+        settings.proactive_heartbeat_weekdays_only = False   # 强制"在时段内" → 不该带提示
+        settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour = 0, 24
+        sent.clear()
+        asyncio.run(bot.handle_status(FakeRoom("!g:ex.org", 3)))
+        assert "当前不在巡检时段" not in "\n".join(sent)
+
+        settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour = 0, 0  # 恒不在时段内
+        sent.clear()
+        asyncio.run(bot.handle_status(FakeRoom("!g:ex.org", 3)))
+        assert "当前不在巡检时段" in "\n".join(sent)
     finally:
-        bot.projects.get_room, state.client = orig
+        (bot.projects.get_room, state.client, settings.proactive_heartbeat_weekdays_only,
+         settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour) = orig
         settings.store_path = orig_store
         _reset_ledger()
 

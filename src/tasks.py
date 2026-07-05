@@ -575,9 +575,13 @@ async def handle_status(room: MatrixRoom):
         ts = runner.session_ts(_sess_key(rec, rid))
         lines.append(f"• 多轮会话：{_human_gap(max(0.0, time.time() - ts))}前活跃（/reset 可重开）"
                      if ts else "• 多轮会话：无（下次派活即新开）")
-    hb = (f"开（每 {settings.proactive_heartbeat_interval // 60} 分钟，"
-          f"autopilot={'开' if settings.proactive_autopilot else '关'}）"
-          if settings.proactive_heartbeat_enabled else "关")
+    if settings.proactive_heartbeat_enabled:
+        import heartbeat   # 函数内延迟导入：heartbeat 模块顶层反过来 import 本模块，避免循环导入
+        active = "" if heartbeat._in_heartbeat_window(time.time()) else "，当前不在巡检时段"
+        hb = (f"开（每 {settings.proactive_heartbeat_interval // 60} 分钟，"
+              f"autopilot={'开' if settings.proactive_autopilot else '关'}{active}）")
+    else:
+        hb = "关"
     lines.append(f"• 主动插话={'开' if settings.proactive else '关'} · 自驱心跳={hb}"
                  f" · 工单接活={'开' if settings.issue_intake_enabled else '关'}")
     gitea_line = gitea_health.status_line(gitea.health())   # Gitea 连不上/ token 失效时在这暴露出来

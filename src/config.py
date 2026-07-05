@@ -1,8 +1,16 @@
 """集中配置：全部从环境变量 / .env 读取（各项说明见 .env.example）。"""
 import os
+from datetime import timedelta, timezone
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def fixed_tz(hours: int) -> timezone:
+    """固定 UTC 偏移的 tzinfo，不依赖服务器本地时区，跨机器/跨部署一致
+    （日期分桶、巡检时段等"按部署时区判日夜/周几"的场景统一走这个）。"""
+    return timezone(timedelta(hours=hours))
 
 
 def _s(key, default=""):
