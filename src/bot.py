@@ -56,9 +56,9 @@ from matrix_io import (send, _is_dm, _thread_of,
 from addressing import (_address_kind, _has_trigger, _strip_reply_fallback,
                         _strip_self_mentions, _mark_engaged)
 from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, do_bind,
-                   handle_unbind, _backfill_cmd, _auto_backfill,
+                   handle_unbind, handle_new_project, _backfill_cmd, _auto_backfill,
                    RESET_CMDS, HELP_CMDS, SUMMARY_CMDS, CANCEL_CMDS, STATUS_CMDS, UNBIND_CMDS,
-                   _HELP_TEXT, _WELCOME)
+                   NEW_PROJECT_CMDS, _HELP_TEXT, _WELCOME)
 from pr_followup import _pr_followup_loop
 from heartbeat import _heartbeat_loop
 from issue_intake import _issue_execute, _issue_intake_loop
@@ -121,6 +121,10 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
         return
     if low in UNBIND_CMDS:                 # 解绑（群 / 私聊通用）
         state._spawn(handle_unbind(room))
+        return
+    if (low.startswith("/new-project") or low.startswith("/newproject")
+            or any(stripped.startswith(w) for w in NEW_PROJECT_CMDS)):
+        state._spawn(handle_new_project(room, event, stripped))
         return
     # /bind 但没带可解析的仓库地址：无论群 / 私聊都提示怎么用（私聊过去直接拒绝，现在也支持绑定了）
     if low.startswith("/bind") and not parse_repo_url(body):

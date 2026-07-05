@@ -15,7 +15,7 @@ from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
 from fmt import _format_context, _safe_name, _human_gap
 from addressing import _strip_reply_fallback
 from dispatch import _dispatch, _general_rec
-from projects import projects
+from projects import projects, trusted_repo_info, _valid_name
 from claude_runner import runner, ClaudeCancelled
 import memory
 import issue_ledger
@@ -53,6 +53,11 @@ UNBIND_CMDS = {"/unbind", "解绑", "取消绑定"}                        # 解
 
 
 
+NEW_PROJECT_CMDS = {"新建项目", "新建仓库"}   # 按前缀匹配（见 bot.py），"新建项目 foo" 也认；
+                                            # 也认 "/new-project"/"/newproject" 前缀
+
+
+
 _HELP_TEXT = (
     "**我能干嘛**\n"
     "我是接到 Matrix 的 Claude Code 工程师：群里 @我 或私聊我就能派活——写代码、查问题、做方案，"
@@ -67,6 +72,7 @@ _HELP_TEXT = (
     "• `帮助` / `用法` 看这个——注意 `/help` 会被 Matrix 客户端当自带命令吞掉，发不到我这，\n"
     "  想发斜杠命令用中文词、或 `//help`（双斜杠发字面文本）、或 @我 带上命令\n"
     "• `/bind <URL>` 把本群 / 本私聊定到某仓库（私聊也能绑）；`/unbind` 解绑\n"
+    "• `/new-project <仓库名>` 不想先手动建仓库？我在 Gitea 上新建一个（默认公开）再自动绑定本房间\n"
     "• `/status` 看我当前状态（项目 / 正在跑的任务 / 在跟的 PR）\n"
     "• `/summarize [N]` 小结最近 N 条对话（catch me up）\n"
     "• `/cancel` 停掉我正在跑的任务\n"
@@ -131,6 +137,36 @@ async def do_bind(room: MatrixRoom, repo: dict,
         return
     if task_text and event is not None:   # 绑定后若还跟了任务，接着派下去
         await handle_task(room, event, task_text)
+
+
+
+async def handle_new_project(room: MatrixRoom, event: RoomMessageText, body: str):
+    """/new-project <仓库名> [接着派的任务]：在 GITEA_TOKEN 对应账号下新建一个仓库（默认公开），
+    然后走 do_bind 同一条路（clone + 绑定本房间），免得非要先手动去 Gitea 建好库才能派活。
+    命令词、仓库名、任务这三段一次 split(None, 2) 拆开——与 /bind <url> [任务] 的用法对齐。"""
+    rid = room.room_id
+    parts = body.split(None, 2)
+    name = parts[1].strip() if len(parts) > 1 else ""
+    task_text = parts[2].strip() if len(parts) > 2 else ""
+    # GITEA_HOST 没配的报错交给 gitea.create_repo 自己判（它才是真正要用这个配置发请求的地方，
+    # 这里只提前挡 GITEA_TOKEN——create_repo 不检查它，没有会直接匿名请求被 Gitea 拒）。
+    if not settings.gitea_token:
+        await send(rid, "还没配置 GITEA_TOKEN，没法建仓库。")
+        return
+    if not name or not _valid_name(name):
+        await send(rid, "用法：`/new-project <仓库名> [接着派的任务]`（仓库名仅限字母/数字/`.` `_` `-`）。")
+        return
+    await send(rid, f"⏳ 正在 Gitea 上新建仓库 {name} …")
+    created, err = await gitea.create_repo(name, private=settings.gitea_new_repo_private)
+    if not created:
+        await send(rid, f"建仓库失败：{err}")
+        return
+    owner = ((created.get("owner") or {}).get("login") or "").strip()
+    repo = trusted_repo_info(owner, created.get("name") or name)
+    if not repo:   # 理论上不会发生（owner/repo 名字来自我们自己刚建好的仓库），兜底别让用户卡住
+        await send(rid, f"仓库建好了：{created.get('html_url', '')}，但没能自动绑定，请手动 `/bind <URL>`。")
+        return
+    await do_bind(room, repo, event, task_text)
 
 
 

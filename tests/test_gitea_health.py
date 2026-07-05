@@ -150,8 +150,39 @@ def test_status_shows_gitea_health():
         _reset_gitea_health()
 
 
+# ---------- create_repo：新建仓库成功解析 / 失败带上原因（HTTP 错误 / 网络错误）----------
+def test_create_repo_success_and_failure():
+    import gitea
+    import json
+    import urllib.error
+    orig_post = gitea._post
+    orig_host = settings.gitea_host
+    settings.gitea_host = "https://gitea.example.com"
+    try:
+        gitea._post = lambda url, payload, timeout=15: (201, json.dumps(
+            {"html_url": "https://gitea.example.com/bot/foo", "clone_url": "https://gitea.example.com/bot/foo.git"}))
+        data, err = asyncio.run(gitea.create_repo("foo", private=True))
+        assert err == "" and data["html_url"] == "https://gitea.example.com/bot/foo"
+
+        def raise_conflict(url, payload, timeout=15):
+            raise urllib.error.HTTPError(url, 409, "name already exists", None, None)
+        gitea._post = raise_conflict
+        data, err = asyncio.run(gitea.create_repo("foo"))
+        assert data is None and "409" in err
+
+        def raise_net(url, payload, timeout=15):
+            raise urllib.error.URLError("refused")
+        gitea._post = raise_net
+        data, err = asyncio.run(gitea.create_repo("foo"))
+        assert data is None and err
+    finally:
+        gitea._post = orig_post
+        settings.gitea_host = orig_host
+
+
 TESTS = [
     ('Gitea健康度 失败累计/成功清零/401定性/404不计', test_gitea_health_accounting),
     ('Gitea健康度 status两态+告警一次+恢复', test_gitea_health_status_and_alert),
     ('/status 暴露Gitea连通性', test_status_shows_gitea_health),
+    ('create_repo 成功解析/HTTP失败/网络失败', test_create_repo_success_and_failure),
 ]

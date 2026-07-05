@@ -96,6 +96,20 @@ def _validate_repo(info: dict | None) -> dict | None:
     return info
 
 
+def trusted_repo_info(owner: str, repo: str) -> dict | None:
+    """直接基于配置的受信 GITEA_HOST 构造仓库信息，不走 parse_repo_url 的"扫描不可信文本"信任判定
+    （host 精确比对 + _RESERVED_OWNERS 拒绝名单）——那套判定是为了防止聊天里的任意链接被误当仓库，
+    但用在"我们自己刚用鉴权 API 建好的仓库"上并不合适：GITEA_HOST 本身就是受信主机，且我们自己的
+    Gitea 账号名（如 admin）完全可能命中 _RESERVED_OWNERS。仍需校验 owner/repo 是合法路径段，
+    防 Gitea 返回的字段异常时污染本地 clone 路径。"""
+    if not settings.gitea_host or not (_valid_name(owner) and _valid_name(repo)):
+        return None
+    p = urlsplit(settings.gitea_host)
+    if not p.scheme or not p.netloc:
+        return None
+    return _mk(p.scheme, p.netloc, owner, repo)
+
+
 def parse_repo_url(text: str) -> dict | None:
     """找出文本里第一个【受信】git 仓库地址；找不到返回 None。
 
