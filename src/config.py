@@ -96,7 +96,7 @@ class Settings:
     # agentic 干活的超时（秒）。流式(默认)下是【空闲】超时：只要 Claude 还在持续产出就不限总时长，
     # 仅连续 CLAUDE_TIMEOUT 秒无任何输出才判为卡死；非流式回退路径下退化为整体超时。
     claude_timeout = _i("CLAUDE_TIMEOUT", 600)
-    quick_timeout  = _i("CLAUDE_QUICK_TIMEOUT", 60)   # quick() 轻量判断专用的短超时，别和 claude_timeout 混用
+    quick_timeout  = _i("CLAUDE_QUICK_TIMEOUT", 300)  # quick()/consult()/摘要 等一次性判断的超时，别和 claude_timeout 混用
     claude_system_prompt = _s(
         "CLAUDE_SYSTEM_PROMPT",
         "你是通过 Matrix 接入的助手，会被派来干活（写代码、查问题、做方案等）。用简洁中文回复。",
