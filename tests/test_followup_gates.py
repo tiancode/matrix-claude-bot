@@ -248,7 +248,7 @@ def test_followup_gate_shows_typing_while_judging():
         settings.followup_semantic_gate = orig_gate
     assert typing_calls == [True, False]   # 判断期间开、判断完（不管结果）就关
 
-# ---------- 8e) 语义闸判完一旦决定接话，立刻打 👀（不等 handle_task 内部才打，且不重复打） ----------
+# ---------- 8e) 语义闸判完一旦决定接话，handle_task 一进去就打 👀（只打一次，处理完统一撤）----------
 def test_followup_gate_acks_once_decided_to_answer():
     set_identity()
     c = _CapClient(); state.client = c
@@ -271,10 +271,10 @@ def test_followup_gate_acks_once_decided_to_answer():
         (settings.followup_semantic_gate, bot.followup_is_for_me,
          settings.stream_replies, settings.reply_in_thread) = orig
     reacts = [m for m in c.sent if (m.get("m.relates_to") or {}).get("rel_type") == "m.annotation"]
-    assert len(reacts) == 1                                            # 只打了一次——handle_task(skip_ack=True) 没再重复打
+    assert len(reacts) == 1                                            # 只打了一次
     assert reacts[0]["m.relates_to"]["event_id"] == "$FWACK"
     assert reacts[0]["m.relates_to"]["key"] == "👀"
-    assert c.redacted == ["$e1"]                                       # 处理完（含 handle_task 内部）才统一撤掉
+    assert c.redacted == ["$e1"]                                       # 处理完统一撤掉
 
 # ---------- 9) /reset 连背景对话一起清空 ----------
 def test_reset_clears_context():

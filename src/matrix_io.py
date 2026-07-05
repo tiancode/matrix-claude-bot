@@ -213,12 +213,10 @@ async def _unreact(room_id: str, reaction_eid: str) -> None:
 
 
 @asynccontextmanager
-async def _ack(room_id: str, event_id: str | None, skip: bool = False):
+async def _ack(room_id: str, event_id: str | None):
     """任务期间的 reaction 回执：进入时给触发消息打 👀（"看到了，在办"），退出时撤掉。
-    覆盖成功/报错/取消所有路径；打/撤失败都不影响任务本身。
-    skip=True：调用方已经在外层打过 👀 了（例如续话语义闸判完就先打一次），这里就是个透明
-    no-op，别对同一条消息重复打两次 👀。"""
-    eid = await _react(room_id, event_id, _ACK_EMOJI) if (event_id and not skip) else None
+    覆盖成功/报错/取消所有路径；打/撤失败都不影响任务本身。"""
+    eid = await _react(room_id, event_id, _ACK_EMOJI) if event_id else None
     try:
         yield
     finally:

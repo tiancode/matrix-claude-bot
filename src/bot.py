@@ -51,7 +51,7 @@ import gitea
 # 下面 import 的名字都是本文件回调/启动自己在用的。唯一例外 _format_context 本文件不直接
 # 用，仅作 `bot.X` 兼容再导出留着（测试仍按这个名字访问）；其余纯测试用的再导出已退役。
 from fmt import _format_context  # noqa: F401  # 测试专用再导出（本文件未直接用）
-from matrix_io import (send, _is_dm, _thread_of, _typing, _ack,
+from matrix_io import (send, _is_dm, _thread_of, _typing,
                        _resolve_reply_author, _edit_message)
 from addressing import (_address_kind, _has_trigger, _strip_reply_fallback,
                         _strip_self_mentions, _mark_engaged)
@@ -182,8 +182,8 @@ async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
 
     语义闸判断期间也开着"正在输入"：明确 @ 我时 handle_task 立刻就有 👀/输入中回执，
     但这条路要先等语义闸判完才会走到 handle_task——没有这段 typing，用户会有一段时间
-    看不到任何回执，像是消息没被看到。判完一旦决定接话，立刻打 👀（不必等 handle_task
-    内部走到那一步才打），处理完（含报错/取消）再撤——回执整体覆盖"判断中 + 处理中"。"""
+    看不到任何回执，像是消息没被看到。判完一旦决定接话，直接派给 handle_task——它自己
+    在函数入口就会立刻打 👀，这里不用再抢先打一次。"""
     if settings.followup_semantic_gate:
         sender_name = room.user_name(event.sender) or event.sender
         async with _typing(room.room_id):
@@ -198,8 +198,7 @@ async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
             return
     if not is_self:   # 弱信号只出现在群里（DM 恒 strong），确认接活后再续窗口
         _mark_engaged(room.room_id, event.sender)
-    async with _ack(room.room_id, getattr(event, "event_id", None)):
-        await handle_task(room, event, cleaned, skip_ack=True)
+    await handle_task(room, event, cleaned)
 
 
 async def on_invite(room: MatrixRoom, event: InviteMemberEvent):
