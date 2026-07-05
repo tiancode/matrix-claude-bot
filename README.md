@@ -69,7 +69,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=%h/Projects/matrix-claude-bot
-ExecStart=%h/Projects/matrix-claude-bot/.venv/bin/python bot.py
+ExecStart=%h/Projects/matrix-claude-bot/.venv/bin/python src/bot.py
 Restart=on-failure
 RestartSec=5
 
@@ -142,6 +142,8 @@ journalctl --user -u matrix-claude -f
 **它和在终端里用 Claude Code 有什么区别？** 终端是「你在场才干活」；这是「你不在场它也在干」——接工单、盯 PR、修 CI、找活，以及一个团队都能 @ 它。
 
 ## 模块导览（贡献者向）
+
+以下模块均在 `src/` 下（`src/bot.py`、`src/state.py`……），测试仍在 `tests/`。
 
 依赖方向单向无环：`state → fmt → matrix_io → addressing → dispatch → tasks → {pr_followup, heartbeat → issue_intake, proactive, media} → bot`
 

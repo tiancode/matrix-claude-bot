@@ -39,7 +39,7 @@ jobs:
             || $PY -m pip install -q --break-system-packages $MIRROR -r requirements.txt pyflakes
           $PY --version
           echo "--- pyflakes（只在 undefined name 时失败；re-export 的未用导入不算）---"
-          out=$($PY -m pyflakes *.py || true); echo "$out"
+          out=$($PY -m pyflakes src/*.py || true); echo "$out"
           if echo "$out" | grep -qi "undefined name"; then echo "::error::pyflakes 发现 undefined name"; exit 1; fi
           echo "--- 冒烟自检（离线，不连 Matrix/不调 claude）---"
           $PY tests/smoke.py
