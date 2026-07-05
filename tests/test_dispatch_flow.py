@@ -303,6 +303,26 @@ def test_runner_on_reset_fires_on_expired_session():
                              on_reset=lambda: fresh.__setitem__("n", fresh["n"] + 1))) == "ok"
     assert fresh["n"] == 0
 
+def test_runner_on_reset_skipped_when_fork_rescues_expired_thread():
+    """线程自己的会话过 TTL，但父会话（房间会话）仍有效 → fork 接上父会话，这其实是续接不是
+    「全新开」：on_reset 不该触发（父会话历史还在，dispatched 标记仍然有效），答复也不该被前缀
+    「已开启新对话」误导用户（fork 明明带着完整历史续上了）。"""
+    set_identity()
+    r = claude_runner.ClaudeRunner()
+    r._sessions["proj|room"] = ("SID-PARENT", time.time())                 # 父会话（房间）仍新鲜
+    r._sessions["proj|room|$T"] = ("SID-THREAD-OLD", time.time() - 10 ** 9)  # 线程自己的会话已过 TTL
+
+    async def fake_run(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+        return 0, json.dumps({"result": "ok", "session_id": "SID-FORKED"}).encode(), b""
+    r._run = fake_run
+
+    fired = {"n": 0}
+    ans = asyncio.run(r.ask("proj|room|$T", "hi", fork_from="proj|room",
+                            on_reset=lambda: fired.__setitem__("n", fired["n"] + 1)))
+    assert ans == "ok"                          # 没有「已开启新对话」前缀：fork 接上了父会话历史
+    assert fired["n"] == 0                      # fork 成功 → 不算全新开，不该清 dispatched 标记
+    assert r._sessions["proj|room|$T"][0] == "SID-FORKED"
+
 def test_thread_scoped_session_forks():
     """用户线程里的任务：会话细分到线程并从房间会话 fork；背景不带房间近况、只补线程起点；
     线程里 /reset 只重置该线程；顶层任务不受影响。"""
@@ -420,6 +440,45 @@ def test_emit_files_allowed_blocked_stripped():
     assert "不在允许目录内" in ans                                                 # /etc/... 被拦
     assert matrix_io._within_allowed(fp, d) and not matrix_io._within_allowed("/etc/hostname", d)
 
+# ---------- 附件上传：nio 不会替我们关文件句柄，_send_file 自己必须收尾，否则每发一个附件漏一个 fd ----------
+def test_send_file_closes_opened_handle():
+    set_identity()
+    import tempfile
+    d = tempfile.mkdtemp(prefix="mxbot-files-fd-")
+    fp = os.path.join(d, "a.png")
+    with open(fp, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+    opened = []
+
+    class FC:                          # 仿真实 nio：只读数据，从不替调用方关闭文件对象
+        async def upload(self, provider, content_type=None, filename=None,
+                         encrypt=False, filesize=None):
+            f = provider(0, 0)
+            opened.append(f)
+            f.read()
+            return types.SimpleNamespace(content_uri="mxc://ex.org/up1"), None
+        async def room_send(self, *a, **k):
+            return types.SimpleNamespace(event_id="$x")
+    state.client = FC()
+    room = FakeRoom("!fd:ex.org", 2)
+    ok, _ = asyncio.run(matrix_io._send_file(room, fp, None))
+    assert ok
+    assert opened and opened[0].closed                  # _send_file 必须自己关掉，别指望 nio 关
+
+# ---------- 附件回传超过单次上限（10 个）：多出的标记别悄悄消失，得让用户知道少发了几个 ----------
+def test_emit_files_over_cap_notifies():
+    set_identity()
+    c = _CapClient(); state.client = c
+    room = FakeRoom("!f11:ex.org", 2)
+    orig = settings.send_files_back; settings.send_files_back = True
+    markers = "\n".join(f"[[send-file: /no/such/file{i}]]" for i in range(11))
+    try:
+        ans = asyncio.run(matrix_io._emit_files(room, f"搞定\n{markers}", "/tmp", None))
+    finally:
+        settings.send_files_back = orig
+    assert "send-file" not in ans                        # 标记文字本身总会被抹掉
+    assert "超过单次上限" in ans and "1 个" in ans        # 但得告诉用户还有 1 个没尝试发送
+
 # ---------- 新增能力 6) 流式：占位→编辑→定稿 ----------
 def test_live_reply_streams_and_finalizes():
     set_identity()
@@ -443,10 +502,13 @@ TESTS = [
     ('任务回执 👀 打上/撤掉', test_task_ack_reaction),
     ('runner 会话分叉 fork/续/父失效', test_runner_fork_session),
     ('runner 会话过期全新开触发 on_reset', test_runner_on_reset_fires_on_expired_session),
+    ('runner fork 接上父会话时不误触发 on_reset', test_runner_on_reset_skipped_when_fork_rescues_expired_thread),
     ('线程会话细分+起点背景+线程reset', test_thread_scoped_session_forks),
     ('/help + 进房欢迎', test_help_and_welcome),
     ('/summarize 小结最近对话', test_summarize_command),
     ('/cancel 停当前任务', test_cancel_command),
     ('附件回传 允许/拦截/抹标记', test_emit_files_allowed_blocked_stripped),
+    ('附件上传后关闭文件句柄', test_send_file_closes_opened_handle),
+    ('附件回传超上限 提示未发送数量', test_emit_files_over_cap_notifies),
     ('流式 占位→编辑→定稿', test_live_reply_streams_and_finalizes),
 ]

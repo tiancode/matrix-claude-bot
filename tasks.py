@@ -453,7 +453,10 @@ async def handle_summarize(room: MatrixRoom, event: RoomMessageText, body: str):
     n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else settings.summary_lines
     recs = transcript.tail(rid, n) if settings.transcript_enabled else []
     if not recs:   # 没开/没历史记录就退回内存背景缓冲
-        recs = [{"ts": ts, "sender": s, "body": b} for ts, s, b, *_ in list(_context[rid])[-n:]]
+        # -0 == 0，list[-0:] 是整个列表而非空表；max(1, n) 避免 /summarize 0 意外吐出全部背景
+        # （transcript.tail 已有同样的 max(1, n) 兜底，这里的内存回退路径此前漏了）
+        recs = [{"ts": ts, "sender": s, "body": b}
+                for ts, s, b, *_ in list(_context[rid])[-max(1, n):]]
 
     def _is_summary_cmd(b) -> bool:   # 去掉 /summarize、/catchup（含带参数形式）命令本身
         b = (b or "").strip().lower()

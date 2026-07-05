@@ -339,6 +339,37 @@ def test_summarize_excludes_command_variants():
     finally:
         state.client, tasks.runner.quick, settings.transcript_enabled = orig
 
+# ---------- /summarize 0（关闭逐字记录、退回内存背景）不该把整段背景当成"最近 0 条" ----------
+def test_summarize_zero_does_not_dump_full_context():
+    import tasks
+    set_identity()
+    rid = "!sum0:ex.org"
+    room = FakeRoom(rid, 3)
+    captured = {}
+
+    class FC:
+        async def room_typing(self, *a, **k): return None
+        async def room_send(self, r, mt, content, **k):
+            return types.SimpleNamespace(event_id="$x")
+
+    async def fake_quick(prompt):
+        captured["p"] = prompt; return "小结好了"
+
+    orig = (state.client, tasks.runner.quick, settings.transcript_enabled)
+    state.client = FC()
+    tasks.runner.quick = fake_quick
+    settings.transcript_enabled = False                   # 走内存背景缓冲（-0 == 0 的坑在这条路径上）
+    bot._context[rid].clear()
+    bot._context[rid].append((time.time(), "Alice", "很久以前聊的无关内容"))
+    bot._context[rid].append((time.time(), "Alice", "最近这条才该被带上"))
+    try:
+        asyncio.run(bot.handle_summarize(room, make_event("/summarize 0"), "/summarize 0"))
+        # n=0 时 list[-0:] 会变成整个列表；期望 max(1, n) 兜底成"最近 1 条"，不该把全部背景喂进去
+        assert "很久以前聊的无关内容" not in captured.get("p", "")
+        assert "最近这条才该被带上" in captured.get("p", "")
+    finally:
+        state.client, tasks.runner.quick, settings.transcript_enabled = orig
+
 
 TESTS = [
     ('自驱/跟进任务可被 /cancel', test_autonomous_tasks_cancellable_by_room),
@@ -350,4 +381,5 @@ TESTS = [
     ('引用回复拉回被引用消息内容', test_quoted_reply_fetches_referenced_message),
     ('PR 跟进忽略自己的评论', test_followup_ignores_own_reviews),
     ('/summarize 剔除命令变体', test_summarize_excludes_command_variants),
+    ('/summarize 0 不当成"全部背景"', test_summarize_zero_does_not_dump_full_context),
 ]

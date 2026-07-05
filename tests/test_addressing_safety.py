@@ -138,6 +138,10 @@ def test_security_bits():
             "参考 https://github.com/foo/bar 然后改 https://gitea.example.com/team/app")["repo"] == "app"
         assert redact("tok=secrettok123") == "tok=***"          # 外发出口抹掉凭证
 
+        # scheme 降级：配的是 https，同 host 的 http 变体不该被当成同一受信主机（否则 token 明文上路）
+        assert projects.parse_repo_url("http://gitea.example.com/team/app") is None
+        assert "secrettok123" not in projects._auth_url("http://gitea.example.com/o/r.git")
+
         settings.gitea_host = ""                                # fail-closed：没配受信主机就不认任何仓库
         assert projects.parse_repo_url("https://gitea.example.com/team/app") is None
 

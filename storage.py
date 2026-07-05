@@ -41,7 +41,8 @@ def store_root(*parts: str) -> str:
 def atomic_write_text(path: str, text: str, *, fsync: bool = False) -> None:
     """把 text 原子写到 path。fsync=True 时落盘后强制刷盘（更耐崩溃，略慢）。
     失败抛 OSError，由调用方决定告警 / 静默 / 上抛。"""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(text)
@@ -49,6 +50,14 @@ def atomic_write_text(path: str, text: str, *, fsync: bool = False) -> None:
             f.flush()
             os.fsync(f.fileno())
     os.replace(tmp, path)
+    if fsync:
+        # 只 fsync 临时文件的数据不够：rename 落到目录里这一步本身也得刷盘，否则崩溃时目录项
+        # 可能没跟着持久化，重启后又看到 rename 前的旧文件——白费了上面那道 fsync。
+        dirfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
 
 
 def atomic_write_json(path: str, obj, *, ensure_ascii: bool = False,

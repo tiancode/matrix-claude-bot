@@ -48,14 +48,26 @@ def _canon_host(url: str) -> str:
     return f"{host}:{port}"
 
 
+def _canon_origin(url: str) -> str:
+    """取可比较的 scheme://host[:port]：连 scheme 一起比较。_canon_host 单独只比 host[:port]，
+    若信任判断也只比这个，配的是 https://gitea.example.com 时，同 host 的 http:// 变体会被
+    误判为同一受信主机 —— token 就会被注入到明文 HTTP 的 clone/push 地址里，明文上路。"""
+    host = _canon_host(url)
+    if not host:
+        return ""
+    scheme = (urlsplit(url).scheme or "").lower()
+    return f"{scheme}://{host}"
+
+
 def _trusted_host() -> str:
-    return _canon_host(settings.gitea_host) if settings.gitea_host else ""
+    return _canon_origin(settings.gitea_host) if settings.gitea_host else ""
 
 
 def _host_trusted(url: str) -> bool:
-    """URL 主机是否就是配置的受信 Gitea（决定能否注入 token）。按 host[:port] 规整后精确比较。"""
+    """URL 主机是否就是配置的受信 Gitea（决定能否注入 token）。按 scheme+host[:port] 规整后精确比较，
+    scheme 也要对上——防 https 配置被同 host 的 http 变体撞过（否则 token 会明文上路）。"""
     allowed = _trusted_host()
-    return bool(allowed) and _canon_host(url) == allowed
+    return bool(allowed) and _canon_origin(url) == allowed
 
 
 def _mk(scheme: str, netloc: str, owner: str, repo: str) -> dict:
