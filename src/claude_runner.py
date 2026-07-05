@@ -36,6 +36,12 @@ class _CancelToken:
 # quick() 处理不可信外来内容，给子进程剔除这些密钥（它用不到）。agentic 的 ask() 仍需 GITEA_TOKEN。
 _QUICK_STRIP_ENV = ("GITEA_TOKEN", "MATRIX_PASSWORD")
 
+# quick/consult 是近乎每条消息一次的轻判断，绝不需要 MCP 连接器（Gmail/日历等）。但 claude 每次启动
+# 都会去 spawn/健康检查用户级配的远端 MCP server——在本机这类网络受限环境里每次要多耗 ~70s（远端连接器
+# 还「需要鉴权」根本用不了），直接把 60s 的 quick 超时撑爆。用空 --mcp-config + --strict-mcp-config 关掉
+# 所有 MCP，冷启动从 ~75s 降到 ~5s。agentic 的 ask() 不加：那是真干活的路径，留着 MCP 的可能性。
+_NO_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+
 
 def _quick_env() -> dict:
     env = os.environ.copy()
@@ -299,6 +305,8 @@ class ClaudeRunner:
                 cmd += ["--dangerously-skip-permissions"]
             elif settings.claude_permission_mode:
                 cmd += ["--permission-mode", settings.claude_permission_mode]
+        else:
+            cmd += _NO_MCP   # 轻判断不碰 MCP，省掉远端 server 的启动/健康检查延迟
         sp = system_prompt if system_prompt is not None else settings.claude_system_prompt
         if sp and not sid:  # 系统提示只在开新会话时设一次
             cmd += ["--append-system-prompt", sp]
@@ -502,7 +510,7 @@ class ClaudeRunner:
     def _cmd_ro(self, prompt: str, system_prompt: str | None = None) -> list[str]:
         """只读 agentic 命令：plan 模式能读代码但不会改/提交，用于主动插话在仓库里查证。"""
         cmd = [settings.claude_bin, "-p", prompt, "--output-format", "json",
-               "--permission-mode", "plan"]
+               "--permission-mode", "plan"] + _NO_MCP   # 只读查证同样不需要 MCP，别付启动税
         model = settings.claude_quick_model or settings.claude_model   # 只读查证也算轻判断
         if model:
             cmd += ["--model", model]
