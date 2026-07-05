@@ -51,7 +51,7 @@ import gitea
 # 下面 import 的名字都是本文件回调/启动自己在用的。唯一例外 _format_context 本文件不直接
 # 用，仅作 `bot.X` 兼容再导出留着（测试仍按这个名字访问）；其余纯测试用的再导出已退役。
 from fmt import _format_context  # noqa: F401  # 测试专用再导出（本文件未直接用）
-from matrix_io import (send, _is_dm, _thread_of, _typing,
+from matrix_io import (send, _is_dm, _thread_of,
                        _resolve_reply_author, _edit_message)
 from addressing import (_address_kind, _has_trigger, _strip_reply_fallback,
                         _strip_self_mentions, _mark_engaged)
@@ -180,14 +180,11 @@ async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
     判为"不是对我说"则不接，转交主动插话闸判断该不该纠错/帮忙（软窗口把这条从"没点名→直接
     进主动判断"的老路截走了，这里补回那次机会），它拿不准会 __PASS__，不会没话找话。
 
-    语义闸判断期间也开着"正在输入"：明确 @ 我时 handle_task 立刻就有 👀/输入中回执，
-    但这条路要先等语义闸判完才会走到 handle_task——没有这段 typing，用户会有一段时间
-    看不到任何回执，像是消息没被看到。判完一旦决定接话，直接派给 handle_task——它自己
-    在函数入口就会立刻打 👀，这里不用再抢先打一次。"""
+    语义闸判断期间不打任何回执（判断本身可能"判不该接"，这时候亮"正在输入"反而误导）；
+    一旦判完决定接话，直接派给 handle_task——它自己在函数入口就会立刻打 👀。"""
     if settings.followup_semantic_gate:
         sender_name = room.user_name(event.sender) or event.sender
-        async with _typing(room.room_id):
-            is_for_me = await followup_is_for_me(room.room_id, sender_name, body)
+        is_for_me = await followup_is_for_me(room.room_id, sender_name, body)
         if not is_for_me:
             log.info("[%s] 续话窗口命中但语义判断非对我说，跳过", room.room_id)
             # 语义闸判"这句不是在跟我说"——但它可能是在跟旁人说、话里却有值得纠正的错/求助。

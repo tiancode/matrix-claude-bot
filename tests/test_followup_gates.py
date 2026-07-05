@@ -218,8 +218,8 @@ def test_followup_semantic_gate():
         proactive.runner.quick = orig_quick
         bot._context[rid].clear()
 
-# ---------- 8d) 续话语义闸判断期间也亮着"正在输入"，别让用户以为消息没被看到 ----------
-def test_followup_gate_shows_typing_while_judging():
+# ---------- 8d) 续话语义闸判断期间不打"正在输入"（判不该接时亮着反而误导） ----------
+def test_followup_gate_shows_no_typing_while_judging():
     set_identity()
     rid = "!gatetyping:ex.org"
     room = FakeRoom(rid, 3)
@@ -236,9 +236,7 @@ def test_followup_gate_shows_typing_while_judging():
     settings.proactive = False   # 判为"不是对我说"后不用真的走主动插话逻辑
 
     async def fake_gate(rid_, sender, body):
-        await asyncio.sleep(0)         # 让 _typing 后台的续期任务有机会先跑一轮 room_typing(True)
-        assert True in typing_calls    # 语义闸还在判的时候，typing(True) 已经发出去了
-        return False                   # 判为"不是对我说"，不会再进 handle_task 触发它自己的 ack/typing
+        return False   # 判为"不是对我说"，不会再进 handle_task 触发它自己的 ack/typing
     bot.followup_is_for_me = fake_gate
     try:
         asyncio.run(bot._maybe_followup_task(
@@ -246,7 +244,7 @@ def test_followup_gate_shows_typing_while_judging():
     finally:
         state.client, bot.followup_is_for_me, settings.proactive = orig_client, orig_quick, orig_proactive
         settings.followup_semantic_gate = orig_gate
-    assert typing_calls == [True, False]   # 判断期间开、判断完（不管结果）就关
+    assert typing_calls == []   # 判断期间不打"正在输入"
 
 # ---------- 8e) 语义闸判完一旦决定接话，handle_task 一进去就打 👀（只打一次，处理完统一撤）----------
 def test_followup_gate_acks_once_decided_to_answer():
@@ -336,7 +334,7 @@ TESTS = [
     ('续话软窗口 硬窗外交给语义闸', test_followup_semantic_window),
     ('线程消息不当顶层weak续话', test_thread_msg_not_top_level_weak),
     ('续话语义闸 NO拦下/YES/出错放行', test_followup_semantic_gate),
-    ('续话语义闸判断期间亮着输入中', test_followup_gate_shows_typing_while_judging),
+    ('续话语义闸判断期间不打输入中', test_followup_gate_shows_no_typing_while_judging),
     ('续话语义闸判完决定接话立刻打👀不重复', test_followup_gate_acks_once_decided_to_answer),
     ('/reset 清空背景上下文', test_reset_clears_context),
     ('重试仅限会话失效', test_retry_only_on_session_error),
