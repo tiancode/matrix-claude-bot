@@ -122,7 +122,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     if low in UNBIND_CMDS:                 # 解绑（群 / 私聊通用）
         state._spawn(handle_unbind(room))
         return
-    if low.startswith("/new-project") or low.startswith("/newproject") or stripped in NEW_PROJECT_CMDS:
+    if (low.startswith("/new-project") or low.startswith("/newproject")
+            or any(stripped.startswith(w) for w in NEW_PROJECT_CMDS)):
         state._spawn(handle_new_project(room, event, stripped))
         return
     # /bind 但没带可解析的仓库地址：无论群 / 私聊都提示怎么用（私聊过去直接拒绝，现在也支持绑定了）

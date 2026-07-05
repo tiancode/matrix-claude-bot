@@ -15,7 +15,7 @@ from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
 from fmt import _format_context, _safe_name, _human_gap
 from addressing import _strip_reply_fallback
 from dispatch import _dispatch, _general_rec
-from projects import projects, parse_repo_url, _valid_name
+from projects import projects, trusted_repo_info, _valid_name
 from claude_runner import runner, ClaudeCancelled
 import memory
 import issue_ledger
@@ -53,7 +53,8 @@ UNBIND_CMDS = {"/unbind", "解绑", "取消绑定"}                        # 解
 
 
 
-NEW_PROJECT_CMDS = {"新建项目", "新建仓库"}   # 也认 "/new-project"/"/newproject" 前缀（见 bot.py）
+NEW_PROJECT_CMDS = {"新建项目", "新建仓库"}   # 按前缀匹配（见 bot.py），"新建项目 foo" 也认；
+                                            # 也认 "/new-project"/"/newproject" 前缀
 
 
 
@@ -140,26 +141,30 @@ async def do_bind(room: MatrixRoom, repo: dict,
 
 
 async def handle_new_project(room: MatrixRoom, event: RoomMessageText, body: str):
-    """/new-project <仓库名>：在 GITEA_TOKEN 对应账号下新建一个仓库（默认公开），然后走 do_bind
-    同一条路（clone + 绑定本房间），免得非要先手动去 Gitea 建好库才能派活。"""
+    """/new-project <仓库名> [接着派的任务]：在 GITEA_TOKEN 对应账号下新建一个仓库（默认公开），
+    然后走 do_bind 同一条路（clone + 绑定本房间），免得非要先手动去 Gitea 建好库才能派活。
+    命令词、仓库名、任务这三段一次 split(None, 2) 拆开——与 /bind <url> [任务] 的用法对齐。"""
     rid = room.room_id
-    name = body.split(None, 1)[1].strip() if len(body.split(None, 1)) > 1 else ""
+    parts = body.split(None, 2)
+    name = parts[1].strip() if len(parts) > 1 else ""
+    task_text = parts[2].strip() if len(parts) > 2 else ""
     if not settings.gitea_host or not settings.gitea_token:
         await send(rid, "还没配置 GITEA_HOST / GITEA_TOKEN，没法建仓库。")
         return
     if not name or not _valid_name(name):
-        await send(rid, "用法：`/new-project <仓库名>`（仅限字母/数字/`.` `_` `-`）。")
+        await send(rid, "用法：`/new-project <仓库名> [接着派的任务]`（仓库名仅限字母/数字/`.` `_` `-`）。")
         return
     await send(rid, f"⏳ 正在 Gitea 上新建仓库 {name} …")
     created, err = await gitea.create_repo(name, private=settings.gitea_new_repo_private)
     if not created:
         await send(rid, f"建仓库失败：{err}")
         return
-    repo = parse_repo_url(created.get("html_url", ""))
-    if not repo:   # 理论上不会发生（刚在受信 GITEA_HOST 上建的），兜底别让用户卡住
+    owner = ((created.get("owner") or {}).get("login") or "").strip()
+    repo = trusted_repo_info(owner, created.get("name") or name)
+    if not repo:   # 理论上不会发生（owner/repo 名字来自我们自己刚建好的仓库），兜底别让用户卡住
         await send(rid, f"仓库建好了：{created.get('html_url', '')}，但没能自动绑定，请手动 `/bind <URL>`。")
         return
-    await do_bind(room, repo, event, "")
+    await do_bind(room, repo, event, task_text)
 
 
 

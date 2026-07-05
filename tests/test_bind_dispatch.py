@@ -158,11 +158,11 @@ def test_just_url_autobind_only_for_bare_url():
     assert n_bare == 1                        # 纯链接 → 自动绑定
     assert n_with_task == 0                   # 链接+闲聊 → 不自动绑定
 
-# ---------- 19) /new-project 建仓成功后走 do_bind 同一条路 ----------
+# ---------- 19) /new-project 建仓成功后走 do_bind 同一条路，且能带上后续任务 ----------
 def test_new_project_creates_and_binds():
     set_identity()
     room = FakeRoom("!g:ex.org", 3)
-    ev = make_event("/new-project foo")
+    ev = make_event("/new-project foo 顺便加个 CI")
     sent = []
 
     class FC:
@@ -174,7 +174,8 @@ def test_new_project_creates_and_binds():
     bound = {}
 
     async def fake_create_repo(name, private=True):
-        return {"html_url": f"https://gitea.example.com/bot/{name}"}, ""
+        return {"html_url": f"https://gitea.example.com/bot/{name}",
+                "name": name, "owner": {"login": "bot"}}, ""
 
     async def fake_do_bind(rm, repo, event, task_text):
         bound["repo"], bound["task_text"] = repo, task_text
@@ -182,12 +183,57 @@ def test_new_project_creates_and_binds():
     tasks.do_bind = fake_do_bind
     state.client = FC()
     try:
-        asyncio.run(tasks.handle_new_project(room, ev, "/new-project foo"))
+        asyncio.run(tasks.handle_new_project(room, ev, "/new-project foo 顺便加个 CI"))
     finally:
         (settings.gitea_host, settings.gitea_token, gitea.create_repo,
          tasks.do_bind, state.client) = orig
-    assert bound.get("repo", {}).get("repo") == "foo"    # 解析出的仓库信息传给了 do_bind
-    assert bound.get("task_text") == ""
+    assert bound.get("repo", {}).get("repo") == "foo"    # 直接用 API 返回的 owner/name 构造，没经过 parse_repo_url
+    assert bound.get("repo", {}).get("owner") == "bot"
+    assert bound.get("task_text") == "顺便加个 CI"        # 名字后的剩余文本当任务接着派
+
+# ---------- 19b) 建仓账号名命中 Gitea 保留字（如 admin）也不影响自动绑定 ----------
+def test_new_project_binds_even_with_reserved_owner_name():
+    set_identity()
+    room = FakeRoom("!g:ex.org", 3)
+    bound = {}
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            return types.SimpleNamespace(event_id="$x")
+
+    async def fake_create_repo(name, private=True):
+        return {"html_url": f"https://gitea.example.com/admin/{name}",
+                "name": name, "owner": {"login": "admin"}}, ""
+
+    async def fake_do_bind(rm, repo, event, task_text):
+        bound["repo"] = repo
+    orig = (settings.gitea_host, settings.gitea_token, gitea.create_repo, tasks.do_bind, state.client)
+    settings.gitea_host, settings.gitea_token = "https://gitea.example.com", "tok"
+    gitea.create_repo = fake_create_repo
+    tasks.do_bind = fake_do_bind
+    state.client = FC()
+    try:
+        asyncio.run(tasks.handle_new_project(room, make_event("/new-project foo"), "/new-project foo"))
+    finally:
+        (settings.gitea_host, settings.gitea_token, gitea.create_repo,
+         tasks.do_bind, state.client) = orig
+    # trusted_repo_info 不套用 parse_repo_url 的 _RESERVED_OWNERS 拒绝名单，owner=admin 照样绑定成功
+    assert bound.get("repo", {}).get("owner") == "admin"
+
+# ---------- 19c) 中文命令别名带参数也能建仓（此前只有裸词才匹配，带名字反而落空） ----------
+def test_new_project_chinese_alias_with_name_dispatches():
+    set_identity()
+    state._synced = True
+    room = FakeRoom("!g:ex.org", 3)
+    called = []
+    orig = (bot.handle_new_project, state._spawn)
+    bot.handle_new_project = lambda rm, ev, body: called.append(body)
+    state._spawn = lambda coro: coro.close() if hasattr(coro, "close") else None
+    try:
+        asyncio.run(bot.on_message(room, make_event("新建项目 foo")))
+    finally:
+        (bot.handle_new_project, state._spawn) = orig
+    assert called == ["新建项目 foo"]   # 带名字的中文命令能匹配到 handle_new_project（此前会落空到普通消息处理）
 
 # ---------- 20) /new-project 建仓失败 / 名字非法都有明确提示，不静默 ----------
 def test_new_project_rejects_bad_name_and_reports_failure():
@@ -242,7 +288,9 @@ TESTS = [
     ('发送失败有日志不入上下文', test_send_failure_logged),
     ('默认分支选实际存在的', test_detect_base_prefers_existing_branch),
     ('纯链接才自动绑定', test_just_url_autobind_only_for_bare_url),
-    ('/new-project 建仓成功后走 do_bind', test_new_project_creates_and_binds),
+    ('/new-project 建仓成功后走 do_bind+带任务接着派', test_new_project_creates_and_binds),
+    ('/new-project owner 命中保留字仍能绑定', test_new_project_binds_even_with_reserved_owner_name),
+    ('/new-project 中文别名带参数也能派发', test_new_project_chinese_alias_with_name_dispatches),
     ('/new-project 非法名字/建仓失败均有提示', test_new_project_rejects_bad_name_and_reports_failure),
     ('未同步群不当私聊+剥外链img', test_dm_classification_and_html_hardening),
 ]
