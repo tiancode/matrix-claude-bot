@@ -84,8 +84,8 @@ class Settings:
     git_user_name  = _s("GIT_USER_NAME", "claude-bot")
     git_user_email = _s("GIT_USER_EMAIL", "claude-bot@localhost")
     git_timeout    = _i("GIT_TIMEOUT", 300)
-    # /new-project：新建仓库默认可见性（GITEA_TOKEN 对应账号下）。默认 private，避免误建成公开库。
-    gitea_new_repo_private = _b("GITEA_NEW_REPO_PRIVATE", True)
+    # /new-project：新建仓库默认可见性（GITEA_TOKEN 对应账号下）。默认公开；要默认私有可设为 1。
+    gitea_new_repo_private = _b("GITEA_NEW_REPO_PRIVATE", False)
 
     # Claude Code
     claude_bin     = _s("CLAUDE_BIN", "claude")
