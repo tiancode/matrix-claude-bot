@@ -45,6 +45,31 @@ def test_queue_receipt_when_busy():
         (tasks.runner, state.client, settings.stream_replies) = orig
         bot._context[rid].clear()
 
+# ---------- 自驱心跳：巡检时段只在工作日白天（默认东八区 9~19 点） ----------
+def test_heartbeat_schedule_window():
+    orig = (settings.proactive_heartbeat_weekdays_only, settings.proactive_heartbeat_start_hour,
+            settings.proactive_heartbeat_end_hour, settings.proactive_heartbeat_tz_hours)
+    settings.proactive_heartbeat_weekdays_only = True
+    settings.proactive_heartbeat_start_hour = 9
+    settings.proactive_heartbeat_end_hour = 19
+    settings.proactive_heartbeat_tz_hours = 8
+    try:
+        assert heartbeat._in_heartbeat_window(1704074400.0)        # 周一 10:00 → 在时段内
+        assert not heartbeat._in_heartbeat_window(1704592800.0)    # 周日 10:00 → 周末，跳过
+        assert not heartbeat._in_heartbeat_window(1704121200.0)    # 周一 23:00 → 夜里，跳过
+
+        settings.proactive_heartbeat_weekdays_only = False
+        assert heartbeat._in_heartbeat_window(1704592800.0)        # 关掉工作日限制 → 周日也算
+
+        settings.proactive_heartbeat_weekdays_only = True          # 跨零点时段（如夜班 22~6）
+        settings.proactive_heartbeat_start_hour = 22
+        settings.proactive_heartbeat_end_hour = 6
+        assert heartbeat._in_heartbeat_window(1704121200.0)        # 周一 23:00 → 落在 22~6 内
+        assert not heartbeat._in_heartbeat_window(1704074400.0)    # 周一 10:00 → 不在 22~6 内
+    finally:
+        (settings.proactive_heartbeat_weekdays_only, settings.proactive_heartbeat_start_hour,
+         settings.proactive_heartbeat_end_hour, settings.proactive_heartbeat_tz_hours) = orig
+
 # ---------- 自驱心跳：PASS 不打扰；有建议→提议；autopilot→派执行 ----------
 def test_heartbeat_propose_and_autopilot():
     set_identity()
@@ -444,7 +469,8 @@ def test_status_command():
         async def room_send(self, r, mt, content, **k):
             sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
 
-    orig = (bot.projects.get_room, state.client)
+    orig = (bot.projects.get_room, state.client, settings.proactive_heartbeat_weekdays_only,
+            settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour)
     bot.projects.get_room = lambda rid: rec
     state.client = FC()
     try:
@@ -453,8 +479,20 @@ def test_status_command():
         out = "\n".join(sent)
         assert "o/r" in out and "PR #7" in out            # 项目 + 在跟的 PR
         assert "没有正在跑的任务" in out and "自驱心跳" in out
+
+        settings.proactive_heartbeat_weekdays_only = False   # 强制"在时段内" → 不该带提示
+        settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour = 0, 24
+        sent.clear()
+        asyncio.run(bot.handle_status(FakeRoom("!g:ex.org", 3)))
+        assert "当前不在巡检时段" not in "\n".join(sent)
+
+        settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour = 0, 0  # 恒不在时段内
+        sent.clear()
+        asyncio.run(bot.handle_status(FakeRoom("!g:ex.org", 3)))
+        assert "当前不在巡检时段" in "\n".join(sent)
     finally:
-        bot.projects.get_room, state.client = orig
+        (bot.projects.get_room, state.client, settings.proactive_heartbeat_weekdays_only,
+         settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour) = orig
         settings.store_path = orig_store
         _reset_ledger()
 
@@ -487,6 +525,7 @@ TESTS = [
     ('PR 自动合并 条件满足才合并', test_pr_automerge),
     ('CI查询失败不放行自动合并', test_automerge_skips_on_ci_unknown),
     ('PR 冲突只告警一次不刷屏', test_conflict_alert_once),
+    ('自驱心跳 巡检时段（工作日白天）', test_heartbeat_schedule_window),
     ('自驱心跳 提议/autopilot', test_heartbeat_propose_and_autopilot),
     ('/status 状态一屏可见', test_status_command),
     ('流式定稿 编辑失败退回新发', test_livereply_finalize_edit_fallback),

@@ -3,8 +3,9 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime
 
-from config import settings
+from config import settings, fixed_tz
 import state
 from state import _sess_key, _last_project_by_room, _project_last_active
 from matrix_io import send, _typing, _is_dm
@@ -97,6 +98,25 @@ async def _heartbeat_one(rec: dict, room: str):
 
 
 
+def _in_heartbeat_window(now: float) -> bool:
+    """自驱巡检只在配置的工作日 + 白天时段内进行（默认周一~周五 9~19 点、东八区）。
+    起止时刻允许跨零点（如 22~6 表示夜间时段）：起 <= 止就是当天区间，起 > 止就是跨天区间。"""
+    local = datetime.fromtimestamp(now, fixed_tz(settings.proactive_heartbeat_tz_hours))
+    if settings.proactive_heartbeat_weekdays_only and local.weekday() >= 5:   # 5=周六 6=周日
+        return False
+    start, end, hour = (settings.proactive_heartbeat_start_hour,
+                        settings.proactive_heartbeat_end_hour, local.hour)
+    if start <= end:
+        return start <= hour < end
+    return hour >= start or hour < end   # 跨零点时段
+
+
+# 循环"探测"节奏上限（秒）：即便 PROACTIVE_HEARTBEAT_INTERVAL 配得很大（如 4 小时），也按这个更短
+# 的节奏醒来检查是否进入了巡检时段——真正"多久巡检一次"仍由每项目的 _project_last_active 节流
+# 保证，这里只管别让大 interval 与巡检时段错峰、导致整段时段被永久错过。
+_WINDOW_POLL_INTERVAL = 300
+
+
 async def _heartbeat_loop():
     """周期巡检有"汇报口"的项目；避让最近在弄的项目，免得打断正在派的活、也别为巡检而 clone。"""
     if not settings.proactive_heartbeat_enabled:
@@ -105,8 +125,10 @@ async def _heartbeat_loop():
              settings.proactive_heartbeat_interval, settings.proactive_autopilot)
     while True:
         try:
-            await asyncio.sleep(settings.proactive_heartbeat_interval)
+            await asyncio.sleep(min(settings.proactive_heartbeat_interval, _WINDOW_POLL_INTERVAL))
             now = time.time()
+            if not _in_heartbeat_window(now):
+                continue   # 非工作时段：跳过本轮，别半夜/周末打扰人
             for rec in projects.list_projects():
                 pid = rec["id"]
                 room = _project_home_room(pid)

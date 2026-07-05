@@ -1,8 +1,16 @@
 """集中配置：全部从环境变量 / .env 读取（各项说明见 .env.example）。"""
 import os
+from datetime import timedelta, timezone
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def fixed_tz(hours: int) -> timezone:
+    """固定 UTC 偏移的 tzinfo，不依赖服务器本地时区，跨机器/跨部署一致
+    （日期分桶、巡检时段等"按部署时区判日夜/周几"的场景统一走这个）。"""
+    return timezone(timedelta(hours=hours))
 
 
 def _s(key, default=""):
@@ -152,6 +160,11 @@ class Settings:
     proactive_heartbeat_interval = _i("PROACTIVE_HEARTBEAT_INTERVAL", 3600)  # 巡检间隔（秒），别太密以免烧钱/打扰
     # 0=只读巡检 + 提议（安全）；1=autopilot：直接认领、开 PR（无人值守自主行动）。默认开
     proactive_autopilot          = _b("PROACTIVE_AUTOPILOT", True)
+    # 自驱心跳的巡检时段：只在工作日 + 白天巡检，别半夜/周末打扰人、也省着烧钱
+    proactive_heartbeat_weekdays_only = _b("PROACTIVE_HEARTBEAT_WEEKDAYS_ONLY", True)  # 只周一~周五
+    proactive_heartbeat_start_hour    = _i("PROACTIVE_HEARTBEAT_START_HOUR", 9)        # 巡检时段起（含，当地时）
+    proactive_heartbeat_end_hour      = _i("PROACTIVE_HEARTBEAT_END_HOUR", 19)         # 巡检时段止（不含）
+    proactive_heartbeat_tz_hours      = _i("PROACTIVE_HEARTBEAT_TZ_HOURS", 8)          # 时段判断用的时区偏移（默认东八区）
 
     # 媒体（图片 / 文件 / 音视频）
     media_enabled  = _b("MEDIA_ENABLED", True)

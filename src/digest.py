@@ -28,9 +28,9 @@ import os
 import re
 import shutil
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-from config import settings
+from config import settings, fixed_tz
 from storage import atomic_write_text, store_root, throttled
 from claude_runner import runner
 import transcript
@@ -66,8 +66,8 @@ def _room_dir(room: str) -> str:
 
 
 # ---- 东八区（可配）日期分桶：不依赖服务器本地时区，跨机器 / 跨部署都一致 ----
-def _tz() -> timezone:
-    return timezone(timedelta(hours=settings.digest_tz_hours))
+def _tz():
+    return fixed_tz(settings.digest_tz_hours)
 
 
 def _local_date(ts: float) -> str:
