@@ -412,10 +412,12 @@ class ClaudeRunner:
                 # 是接着父对话往下走（--resume 父 sid），跟续接轮同理：算续接、不算新任务，故这里判 fresh
                 # 必须在上面的 fork 解析【之后】——否则 fork 时 sid 还是 None 会被误判成新任务而 reset。
                 fresh = sid is None
-                if expired and on_reset is not None:
-                    # 拿到锁时才发现会话已过 TTL → 本轮要全新开；但拼 prompt 那刻会话还在，调用方可能已按
-                    # 「续接」裁掉派过的消息（drop_dispatched）。这里 sid 从一开始就是 None，走不到下面
-                    # 「resume 被拒」的回调，必须在此单独通知，别让被裁的消息两头落空（背景没、新会话也没）。
+                if expired and fresh and on_reset is not None:
+                    # 拿到锁时才发现本 key 会话已过 TTL → 本轮要全新开；但拼 prompt 那刻会话还在，调用方
+                    # 可能已按「续接」裁掉派过的消息（drop_dispatched）。这里 sid 从一开始就是 None，走不到
+                    # 下面「resume 被拒」的回调，必须在此单独通知，别让被裁的消息两头落空（背景没、新会话也没）。
+                    # 必须再判一次 fresh：若 fork 从父会话接上了（expired 但 fork 成功→sid 非 None），
+                    # 那就不是「全新开」，父会话历史还在，dispatched 标记仍然有效，不该被清掉。
                     try:
                         on_reset()
                     except Exception:
@@ -462,7 +464,7 @@ class ClaudeRunner:
                 if is_err:
                     raise RuntimeError(f"claude: {redact(payload)}")
                 answer = (payload if isinstance(payload, str) else "") or "(空回复)"
-                if expired:  # 上次对话隔太久被清，提示用户已开新会话
+                if expired and fresh:  # 真·全新开（fork 接上父会话时历史还在，不算，别误导用户）
                     answer = "（距上次较久，已开启新对话）\n\n" + answer
                 return answer
         finally:
