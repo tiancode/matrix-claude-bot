@@ -55,7 +55,7 @@ cp .env.example .env   # 填 Matrix 账号 + GITEA_HOST / GITEA_TOKEN
 ```
 
 然后：
-1. 把 bot 拉进群（谁邀请都进），群里发一个 Gitea 仓库地址（或 `/bind <URL>`）→ 自动 clone 绑定；
+1. 把 bot 拉进群（谁邀请都进），群里发一个 Gitea 仓库地址（或 `/bind <URL>`）→ 自动 clone 绑定；还没建仓库？发 `/new-project <仓库名>` 让它在 Gitea 上新建（默认私有）再自动绑定；
 2. @它派活。改代码的活它会开 PR 并盯到合并；纯问答/闲聊直接回（没绑仓库也行）。私聊同理：发仓库地址或 `/bind` 定住一个仓库再派活，`/unbind` 解绑，不绑也能闲聊/答疑；
 3. 想不打字：Gitea 上把 issue 指派给它的账号，它每 5 分钟收一次单。
 
@@ -108,7 +108,7 @@ journalctl --user -u matrix-claude -f
 - 项目长期记忆：值得跨周记住的事实（决策+原因、约定、坑）由它自己写进 `store/memory/<项目>/`，开新会话时按预算注入——会话过期也"记得住事"
 - 聊天逐字记录：按房间落盘（保留 30 天），系统提示里只给**路径**，被问到更早对话时它自己去读/grep——不把历史塞爆每次 prompt；`/backfill` 可回灌开启前的历史
 
-**元命令**（群里不必 @ 也认）：`/help` `/bind <URL>` `/status`（项目/在跑任务/在跟 PR/在办工单一屏可见）`/summarize [N]` `/cancel` `/reset` `/backfill [天]`
+**元命令**（群里不必 @ 也认）：`/help` `/bind <URL>` `/new-project <仓库名>`（Gitea 上新建仓库并自动绑定，默认私有，见 `GITEA_NEW_REPO_PRIVATE`）`/status`（项目/在跑任务/在跟 PR/在办工单一屏可见）`/summarize [N]` `/cancel` `/reset` `/backfill [天]`
 
 ## 安全模型（必读）
 

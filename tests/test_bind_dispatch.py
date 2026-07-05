@@ -1,6 +1,7 @@
 """冒烟：代码围栏·/bind 派活·群分派修复·绑定原子写·默认分支·自动绑定·DM 分类与 HTML 加固"""
 from _helpers import (
     FakeRoom, asyncio, bot, dispatch, fmt, json, make_event, os, set_identity, settings, state, tasks, types)
+import gitea
 
 # ---------- 11) 分块后代码围栏自洽（每块 ``` 成对） ----------
 def test_fence_balance_on_split():
@@ -157,6 +158,66 @@ def test_just_url_autobind_only_for_bare_url():
     assert n_bare == 1                        # 纯链接 → 自动绑定
     assert n_with_task == 0                   # 链接+闲聊 → 不自动绑定
 
+# ---------- 19) /new-project 建仓成功后走 do_bind 同一条路 ----------
+def test_new_project_creates_and_binds():
+    set_identity()
+    room = FakeRoom("!g:ex.org", 3)
+    ev = make_event("/new-project foo")
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (settings.gitea_host, settings.gitea_token, gitea.create_repo, tasks.do_bind, state.client)
+    settings.gitea_host, settings.gitea_token = "https://gitea.example.com", "tok"
+    bound = {}
+
+    async def fake_create_repo(name, private=True):
+        return {"html_url": f"https://gitea.example.com/bot/{name}"}, ""
+
+    async def fake_do_bind(rm, repo, event, task_text):
+        bound["repo"], bound["task_text"] = repo, task_text
+    gitea.create_repo = fake_create_repo
+    tasks.do_bind = fake_do_bind
+    state.client = FC()
+    try:
+        asyncio.run(tasks.handle_new_project(room, ev, "/new-project foo"))
+    finally:
+        (settings.gitea_host, settings.gitea_token, gitea.create_repo,
+         tasks.do_bind, state.client) = orig
+    assert bound.get("repo", {}).get("repo") == "foo"    # 解析出的仓库信息传给了 do_bind
+    assert bound.get("task_text") == ""
+
+# ---------- 20) /new-project 建仓失败 / 名字非法都有明确提示，不静默 ----------
+def test_new_project_rejects_bad_name_and_reports_failure():
+    set_identity()
+    room = FakeRoom("!g:ex.org", 3)
+    sent = []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+
+    orig = (settings.gitea_host, settings.gitea_token, gitea.create_repo, state.client)
+    settings.gitea_host, settings.gitea_token = "https://gitea.example.com", "tok"
+    state.client = FC()
+    try:
+        asyncio.run(tasks.handle_new_project(room, make_event("/new-project ../evil"),
+                                              "/new-project ../evil"))
+        assert any("用法" in s for s in sent)             # 非法名字：提示用法，不去调 Gitea
+
+        async def fake_fail(name, private=True):
+            return None, "HTTP 409 name already exists"
+        gitea.create_repo = fake_fail
+        sent.clear()
+        asyncio.run(tasks.handle_new_project(room, make_event("/new-project foo"),
+                                              "/new-project foo"))
+        assert any("建仓库失败" in s and "409" in s for s in sent)
+    finally:
+        (settings.gitea_host, settings.gitea_token, gitea.create_repo, state.client) = orig
+
+
 # ---------- 18) 成员未同步的群不被当私聊 + 外发富文本剥外链 img ----------
 def test_dm_classification_and_html_hardening():
     # 成员还没同步（users 空、member_count 0/缺）→ 不当 DM，否则 REPLY_IN_DM_ALWAYS 会逐条乱回
@@ -181,5 +242,7 @@ TESTS = [
     ('发送失败有日志不入上下文', test_send_failure_logged),
     ('默认分支选实际存在的', test_detect_base_prefers_existing_branch),
     ('纯链接才自动绑定', test_just_url_autobind_only_for_bare_url),
+    ('/new-project 建仓成功后走 do_bind', test_new_project_creates_and_binds),
+    ('/new-project 非法名字/建仓失败均有提示', test_new_project_rejects_bad_name_and_reports_failure),
     ('未同步群不当私聊+剥外链img', test_dm_classification_and_html_hardening),
 ]

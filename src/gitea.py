@@ -198,6 +198,36 @@ async def ci_state(rec: dict, sha: str) -> str | None:
     return None
 
 
+async def create_repo(name: str, private: bool = True, description: str = "") -> tuple[dict | None, str]:
+    """在 GITEA_TOKEN 对应账号下新建一个仓库（POST /user/repos，auto_init 建好默认分支免得
+    clone 出一个空仓库）。成功返回 (仓库 JSON, "")；失败返回 (None, 原因)。写操作，不吞异常。"""
+    if not settings.gitea_host:
+        return None, "未配置 GITEA_HOST"
+    url = f"{settings.gitea_host.rstrip('/')}/api/v1/user/repos"
+    payload = {"name": name, "private": private, "auto_init": True}
+    if description:
+        payload["description"] = description
+    try:
+        st, body = await asyncio.to_thread(_post, url, payload)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode(errors="ignore")
+        except Exception:
+            detail = ""
+        return None, f"HTTP {e.code} {detail[:200]}".strip()
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return None, str(e)[:200]
+    if st not in (200, 201):
+        return None, f"HTTP {st} {body[:200]}"
+    try:
+        data = json.loads(body or "null")
+    except json.JSONDecodeError:
+        return None, "响应解析失败"
+    if not isinstance(data, dict) or not data.get("html_url"):
+        return None, "响应缺少仓库信息"
+    return data, ""
+
+
 async def merge(rec: dict, number: int, method: str = "merge",
                 delete_branch: bool = False) -> tuple[bool, str]:
     """合并 PR（POST .../pulls/<n>/merge）。成功返回 (True, "")，失败返回 (False, 原因)。
