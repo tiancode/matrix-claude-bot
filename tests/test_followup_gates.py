@@ -1,6 +1,7 @@
 """冒烟：群对话延续窗口·强弱信号分级·语义闸·/reset·会话失效重试"""
 from _helpers import (
-    FakeRoom, addressing, asyncio, bot, claude_runner, json, make_event, set_identity, settings, state, time, types)
+    FakeRoom, _CapClient, _task_fixtures, addressing, asyncio, bot, claude_runner, json, make_event,
+    set_identity, settings, state, time, types)
 
 # ---------- 8b) 群"对话延续窗口"：点过名后免重复 @ 也算续话 ----------
 def test_group_followup_window():
@@ -247,6 +248,34 @@ def test_followup_gate_shows_typing_while_judging():
         settings.followup_semantic_gate = orig_gate
     assert typing_calls == [True, False]   # 判断期间开、判断完（不管结果）就关
 
+# ---------- 8e) 语义闸判完一旦决定接话，立刻打 👀（不等 handle_task 内部才打，且不重复打） ----------
+def test_followup_gate_acks_once_decided_to_answer():
+    set_identity()
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    rid = "!ackfollow:ex.org"
+    room = FakeRoom(rid, 3)
+    ev = make_event("接着讲", event_id="$FWACK")
+    orig = (settings.followup_semantic_gate, bot.followup_is_for_me,
+            settings.stream_replies, settings.reply_in_thread)
+    settings.followup_semantic_gate = True
+    settings.stream_replies = False
+    settings.reply_in_thread = False
+
+    async def fake_gate(rid_, sender, body):
+        return True   # 判定：确实在跟我说 → 该接话
+    bot.followup_is_for_me = fake_gate
+    try:
+        asyncio.run(bot._maybe_followup_task(room, ev, "接着讲", "接着讲", is_self=False))
+    finally:
+        (settings.followup_semantic_gate, bot.followup_is_for_me,
+         settings.stream_replies, settings.reply_in_thread) = orig
+    reacts = [m for m in c.sent if (m.get("m.relates_to") or {}).get("rel_type") == "m.annotation"]
+    assert len(reacts) == 1                                            # 只打了一次——handle_task(skip_ack=True) 没再重复打
+    assert reacts[0]["m.relates_to"]["event_id"] == "$FWACK"
+    assert reacts[0]["m.relates_to"]["key"] == "👀"
+    assert c.redacted == ["$e1"]                                       # 处理完（含 handle_task 内部）才统一撤掉
+
 # ---------- 9) /reset 连背景对话一起清空 ----------
 def test_reset_clears_context():
     set_identity()
@@ -308,6 +337,7 @@ TESTS = [
     ('线程消息不当顶层weak续话', test_thread_msg_not_top_level_weak),
     ('续话语义闸 NO拦下/YES/出错放行', test_followup_semantic_gate),
     ('续话语义闸判断期间亮着输入中', test_followup_gate_shows_typing_while_judging),
+    ('续话语义闸判完决定接话立刻打👀不重复', test_followup_gate_acks_once_decided_to_answer),
     ('/reset 清空背景上下文', test_reset_clears_context),
     ('重试仅限会话失效', test_retry_only_on_session_error),
 ]

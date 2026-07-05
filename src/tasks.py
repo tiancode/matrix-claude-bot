@@ -409,7 +409,8 @@ async def _quoted_subject(room: MatrixRoom, event: RoomMessageText) -> str:
 
 
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
-                      skip_body: str | None = None):
+                      skip_body: str | None = None, skip_ack: bool = False):
+    """skip_ack=True：调用方（如续话语义闸判完就先打好 👀）已经打过回执了，这里不再重复打一次。"""
     rid = room.room_id
     # 引用回复：客户端常只发 m.in_reply_to 指针、不内联引文，本条正文可能只剩一个 @。把被引用的
     # 消息拉进来——正文空时它就是要处理的主题（否则会被下面的空正文闸静默丢掉）；正文非空时作为
@@ -444,7 +445,8 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
         if not text.strip():
             return
         # 回执：接手就给触发消息打 👀，处理完（含报错/取消）撤掉——用户不用盯 typing 猜有没有人接
-        async with _ack(rid, getattr(event, "event_id", None)):
+        # （skip_ack=True 时调用方已经打过了，这里不重复打，只借这层 async with 管生命周期）
+        async with _ack(rid, getattr(event, "event_id", None), skip=skip_ack):
             if text.strip() in RESET_CMDS:
                 # 绑了重置该项目会话；没绑（群/私聊都一样）重置通用助手会话——总有东西可重置
                 rec = projects.get_room(rid) or _general_rec()
