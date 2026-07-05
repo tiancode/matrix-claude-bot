@@ -148,8 +148,10 @@ async def handle_new_project(room: MatrixRoom, event: RoomMessageText, body: str
     parts = body.split(None, 2)
     name = parts[1].strip() if len(parts) > 1 else ""
     task_text = parts[2].strip() if len(parts) > 2 else ""
-    if not settings.gitea_host or not settings.gitea_token:
-        await send(rid, "还没配置 GITEA_HOST / GITEA_TOKEN，没法建仓库。")
+    # GITEA_HOST 没配的报错交给 gitea.create_repo 自己判（它才是真正要用这个配置发请求的地方，
+    # 这里只提前挡 GITEA_TOKEN——create_repo 不检查它，没有会直接匿名请求被 Gitea 拒）。
+    if not settings.gitea_token:
+        await send(rid, "还没配置 GITEA_TOKEN，没法建仓库。")
         return
     if not name or not _valid_name(name):
         await send(rid, "用法：`/new-project <仓库名> [接着派的任务]`（仓库名仅限字母/数字/`.` `_` `-`）。")

@@ -159,18 +159,18 @@ def test_create_repo_success_and_failure():
     orig_host = settings.gitea_host
     settings.gitea_host = "https://gitea.example.com"
     try:
-        gitea._post = lambda url, payload: (201, json.dumps(
+        gitea._post = lambda url, payload, timeout=15: (201, json.dumps(
             {"html_url": "https://gitea.example.com/bot/foo", "clone_url": "https://gitea.example.com/bot/foo.git"}))
         data, err = asyncio.run(gitea.create_repo("foo", private=True))
         assert err == "" and data["html_url"] == "https://gitea.example.com/bot/foo"
 
-        def raise_conflict(url, payload):
+        def raise_conflict(url, payload, timeout=15):
             raise urllib.error.HTTPError(url, 409, "name already exists", None, None)
         gitea._post = raise_conflict
         data, err = asyncio.run(gitea.create_repo("foo"))
         assert data is None and "409" in err
 
-        def raise_net(url, payload):
+        def raise_net(url, payload, timeout=15):
             raise urllib.error.URLError("refused")
         gitea._post = raise_net
         data, err = asyncio.run(gitea.create_repo("foo"))

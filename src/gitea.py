@@ -25,13 +25,28 @@ def _get(url: str):
         return r.status, json.loads(r.read().decode() or "null")
 
 
-def _post(url: str, payload: dict):
+def _post(url: str, payload: dict, timeout: int = 15):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
     if settings.gitea_token:
         req.add_header("Authorization", "token " + settings.gitea_token)
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, (r.read().decode(errors="ignore") or "")
+
+
+async def _post_safe(url: str, payload: dict, timeout: int = 15) -> tuple[int | None, str]:
+    """POST + 统一异常兜底：成功返回 (status, body)；网络/HTTP 错误返回 (None, 截断后的错误描述)，
+    HTTPError 的响应体也读出截断进描述——create_repo/merge 共用，别在每处各写一遍 try/except。"""
+    try:
+        return await asyncio.to_thread(_post, url, payload, timeout)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode(errors="ignore")
+        except Exception:
+            detail = ""
+        return None, f"HTTP {e.code} {detail[:200]}".strip()
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return None, str(e)[:200]
 
 
 # ---- Gitea 全局健康度 ----
@@ -198,25 +213,17 @@ async def ci_state(rec: dict, sha: str) -> str | None:
     return None
 
 
-async def create_repo(name: str, private: bool = True, description: str = "") -> tuple[dict | None, str]:
+async def create_repo(name: str, private: bool = True) -> tuple[dict | None, str]:
     """在 GITEA_TOKEN 对应账号下新建一个仓库（POST /user/repos，auto_init 建好默认分支免得
-    clone 出一个空仓库）。成功返回 (仓库 JSON, "")；失败返回 (None, 原因)。写操作，不吞异常。"""
+    clone 出一个空仓库）。成功返回 (仓库 JSON, "")；失败返回 (None, 原因)。写操作，不吞异常。
+    auto_init 要服务端做 git init + 首个提交，比普通 POST 慢，超时给宽一点（60s）。"""
     if not settings.gitea_host:
         return None, "未配置 GITEA_HOST"
     url = f"{settings.gitea_host.rstrip('/')}/api/v1/user/repos"
     payload = {"name": name, "private": private, "auto_init": True}
-    if description:
-        payload["description"] = description
-    try:
-        st, body = await asyncio.to_thread(_post, url, payload)
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read().decode(errors="ignore")
-        except Exception:
-            detail = ""
-        return None, f"HTTP {e.code} {detail[:200]}".strip()
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return None, str(e)[:200]
+    st, body = await _post_safe(url, payload, timeout=60)
+    if st is None:
+        return None, body   # body 此时是 _post_safe 已经截断好的错误描述
     if st not in (200, 201):
         return None, f"HTTP {st} {body[:200]}"
     try:
@@ -235,15 +242,8 @@ async def merge(rec: dict, number: int, method: str = "merge",
     把异常吞成默认值——把失败原因带回去好回报 / 记日志（不可合并、方法被禁、分支保护等）。"""
     url = f"{_repo_api(rec)}/pulls/{number}/merge"
     payload = {"Do": method, "delete_branch_after_merge": bool(delete_branch)}
-    try:
-        st, body = await asyncio.to_thread(_post, url, payload)
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read().decode(errors="ignore")
-        except Exception:
-            detail = ""
-        return False, f"HTTP {e.code} {detail[:200]}".strip()
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return False, str(e)[:200]
+    st, body = await _post_safe(url, payload)
+    if st is None:
+        return False, body   # body 此时是 _post_safe 已经截断好的错误描述
     ok = st in (200, 201, 204)
     return ok, ("" if ok else f"HTTP {st} {body[:200]}")
