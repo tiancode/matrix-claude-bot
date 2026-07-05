@@ -411,40 +411,42 @@ async def _quoted_subject(room: MatrixRoom, event: RoomMessageText) -> str:
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                       skip_body: str | None = None):
     rid = room.room_id
-    # 引用回复：客户端常只发 m.in_reply_to 指针、不内联引文，本条正文可能只剩一个 @。把被引用的
-    # 消息拉进来——正文空时它就是要处理的主题（否则会被下面的空正文闸静默丢掉）；正文非空时作为
-    # "用户在指这条"的上文附带过去。重置类元命令不动，别把 /reset 揉进引文。
-    if text.strip() not in RESET_CMDS:
-        quoted = await _quoted_subject(room, event)
-        if quoted:
-            text = (f"我引用/回复了这条消息，请针对它回应：\n> {quoted}" if not text.strip()
-                    else f"（我引用/回复了这条消息作为上文：\n> {quoted}\n）\n\n{text.strip()}")
-    # 线程策略：跟着用户走——他在线程里说话就把答复挂进那个线程，并且【会话也细分到线程】
-    # （首次派活从房间会话 fork，记忆随视觉一起分叉，线程之间互不串台）；顶层消息不再强开新线程。
-    # REPLY_IN_THREAD=1 保留旧式"每条顶层消息开线程"，供偏爱线程的群显式选回——但会话细分
-    # 只认用户自己在线程里说话（sess_thr），旧式给顶层消息强开的线程不算。
-    sess_thr = _thread_of(event)
-    thr = sess_thr
-    if thr is None and settings.reply_in_thread and not _is_dm(room):
-        thr = _thread_root_of(event)
-    # 引用回复决策器：发送/占位那一刻若群里已插进别的消息（长任务期间常有），改用引用回复
-    # 指明在回哪条；房间安静就顶层直答。用尾条的 (ts,sender,body) 作稳定标识比对：别用对象身份——
-    # _mark_dispatched 会把这条触发消息就地换成带 dispatched 标记的新元组，身份变了但并非新消息，
-    # 用身份比会把每条顶层群回复都误判成「群里插了话」而强行引用回复。(ts,sender,body) 对同文本
-    # 消息也不误判（各自 append 时的 ts 不同）。
-    reply_to = None
-    if thr is None and not _is_dm(room):
-        dq = _context[rid]
-        tail_at_start = tuple(dq[-1][:3]) if dq else None
-        trigger_eid = getattr(event, "event_id", None)
+    # 回执：接手就给触发消息打 👀，处理完（含报错/取消）撤掉——用户不用盯 typing 猜有没有人接。
+    # 包住整个函数体（引用回复拉取、线程解析等都在内）：不管走哪条调用路径（强点名/续话/reset），
+    # 都在函数入口就立刻打上，不必再靠调用方各自提前打一次、传标志位告诉这里别重复打。
+    async with _ack(rid, getattr(event, "event_id", None)):
+        # 引用回复：客户端常只发 m.in_reply_to 指针、不内联引文，本条正文可能只剩一个 @。把被引用的
+        # 消息拉进来——正文空时它就是要处理的主题（否则会被下面的空正文闸静默丢掉）；正文非空时作为
+        # "用户在指这条"的上文附带过去。重置类元命令不动，别把 /reset 揉进引文。
+        if text.strip() not in RESET_CMDS:
+            quoted = await _quoted_subject(room, event)
+            if quoted:
+                text = (f"我引用/回复了这条消息，请针对它回应：\n> {quoted}" if not text.strip()
+                        else f"（我引用/回复了这条消息作为上文：\n> {quoted}\n）\n\n{text.strip()}")
+        # 线程策略：跟着用户走——他在线程里说话就把答复挂进那个线程，并且【会话也细分到线程】
+        # （首次派活从房间会话 fork，记忆随视觉一起分叉，线程之间互不串台）；顶层消息不再强开新线程。
+        # REPLY_IN_THREAD=1 保留旧式"每条顶层消息开线程"，供偏爱线程的群显式选回——但会话细分
+        # 只认用户自己在线程里说话（sess_thr），旧式给顶层消息强开的线程不算。
+        sess_thr = _thread_of(event)
+        thr = sess_thr
+        if thr is None and settings.reply_in_thread and not _is_dm(room):
+            thr = _thread_root_of(event)
+        # 引用回复决策器：发送/占位那一刻若群里已插进别的消息（长任务期间常有），改用引用回复
+        # 指明在回哪条；房间安静就顶层直答。用尾条的 (ts,sender,body) 作稳定标识比对：别用对象身份——
+        # _mark_dispatched 会把这条触发消息就地换成带 dispatched 标记的新元组，身份变了但并非新消息，
+        # 用身份比会把每条顶层群回复都误判成「群里插了话」而强行引用回复。(ts,sender,body) 对同文本
+        # 消息也不误判（各自 append 时的 ts 不同）。
+        reply_to = None
+        if thr is None and not _is_dm(room):
+            dq = _context[rid]
+            tail_at_start = tuple(dq[-1][:3]) if dq else None
+            trigger_eid = getattr(event, "event_id", None)
 
-        def reply_to():
-            return trigger_eid if (dq and tuple(dq[-1][:3]) != tail_at_start) else None
-    try:
-        if not text.strip():
-            return
-        # 回执：接手就给触发消息打 👀，处理完（含报错/取消）撤掉——用户不用盯 typing 猜有没有人接
-        async with _ack(rid, getattr(event, "event_id", None)):
+            def reply_to():
+                return trigger_eid if (dq and tuple(dq[-1][:3]) != tail_at_start) else None
+        try:
+            if not text.strip():
+                return
             if text.strip() in RESET_CMDS:
                 # 绑了重置该项目会话；没绑（群/私聊都一样）重置通用助手会话——总有东西可重置
                 rec = projects.get_room(rid) or _general_rec()
@@ -466,19 +468,19 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                     _save_last_projects()   # 落盘：记录"这个房间在弄哪个项目"，供自驱心跳/Gitea 健康度找汇报口
                 await _run_on_project(room, event, text, rec, skip_body=skip_body,
                                       thread_root=thr, reply_to=reply_to, sess_thread=sess_thr)
-    except ClaudeCancelled:
-        try:
-            await send(rid, "🛑 已停止。", thread_root=thr,
-                       reply_to=reply_to() if callable(reply_to) else None)
-        except Exception:
-            pass
-    except Exception as e:
-        log.exception("处理失败")
-        try:
-            await send(rid, f"出错了：{e}", thread_root=thr,
-                       reply_to=reply_to() if callable(reply_to) else None)
-        except Exception:
-            pass
+        except ClaudeCancelled:
+            try:
+                await send(rid, "🛑 已停止。", thread_root=thr,
+                           reply_to=reply_to() if callable(reply_to) else None)
+            except Exception:
+                pass
+        except Exception as e:
+            log.exception("处理失败")
+            try:
+                await send(rid, f"出错了：{e}", thread_root=thr,
+                           reply_to=reply_to() if callable(reply_to) else None)
+            except Exception:
+                pass
 
 
 
