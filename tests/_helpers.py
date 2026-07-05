@@ -1,6 +1,6 @@
 """smoke 冒烟自检的共享夹具与桩。
 
-sys.path 引导（让 `import bot` 找到仓库根）+ 通用假对象/假客户端 + 各台账/健康度重置。
+sys.path 引导（让 `import bot` 找到 src/）+ 通用假对象/假客户端 + 各台账/健康度重置。
 各主题模块 `from _helpers import (...)` 取用。产品代码零依赖本文件。
 """
 import asyncio  # noqa: F401
@@ -10,7 +10,7 @@ import sys
 import time     # noqa: F401
 import types    # noqa: F401
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import bot                                  # noqa: E402,F401
 import state                               # noqa: E402,F401

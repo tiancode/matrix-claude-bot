@@ -12,4 +12,4 @@ if [ ! -f .env ]; then
   exit 1
 fi
 chmod 600 .env 2>/dev/null || true   # .env 含 GITEA_TOKEN / 登录密码，收紧权限别让同机其他用户读到
-exec .venv/bin/python bot.py
+exec .venv/bin/python src/bot.py
