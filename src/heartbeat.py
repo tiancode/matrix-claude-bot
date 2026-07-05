@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 from config import settings
 import state
@@ -97,6 +98,15 @@ async def _heartbeat_one(rec: dict, room: str):
 
 
 
+def _in_heartbeat_window(now: float) -> bool:
+    """自驱巡检只在配置的工作日 + 白天时段内进行（默认周一~周五 9~19 点、东八区）。"""
+    local = datetime.fromtimestamp(now, timezone(timedelta(hours=settings.proactive_heartbeat_tz_hours)))
+    if settings.proactive_heartbeat_weekdays_only and local.weekday() >= 5:   # 5=周六 6=周日
+        return False
+    return settings.proactive_heartbeat_start_hour <= local.hour < settings.proactive_heartbeat_end_hour
+
+
+
 async def _heartbeat_loop():
     """周期巡检有"汇报口"的项目；避让最近在弄的项目，免得打断正在派的活、也别为巡检而 clone。"""
     if not settings.proactive_heartbeat_enabled:
@@ -107,6 +117,8 @@ async def _heartbeat_loop():
         try:
             await asyncio.sleep(settings.proactive_heartbeat_interval)
             now = time.time()
+            if not _in_heartbeat_window(now):
+                continue   # 非工作时段：跳过本轮，别半夜/周末打扰人
             for rec in projects.list_projects():
                 pid = rec["id"]
                 room = _project_home_room(pid)
