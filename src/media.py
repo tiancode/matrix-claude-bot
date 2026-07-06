@@ -12,7 +12,7 @@ import state
 from state import _context
 from fmt import _safe_name, _human_bytes
 from matrix_io import send, _is_dm, _resolve_reply_author, _thread_of
-from addressing import _has_trigger, _is_addressed, _mark_engaged
+from addressing import _has_trigger, _is_addressed, _mark_engaged, _mention_note
 from tasks import handle_task
 import transcript
 
@@ -169,6 +169,8 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
             line = f"[文件] {fname}（{saved.get('error', '未处理')}）"
         if caption:
             line += f"\n说明：{caption}"
+        # 配文里 @ 了谁也补附注（与文本消息一致）；skip_body 传的就是这个 line，天然保持匹配
+        line += _mention_note(room, (event.source or {}).get("content", {}))
         _context[rid].append((time.time(), sender, line, _thread_of(event)))   # 本地时钟+线程标记，与文本一致
         transcript.append(rid, sender, line, event_id=getattr(event, "event_id", ""))
 

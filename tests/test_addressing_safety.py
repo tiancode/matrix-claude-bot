@@ -317,6 +317,31 @@ def test_undecryptable_notifies_and_rate_limits():
         bot._last_undecrypt_notice.pop(rid, None)
 
 
+# ---------- 「@了 谁」附注：@pill 纯文本里只剩显示名，靠元数据补出点名对象 ----------
+def test_mention_note():
+    set_identity()
+    room = FakeRoom("!g:ex.org", 3)
+    note = addressing._mention_note(
+        room, {"m.mentions": {"user_ids": ["@claudebot:ex.org", "@alice:ex.org"]}})
+    assert note == "〔@了 Alice〕"                                     # bot 自己不进附注，MXID 解析成显示名
+    assert addressing._mention_note(
+        room, {"m.mentions": {"user_ids": ["@claudebot:ex.org"]}}) == ""   # 只 @了 bot → 无附注
+    assert addressing._mention_note(room, {}) == ""                    # 没 @ 人 → 空串
+    assert addressing._mention_note(
+        room, {"m.mentions": {"user_ids": ["@bob:ex.org"]}}) == "〔@了 @bob:ex.org〕"  # 查不到显示名退回 MXID
+
+    # 老客户端只发富文本 pill：引用块里的 pill 不算，正文里的算；百分号转义的 MXID 也能解
+    fb = ('<mx-reply><blockquote><a href="https://matrix.to/#/@bob:ex.org">Bob</a> 旧话'
+          '</blockquote></mx-reply>问下 <a href="https://matrix.to/#/%40alice%3Aex.org">Alice</a> 的进度')
+    assert addressing._mention_note(room, {"formatted_body": fb}) == "〔@了 Alice〕"
+    # 房间/事件链接不是人，不进附注；m.mentions 与 pill 同指一人不重复
+    assert addressing._mention_note(
+        room, {"formatted_body": '<a href="https://matrix.to/#/%23room%3Aex.org">房间</a>'}) == ""
+    assert addressing._mention_note(
+        room, {"m.mentions": {"user_ids": ["@alice:ex.org"]},
+               "formatted_body": '<a href="https://matrix.to/#/@alice:ex.org">Alice</a>'}) == "〔@了 Alice〕"
+
+
 TESTS = [
     ('认 reply / 点名', test_reply_addressing),
     ('引用回退块剥离', test_reply_fallback_strip),
@@ -329,4 +354,5 @@ TESTS = [
     ('孤儿房间 人走光自动退', test_leave_when_alone),
     ('退房清尾巴 绑定/路由/任务/记录', test_leave_cleans_up_room),
     ('加密解不开 要密钥+提示+限流', test_undecryptable_notifies_and_rate_limits),
+    ('「@了 谁」附注 解析/排己/去重', test_mention_note),
 ]

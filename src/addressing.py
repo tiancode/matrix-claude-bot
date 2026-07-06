@@ -1,6 +1,7 @@
 """判定该不该应答：点名 / 回复 bot / 触发词 / 续话窗口 / 剥引用块与自我 @。"""
 import re
 import time
+from urllib.parse import unquote
 
 from nio import MatrixRoom, RoomMessageText
 
@@ -19,6 +20,29 @@ def _addresses_other_user(content: dict) -> bool:
     """这条消息是否 @ 了 bot 以外的人（@别人 → 在跟别人说话，不当成对 bot 的续话）。"""
     ids = content.get("m.mentions", {}).get("user_ids", []) or []
     return any(u and u != state.MY_ID for u in ids)
+
+
+
+def _mention_note(room: MatrixRoom, content: dict) -> str:
+    """这条消息 @ 了谁（bot 自己除外）→ 渲染成正文附注，如「〔@了 张三、李四〕」；没 @ 人返回空串。
+    客户端发 @pill 时纯文本 body 里往往只剩显示名（连 @ 都没有），光看正文分不清「正式点名」和
+    「顺嘴提个名字」——落背景/拼任务时把这附注补在正文后，Claude 才知道谁被点名了；点名判定本身
+    不用它（那边直接读元数据）。以 m.mentions 为准，兼容只发富文本 pill 的老客户端
+    （剔 <mx-reply> 引用块再扫，同点名判定，别把回复引文里的 @ 也算上）。"""
+    ids = list(content.get("m.mentions", {}).get("user_ids", []) or [])
+    fb = re.sub(r"<mx-reply>.*?</mx-reply>", "",
+                content.get("formatted_body", "") or "", flags=re.S | re.I)
+    for raw in re.findall(r"matrix\.to/#/([^\"'<>?#\s]+)", fb):
+        uid = unquote(raw)          # pill 的 MXID 可能被百分号转义
+        if uid.startswith("@"):     # 只认用户（房间/事件链接以 #、! 开头）
+            ids.append(uid)
+    seen, names = set(), []
+    for uid in ids:
+        if not uid or uid == state.MY_ID or uid in seen:
+            continue
+        seen.add(uid)
+        names.append(room.user_name(uid) or uid)
+    return f"〔@了 {'、'.join(names)}〕" if names else ""
 
 
 

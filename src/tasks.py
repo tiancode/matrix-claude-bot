@@ -13,7 +13,7 @@ from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
 from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
                        _thread_of, _thread_root_of, _ack, _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
-from addressing import _strip_reply_fallback
+from addressing import _strip_reply_fallback, _mention_note
 from dispatch import _dispatch, _general_rec
 from projects import projects, trusted_repo_info, _valid_name
 from claude_runner import runner, ClaudeCancelled
@@ -253,6 +253,10 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     要隔离的串台源），只补一行线程起点。"""
     rid = room.room_id
     sender = room.user_name(event.sender) or event.sender
+    # 这条消息 @ 了谁的附注：拼进任务正文让 Claude 看到点名对象（@pill 纯文本里只剩显示名）。
+    # 落背景时（bot.py）正文尾部也带同一附注，下面 skip/mark_after 的原文匹配要按同样规则拼。
+    note = _mention_note(room, (event.source or {}).get("content", {}))
+    text += note
     mark_after = None   # 顶层任务：等派活【成功】后再把这条标 dispatched（见下方 log「完成」处），
                         # 别在 ask 之前抢标——否则取消/报错、根本没进会话的消息也被标，下轮反被剔出背景
     if sess_thread:   # 线程任务：背景只带线程起点；fork 前的房间历史已在父会话里，fork 后要的就是隔离
@@ -260,7 +264,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         ctx = f"—— 本线程起点 ——\n{origin}" if origin else ""
     else:
         cur_body = (skip_body if skip_body is not None
-                    else _strip_reply_fallback(event.body or "", (event.source or {}).get("content", {})))
+                    else _strip_reply_fallback(event.body or "",
+                                               (event.source or {}).get("content", {})) + note)
         # 已有可续接的房间会话（--resume 会带上历次派过的消息）→ 背景里就别再喂「以前派过的用户消息」；
         # 没有会话（首轮/reset/过期）→ 背景是唯一来源，drop_dispatched=False 照常全带。
         resuming = runner.session_ts(_sess_key(rec, rid)) is not None

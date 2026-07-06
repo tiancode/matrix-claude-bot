@@ -373,6 +373,39 @@ def test_thread_scoped_session_forks():
         settings.stream_replies, settings.reply_in_thread, bot.runner.reset = orig
         bot._context[rid].clear()
 
+# ---------- 「@了 谁」附注贯通：背景/任务正文都看得到点名对象，skip 去重不被附注破坏 ----------
+def test_mention_note_in_context_and_prompt():
+    set_identity(); state._synced = True
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    captured = {}
+    async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
+                       on_delta=None, cancel_key=None, **_kw):
+        captured["prompt"] = prompt
+        return "搞定"
+    bot.runner.ask = fake_ask
+    room = FakeRoom("!mn:ex.org", 3)
+    rid = room.room_id
+    orig = (settings.stream_replies, settings.reply_in_thread)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    try:
+        bot._context[rid].clear()
+        bot._context[rid].append((time.time(), "Bob", "先垫一条背景"))
+        ev = make_event("@claude-bot 问下 Alice 的进度", sender="@bob:ex.org", event_id="$mn1",
+                        mentions=["@claudebot:ex.org", "@alice:ex.org"])
+        _drain_and_run(bot.on_message(room, ev))
+        # ① 落进背景的这条正文尾部带附注（Claude 拼背景时能看到谁被点名，@bot 自己不进附注）
+        stored = [b for _, s, b, *_ in bot._context[rid] if s == "@bob:ex.org"]
+        assert stored and stored[0].endswith("〔@了 Alice〕") and "claudebot" not in stored[0].split("〔")[-1]
+        # ② 派给 Claude 的当前任务正文也带附注
+        task_part = captured["prompt"].split("【当前要你处理的任务】")[-1]
+        assert "问下 Alice 的进度〔@了 Alice〕" in task_part
+        # ③ skip/dispatched 的原文匹配按同样规则拼过：当前消息没在背景区重复出现
+        assert "问下 Alice 的进度" not in captured["prompt"].split("【当前要你处理的任务】")[0]
+    finally:
+        settings.stream_replies, settings.reply_in_thread = orig
+        bot._context[rid].clear()
+
 # ---------- 新增能力 2) /help + 进房欢迎 ----------
 def test_help_and_welcome():
     set_identity(); state._synced = True
@@ -504,6 +537,7 @@ TESTS = [
     ('runner 会话过期全新开触发 on_reset', test_runner_on_reset_fires_on_expired_session),
     ('runner fork 接上父会话时不误触发 on_reset', test_runner_on_reset_skipped_when_fork_rescues_expired_thread),
     ('线程会话细分+起点背景+线程reset', test_thread_scoped_session_forks),
+    ('「@了 谁」附注贯通背景/任务正文', test_mention_note_in_context_and_prompt),
     ('/help + 进房欢迎', test_help_and_welcome),
     ('/summarize 小结最近对话', test_summarize_command),
     ('/cancel 停当前任务', test_cancel_command),
