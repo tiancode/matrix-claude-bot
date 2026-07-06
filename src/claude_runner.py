@@ -516,6 +516,11 @@ class ClaudeRunner:
                     ps.turn = None
                     _kill_group(ps.proc)
                     raise
+                except Exception:
+                    # fut 以异常收尾（进程被 /cancel 杀、崩溃）：await 会把异常直接抛出来，
+                    # 这里吞掉跳出循环，交给下面 fut.result() 统一分流成非零 rc——
+                    # 让 ask() 判 token.cancelled 报"已停止"，而不是把异常一路穿成"出错了"。
+                    break
             try:
                 fut.result()
             except RuntimeError:
