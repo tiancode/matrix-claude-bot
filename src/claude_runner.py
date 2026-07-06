@@ -61,6 +61,32 @@ def _kill_group(proc) -> None:
             pass
 
 
+class _Persist:
+    """一个会话 key 的常驻 claude 进程（--input-format stream-json）。
+
+    回合结束（result 事件）后进程不退出，留在原地等 stdin 的下一条用户消息——于是
+    Claude 在回合里启动的后台任务（子代理/后台命令）跨轮次存活；任务完成时 CLI 会自动
+    续跑再吐一轮 assistant/result，这类"回合外自发产出"经 on_notify 回投给房间。
+    """
+    __slots__ = ("key", "proc", "reader", "turn", "on_notify", "sid",
+                 "last_activity", "err_tail", "spont_text", "cwd")
+
+    def __init__(self, key: str, proc, cwd: str):
+        self.key = key
+        self.proc = proc
+        self.cwd = cwd
+        self.reader = None        # stdout 读取任务（进程同寿命）
+        self.turn = None          # 活动回合状态 dict；None=回合外
+        self.on_notify = None     # async fn(text)：回合外自发产出的投递回调（每轮 ask 可刷新）
+        self.sid = None           # 事件流里报的 session_id（进程死后靠它 --resume 续命）
+        self.last_activity = time.time()
+        self.err_tail = bytearray()   # stderr 尾部（诊断/判 resume 失效用）
+        self.spont_text = ""      # 回合外累计的 assistant 文本
+
+    def alive(self) -> bool:
+        return self.proc.returncode is None
+
+
 class ClaudeRunner:
     def __init__(self):
         self._sessions: dict[str, tuple[str, float]] = self._load_sessions()  # key -> (session_id, ts)
@@ -70,6 +96,8 @@ class ClaudeRunner:
         self._quick_sema = asyncio.Semaphore(max(1, settings.max_concurrency))  # quick 独立并发池
         self._active: dict[str, list] = {}   # cancel_key -> 正在跑的子进程列表（供 /cancel 杀）
         self._tokens: dict[str, set] = {}    # cancel_key -> 在途任务的取消令牌集合（含排队等锁、prepare 中、运行中的）
+        self._persist: dict[str, _Persist] = {}   # key -> 常驻进程（CLAUDE_PERSISTENT=1）
+        self._reaper: asyncio.Task | None = None  # 空闲常驻进程回收循环
 
     # ---- 取消：杀在跑的子进程 + 给在途任务（含还没起进程的排队/准备中）置取消令牌 ----
     def cancel(self, cancel_key: str) -> tuple[int, int]:
@@ -147,6 +175,9 @@ class ClaudeRunner:
         self._sessions.pop(key, None)
         self._epoch[key] = self._epoch.get(key, 0) + 1
         self._save_sessions()
+        ps = self._persist.pop(key, None)   # 常驻进程与会话同寿命：/reset 一并杀掉
+        if ps is not None:
+            _kill_group(ps.proc)
 
     def _sid(self, key: str) -> tuple[str | None, bool]:
         """返回 (有效 session_id 或 None, 是否因空闲超时刚被清掉)。"""
@@ -282,6 +313,222 @@ class ClaudeRunner:
                     pass
         return proc.returncode, bytes(err_buf)
 
+    # ---- 常驻进程模式（CLAUDE_PERSISTENT）：进程跨轮次保活，后台任务不随回合死 ----
+    def _cmd_persistent(self, sid: str | None, system_prompt: str | None,
+                        fork: bool) -> list[str]:
+        """常驻 agentic 进程的命令行：无位置 prompt（消息走 stdin NDJSON），其余同 _cmd(agentic)。"""
+        cmd = [settings.claude_bin, "-p",
+               "--input-format", "stream-json",
+               "--output-format", "stream-json", "--verbose"]
+        if settings.claude_model:
+            cmd += ["--model", settings.claude_model]
+        if settings.claude_dangerous:
+            cmd += ["--dangerously-skip-permissions"]
+        elif settings.claude_permission_mode:
+            cmd += ["--permission-mode", settings.claude_permission_mode]
+        sp = system_prompt if system_prompt is not None else settings.claude_system_prompt
+        if sp and not sid:   # 系统提示只在开新会话时设一次（同 _cmd）
+            cmd += ["--append-system-prompt", sp]
+        if sid:
+            cmd += ["--resume", sid]
+            if fork:
+                cmd += ["--fork-session"]
+        if settings.claude_extra_args:
+            cmd += shlex.split(settings.claude_extra_args)
+        return cmd
+
+    async def _persist_spawn(self, key: str, sid: str | None, fork: bool,
+                             system_prompt: str | None, cwd: str | None) -> _Persist:
+        workdir = cwd or settings.claude_workdir
+        os.makedirs(workdir, exist_ok=True)
+        proc = await asyncio.create_subprocess_exec(
+            *self._cmd_persistent(sid, system_prompt, fork),
+            cwd=workdir,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True, limit=1024 * 1024,
+        )
+        ps = _Persist(key, proc, workdir)
+        ps.sid = None if fork else sid   # fork 会派生新 sid，事件流里会报真值
+        loop = asyncio.get_running_loop()
+        ps.reader = loop.create_task(self._persist_reader(ps))
+        loop.create_task(self._persist_drain_err(ps))
+        self._persist[key] = ps
+        self._ensure_reaper()
+        return ps
+
+    async def _persist_drain_err(self, ps: _Persist):
+        """持续吸 stderr（防管道堵死），只留尾部 64KB 供诊断/判 resume 失效。"""
+        try:
+            while True:
+                b = await ps.proc.stderr.read(65536)
+                if not b:
+                    break
+                ps.err_tail.extend(b)
+                if len(ps.err_tail) > 65536:
+                    del ps.err_tail[:len(ps.err_tail) - 65536]
+        except Exception:
+            pass
+
+    async def _persist_reader(self, ps: _Persist):
+        """常驻进程的 stdout 读取循环（进程同寿命）。回合内事件喂给活动回合；回合外的
+        自发产出（后台任务完成后 CLI 自动续跑）经 on_notify 投递。进程一死就收尾摘除。"""
+        proc = ps.proc
+        buf = bytearray()
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                ps.last_activity = time.time()
+                buf.extend(chunk)
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line = bytes(buf[:nl]); del buf[:nl + 1]
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line.decode(errors="ignore"))
+                    except json.JSONDecodeError:
+                        continue
+                    try:
+                        await self._persist_event(ps, obj)
+                    except Exception:
+                        log.exception("常驻进程事件处理异常（忽略，继续读）")
+                if len(buf) > 32 * 1024 * 1024:   # 防单行失控吃内存
+                    del buf[:]
+        finally:
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            if self._persist.get(ps.key) is ps:
+                self._persist.pop(ps.key, None)
+            t, ps.turn = ps.turn, None
+            if t and not t["fut"].done():   # 回合进行中进程死了（被杀/崩溃/resume 失败秒退）
+                t["fut"].set_exception(RuntimeError("claude 常驻进程退出"))
+
+    async def _persist_event(self, ps: _Persist, obj: dict):
+        if obj.get("session_id"):
+            ps.sid = obj["session_id"]
+        t = obj.get("type")
+        turn = ps.turn
+        if turn is not None:                     # 回合内：行为等同 _run_stream 的 _on_line
+            turn["last_io"] = time.time()
+            if t == "assistant":
+                for blk in (obj.get("message") or {}).get("content") or []:
+                    if blk.get("type") == "text" and blk.get("text"):
+                        turn["text"] += (("\n\n" if turn["text"] else "") + blk["text"])
+                        if turn["on_delta"]:
+                            await turn["on_delta"](turn["text"], None)
+                    elif blk.get("type") == "tool_use" and turn["on_delta"]:
+                        await turn["on_delta"](turn["text"], blk.get("name"))
+            elif t == "result":
+                if isinstance(obj.get("result"), str):
+                    turn["result"] = obj["result"]
+                turn["is_err"] = bool(obj.get("is_error"))
+                if not turn["fut"].done():
+                    turn["fut"].set_result(None)
+            return
+        # 回合外：后台任务完成 → CLI 自动续跑的自发产出，攒文本、result 时整体投递
+        if t == "assistant":
+            for blk in (obj.get("message") or {}).get("content") or []:
+                if blk.get("type") == "text" and blk.get("text"):
+                    ps.spont_text += (("\n\n" if ps.spont_text else "") + blk["text"])
+        elif t == "result":
+            text = obj["result"] if isinstance(obj.get("result"), str) else ps.spont_text
+            ps.spont_text = ""
+            cb = ps.on_notify
+            if cb is not None and (text or "").strip():
+                asyncio.get_running_loop().create_task(self._safe_notify(cb, text.strip()))
+
+    @staticmethod
+    async def _safe_notify(cb, text: str):
+        try:
+            await cb(text)
+        except Exception:
+            log.exception("后台产出投递回调失败（丢弃这条产出）")
+
+    def _ensure_reaper(self):
+        if self._reaper is None or self._reaper.done():
+            self._reaper = asyncio.get_running_loop().create_task(self._reap_loop())
+
+    async def _reap_loop(self):
+        """周期回收空闲常驻进程：释放内存。会话 sid 已落盘，下条消息照常 --resume，上下文不丢。"""
+        while True:
+            await asyncio.sleep(600)
+            now = time.time()
+            for key, ps in list(self._persist.items()):
+                if ps.turn is None and now - ps.last_activity > settings.persistent_idle:
+                    self._persist.pop(key, None)
+                    _kill_group(ps.proc)
+                    log.info("回收空闲常驻 claude 进程 %s（闲置 %.0f 分钟）",
+                             key, (now - ps.last_activity) / 60)
+            if not self._persist:
+                self._reaper = None
+                return
+
+    async def _persist_once(self, key: str, sid: str | None, fork: bool, prompt: str,
+                            system_prompt: str | None, cwd: str | None,
+                            on_delta, on_notify, on_proc):
+        """常驻进程跑一个回合。返回值形状与 ask._once 相同：
+        rc==0 → (0, 结果字符串, b"", (session_id, is_error))；失败 → (rc, b"", stderr尾, None)。"""
+        async with self._sema:   # 并发额度只在回合期间占用；空闲常驻进程不占
+            ps = self._persist.get(key)
+            if ps is not None and not ps.alive():
+                self._persist.pop(key, None)
+                ps = None
+            if ps is None:
+                ps = await self._persist_spawn(key, sid, fork, system_prompt, cwd)
+            if on_proc:
+                on_proc(ps.proc)   # 登记给 /cancel（杀常驻进程=停任务；下轮凭 sid 重生）
+            if on_notify is not None:
+                ps.on_notify = on_notify
+            fut = asyncio.get_running_loop().create_future()
+            turn = {"fut": fut, "on_delta": on_delta, "text": "", "result": None,
+                    "is_err": False, "last_io": time.time()}
+            ps.turn = turn
+            try:
+                msg = json.dumps({"type": "user", "message": {
+                    "role": "user", "content": [{"type": "text", "text": prompt}]}},
+                    ensure_ascii=False) + "\n"
+                ps.proc.stdin.write(msg.encode())
+                await ps.proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
+                ps.turn = None
+                _kill_group(ps.proc)
+                return 1, b"", bytes(ps.err_tail), None
+            eff = settings.claude_timeout or 600
+            # 空闲超时语义同 _run_stream：持续产出不限总时长，静默 eff 秒才判卡死
+            while not fut.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(fut), timeout=10)
+                except asyncio.TimeoutError:
+                    if time.time() - turn["last_io"] > eff:
+                        ps.turn = None
+                        _kill_group(ps.proc)
+                        raise RuntimeError("Claude 响应超时")
+                except asyncio.CancelledError:
+                    # 同 _run：协程被取消（Ctrl-C）别把子进程组丢成孤儿
+                    ps.turn = None
+                    _kill_group(ps.proc)
+                    raise
+            try:
+                fut.result()
+            except RuntimeError:
+                # 回合中进程退出（被 /cancel 杀、崩溃、--resume 失败秒退）：
+                # 交回非零 rc + stderr 尾，让 ask() 现有的"会话失效重试"逻辑接手判断
+                ps.turn = None
+                return (ps.proc.returncode if ps.proc.returncode is not None else 1), \
+                    b"", bytes(ps.err_tail), None
+            ps.turn = None
+            ps.last_activity = time.time()
+            result = turn["result"] if turn["result"] is not None else turn["text"]
+            return 0, (result or "").strip(), b"", (ps.sid, turn["is_err"])
+
     @staticmethod
     def _parse(out: bytes) -> tuple[str, str | None, bool]:
         try:
@@ -339,7 +586,7 @@ class ClaudeRunner:
     async def ask(self, key: str, prompt: str, cwd: str | None = None,
                   system_prompt: str | None = None, lock_key: str | None = None,
                   prepare=None, on_delta=None, cancel_key: str | None = None,
-                  fork_from: str | None = None, on_reset=None) -> str:
+                  fork_from: str | None = None, on_reset=None, on_notify=None) -> str:
         """带工具、带会话上下文地干活；cwd=该项目的仓库目录。
 
         key:        会话维度（项目+房间[+线程]），不同房间/私聊用户互不串台。
@@ -353,6 +600,9 @@ class ClaudeRunner:
                     公共前缀逐字节相同，缓存 TTL 内还能命中 prompt cache。父会话也不存在就全新开。
         on_reset:   续接的 sid 被 claude 判失效、就地清掉会话改全新开时回调一次（无参）。调用方据此
                     作废「本以为在这条会话里、其实已丢」的派生状态（如背景缓冲的 dispatched 标记）。
+        on_notify:  常驻进程模式下"回合外自发产出"（后台任务完成后 CLI 自动续跑）的投递回调
+                    async fn(text)。不传则沿用该会话上次设置的回调（心跳/工单等复用聊天会话时
+                    别把聊天设好的投递口冲掉）。
         """
         lock_key = lock_key or key
         ckey = cancel_key or lock_key
@@ -370,6 +620,9 @@ class ClaudeRunner:
         async def _once(sid, fork=False):
             """跑一次。返回 (rc, payload, err, meta)：
             rc==0 → payload=结果字符串, meta=(session_id, is_error)；rc!=0 → payload=原始 stdout 字节, meta=None。"""
+            if settings.claude_persistent:
+                return await self._persist_once(key, sid, fork, prompt, system_prompt,
+                                                cwd, on_delta, on_notify, _reg)
             if on_delta is None:
                 rc, out, err = await self._run(self._cmd(prompt, sid, True, system_prompt, fork=fork),
                                                cwd, on_proc=_reg)
@@ -411,6 +664,12 @@ class ClaudeRunner:
                     raise ClaudeCancelled()
                 epoch = self._epoch.get(key, 0)
                 sid, expired = self._sid(key)
+                if sid is None:
+                    # 会话已过期/不存在：残留的常驻进程（若有）承载的是旧上下文，一并作废，
+                    # 别让"新任务"接在一条按理该翻篇的进程里续写。
+                    stale = self._persist.pop(key, None)
+                    if stale is not None:
+                        _kill_group(stale.proc)
                 fork = False
                 if sid is None and fork_from:      # 本 key 还没会话：从父会话分叉（父也没有就全新开）
                     parent_sid, _ = self._sid(fork_from)

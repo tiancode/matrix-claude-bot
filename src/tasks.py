@@ -312,6 +312,15 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             return reply_to() if callable(reply_to) else reply_to
         except Exception:
             return None
+
+    async def _bg_notify(bg_text: str):
+        # 常驻进程模式：回合结束后后台任务（子代理/后台命令）完成，Claude 续跑的产出从这里
+        # 作为一条新消息投回房间（挂原线程）。与占位/inflight 无关——那套只管当轮问答。
+        try:
+            out = await _emit_files(room, bg_text, cwd, thread_root)
+            await send(rid, out, track=True, thread_root=thread_root)
+        except Exception:
+            log.exception("[%s] 后台任务产出投递失败", rid)
     try:
         # 排队回执：串行锁被占（同项目已有任务在跑）时立即知会，别让用户对着 typing 猜消息丢没丢。
         # 尽力而为——与对方拿锁存在竞态，漏发只影响提示不影响排队本身。
@@ -333,7 +342,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                 answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
                                           lock_key=lock_key, prepare=prepare,
                                           on_delta=_relay, cancel_key=rid,
-                                          on_reset=lambda: _clear_dispatched(rid), **fork_kw)
+                                          on_reset=lambda: _clear_dispatched(rid),
+                                          on_notify=_bg_notify, **fork_kw)
             except ClaudeCancelled:
                 await live.finalize("🛑 已停止。", track=False)
                 return
@@ -352,7 +362,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             try:
                 answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
                                           lock_key=lock_key, prepare=prepare, cancel_key=rid,
-                                          on_reset=lambda: _clear_dispatched(rid), **fork_kw)
+                                          on_reset=lambda: _clear_dispatched(rid),
+                                          on_notify=_bg_notify, **fork_kw)
             except ClaudeCancelled:
                 await send(rid, "🛑 已停止。", thread_root=thread_root, reply_to=_reply_eid())
                 return

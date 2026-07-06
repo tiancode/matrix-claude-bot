@@ -114,6 +114,13 @@ class Settings:
     claude_permission_mode = _s("CLAUDE_PERMISSION_MODE", "acceptEdits")
     claude_dangerous = _b("CLAUDE_DANGEROUS", True)
     claude_extra_args = _s("CLAUDE_EXTRA_ARGS")
+    # agentic 会话用常驻进程（--input-format stream-json）：回合结束进程不退出，等下一条消息。
+    # 这样 Claude 在回合里启动的后台任务（子代理/后台命令）跨轮次存活，完成后 CLI 自动续跑，
+    # 产出经 on_notify 回投房间。关掉则回到每消息一次性进程（后台任务随回合死）。
+    claude_persistent = _b("CLAUDE_PERSISTENT", True)
+    # 常驻进程空闲回收（秒）：超过此时长没有任何活动（无回合、无后台产出）就杀掉释放内存；
+    # 下一条消息会用落盘的 session_id 照常 --resume，对话上下文不丢，只是后台任务不再跨过回收点。
+    persistent_idle = _i("CLAUDE_PERSISTENT_IDLE", 7200)
     session_ttl    = _i("SESSION_TTL", 86400)   # 多轮上下文空闲过期：默认 24 小时
     max_concurrency = _i("MAX_CONCURRENCY", 2)
 

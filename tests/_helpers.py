@@ -25,6 +25,10 @@ import issue_intake                        # noqa: E402,F401
 from config import settings, redact        # noqa: E402,F401
 from nio import RoomMessageText            # noqa: E402,F401
 
+# 存量用例都是针对一次性进程路径写的（stub 掉 _run/_run_stream）；常驻进程模式有自己的
+# 专门用例（test_persistent.py，自带假 CLI），这里统一关掉，别让两套路径混跑互相踩。
+settings.claude_persistent = False
+
 __all__ = [
     "asyncio", "json", "os", "sys", "time", "types",
     "bot", "state", "dispatch", "proactive", "tasks", "heartbeat", "media",
