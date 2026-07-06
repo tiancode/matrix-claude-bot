@@ -103,9 +103,98 @@ def test_persistent_respawn_after_death():
     _with_persistent(go)
 
 
+# ---------- steering：回合进行中把追加消息写进 stdin（像 Claude Code 运行中打字） ----------
+def test_try_steer_injects_only_mid_turn():
+    import json as _json
+    import types as _types
+    from _helpers import set_identity
+    set_identity()
+    r = cr.ClaudeRunner()
+    written = []
+
+    class FS:   # 假 stdin：只记写入
+        def write(self, b):
+            written.append(b)
+        async def drain(self):
+            pass
+
+    ps = cr._Persist("k|r", _types.SimpleNamespace(returncode=None, stdin=FS()), "/tmp")
+    r._persist["k|r"] = ps
+    orig = settings.claude_persistent
+    settings.claude_persistent = True
+    try:
+        assert asyncio.run(r.try_steer("k|r", "x")) is False        # 回合外不注入（会被当下一任务）
+        ps.turn = {"fut": None}
+        assert asyncio.run(r.try_steer("k|r", "追加一句")) is True  # 回合中注入
+        obj = _json.loads(written[0].decode())
+        assert obj["type"] == "user"
+        assert obj["message"]["content"][0]["text"] == "追加一句"
+        assert asyncio.run(r.try_steer("nokey|r", "x")) is False    # 没有常驻进程的 key 不注入
+        settings.claude_persistent = False
+        assert asyncio.run(r.try_steer("k|r", "x")) is False        # 非常驻模式整体关闭
+    finally:
+        settings.claude_persistent = orig
+
+
+def test_handle_task_steers_when_turn_running():
+    """回合进行中来的新点名：不排队开新回合，递进当前回合 + 📎 回执 + 标 dispatched；
+    steering 失败（回合恰好结束/进程刚死）回落正常派活。"""
+    from _helpers import (FakeRoom, _CapClient, bot, make_event, set_identity,
+                          state, time, _task_fixtures)
+    set_identity()
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    steered, asked = {}, {"n": 0}
+
+    async def fake_steer(key, text):
+        steered["key"], steered["text"] = key, text
+        return True
+
+    async def fake_ask(*a, **k):
+        asked["n"] += 1
+        return "搞定"
+
+    orig = (bot.runner.try_steer, bot.runner.ask,
+            settings.stream_replies, settings.reply_in_thread, settings.steer_enabled)
+    bot.runner.try_steer, bot.runner.ask = fake_steer, fake_ask
+    settings.stream_replies = False; settings.reply_in_thread = False
+    settings.steer_enabled = True
+    room = FakeRoom("!steer:ex.org", 3)
+    rid = room.room_id
+    try:
+        bot._context[rid].clear()
+        bot._context[rid].append((time.time(), "Alice", "@claude-bot 顺便加个重试"))
+        asyncio.run(bot.handle_task(
+            room, make_event("@claude-bot 顺便加个重试", mentions=[state.MY_ID], event_id="$S1"),
+            "顺便加个重试", skip_body="@claude-bot 顺便加个重试"))
+        assert asked["n"] == 0                                   # 没有排队开新回合
+        assert steered["key"] == f"h/o/r|{rid}"                  # 递进的是本房间会话的回合
+        assert "顺便加个重试" in steered["text"] and "追加" in steered["text"]
+        reacts = [m for m in c.sent
+                  if (m.get("m.relates_to") or {}).get("rel_type") == "m.annotation"]
+        clips = [m for m in reacts if m["m.relates_to"]["key"] == "📎"]
+        assert clips and clips[0]["m.relates_to"]["event_id"] == "$S1"   # 📎 打在触发消息上
+        assert any(state._ctx_dispatched(it) for it in bot._context[rid])  # 已进会话 → 标 dispatched
+
+        async def no_steer(key, text):
+            return False
+        bot.runner.try_steer = no_steer
+        bot._context[rid].append((time.time(), "Alice", "@claude-bot 再来一个"))
+        asyncio.run(bot.handle_task(
+            room, make_event("@claude-bot 再来一个", mentions=[state.MY_ID], event_id="$S2"),
+            "再来一个", skip_body="@claude-bot 再来一个"))
+        assert asked["n"] == 1                                   # 回落到 runner.ask 正常派活
+    finally:
+        (bot.runner.try_steer, bot.runner.ask,
+         settings.stream_replies, settings.reply_in_thread, settings.steer_enabled) = orig
+        bot._context[rid].clear()
+
+
 TESTS = [
     ('常驻进程 跨轮复用同一进程', test_persistent_reuse_across_turns),
     ('常驻进程 后台自发产出经 on_notify 投递', test_persistent_spontaneous_notify),
     ('常驻进程 reset 杀进程并摘除', test_persistent_reset_kills_process),
     ('常驻进程 死后凭 sid 重生', test_persistent_respawn_after_death),
+    ('steering 仅回合中注入 stdin', test_try_steer_injects_only_mid_turn),
+    ('steering 点名递进当前回合+📎+标记', test_handle_task_steers_when_turn_running),
 ]

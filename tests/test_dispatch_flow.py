@@ -450,6 +450,51 @@ def test_mention_note_immune_to_displayname_drift():
         settings.stream_replies, settings.reply_in_thread = orig
         bot._context[rid].clear()
 
+# ---------- 连发合并：短窗内同一人连发的消息并成一个任务，去重/附注不变形 ----------
+def test_debounce_merges_rapid_messages():
+    set_identity(); state._synced = True
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    captured = {"n": 0}
+    async def fake_ask(key, prompt, **_kw):
+        captured["n"] += 1
+        captured["prompt"] = prompt
+        return "搞定"
+    bot.runner.ask = fake_ask
+    room = FakeRoom("!db:ex.org", 3)
+    rid = room.room_id
+    orig = (settings.stream_replies, settings.reply_in_thread, settings.message_debounce)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    settings.message_debounce = 0.2
+    try:
+        bot._context[rid].clear()
+        bot._context[rid].append((time.time(), "Bob", "垫一条背景"))
+        async def go():
+            # 第一条点名 + 紧接一条没点名的补充（一句话分两条打）；第二条若不被合并，
+            # 会因 _mark_engaged 落进续话弱信号路径去打语义闸（这里未打桩，走到就会炸）
+            await bot.on_message(room, make_event(
+                "@claude-bot 修一下登录", mentions=[state.MY_ID],
+                sender="@alice:ex.org", event_id="$db1"))
+            await bot.on_message(room, make_event(
+                "顺便把注册流程也看看", sender="@alice:ex.org", event_id="$db2"))
+            for _ in range(80):
+                pend = [t for t in state._tasks if not t.done()]
+                if not pend:
+                    break
+                await asyncio.gather(*pend, return_exceptions=True)
+        asyncio.run(go())
+        assert captured["n"] == 1                                     # 两条并成一个任务，只派一次
+        head, _, task = captured["prompt"].partition("【当前要你处理的任务】")
+        assert "修一下登录" in task and "顺便把注册流程也看看" in task
+        assert "修一下登录" not in head and "顺便把注册流程" not in head  # 多条 skip 全部剔出背景
+        # 两条原文事后都标 dispatched（续接轮背景不再重复喂）
+        marked = [it for it in bot._context[rid] if state._ctx_dispatched(it)]
+        assert len(marked) == 2
+    finally:
+        settings.stream_replies, settings.reply_in_thread, settings.message_debounce = orig
+        bot._pending_dispatch.clear()
+        bot._context[rid].clear()
+
 # ---------- 新增能力 2) /help + 进房欢迎 ----------
 def test_help_and_welcome():
     set_identity(); state._synced = True
@@ -583,6 +628,7 @@ TESTS = [
     ('线程会话细分+起点背景+线程reset', test_thread_scoped_session_forks),
     ('「@了 谁」附注贯通背景/任务正文', test_mention_note_in_context_and_prompt),
     ('「@了 谁」附注抗显示名漂移', test_mention_note_immune_to_displayname_drift),
+    ('连发合并 一个任务/去重/标记', test_debounce_merges_rapid_messages),
     ('/help + 进房欢迎', test_help_and_welcome),
     ('/summarize 小结最近对话', test_summarize_command),
     ('/cancel 停当前任务', test_cancel_command),

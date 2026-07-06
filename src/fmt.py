@@ -130,7 +130,8 @@ def _format_context(room_id: str, skip: tuple[str, str] | None = None,
                     drop_dispatched: bool = False) -> str:
     """把最近对话渲染成带时间的文本；跨度大处插"间隔"提示，让 Claude 自行判断旧话题是否相关。
 
-    skip=(sender, body)：当前任务会单独给出，这里从背景里剔除它，免得喂两遍。
+    skip=(sender, body 或 body 列表)：当前任务会单独给出，这里从背景里剔除它（连发合并的
+    任务对应多条原文，逐条剔），免得喂两遍。
     drop_sender：派任务时传 bot 自己的名字——它过往的回复在 Claude 的续接会话里已经有了，
     再塞进背景纯属重复投喂、还容易让模型对着自己的旧话打转。
     thread：只渲染该范围的消息——None=顶层主时间线（不含任何线程里说的话），线程根 event_id=该线程内。
@@ -145,10 +146,12 @@ def _format_context(room_id: str, skip: tuple[str, str] | None = None,
     items = [it for it in _context[room_id]                 # 先按线程范围（+续接时剔派过的）滤，再取末 n 条
              if _ctx_thread(it) == thread and not (drop_dispatched and _ctx_dispatched(it))][-n:]
     if skip and items:
-        for i in range(len(items) - 1, -1, -1):   # 从最近往前找到这条任务并删掉
-            if items[i][1:3] == skip:             # 只比 (sender, body)，第 4 元线程标记不参与
-                del items[i]
-                break
+        s_sender, s_bodies = skip
+        for b in (s_bodies if isinstance(s_bodies, (list, tuple)) else [s_bodies]):
+            for i in range(len(items) - 1, -1, -1):   # 从最近往前找到这条任务并删掉
+                if items[i][1] == s_sender and items[i][2] == b:   # 第 4 元线程标记不参与
+                    del items[i]
+                    break
     if drop_sender:
         items = [it for it in items if it[1] != drop_sender]
     lines, prev_ts = [], None

@@ -146,6 +146,31 @@ class ClaudeRunner:
             _kill_group(p)
         return running, queued
 
+    # ---- steering：任务进行中把追加消息递进当前回合（像 Claude Code 运行中打字）----
+    async def try_steer(self, key: str, text: str) -> bool:
+        """该 key 的常驻进程【回合在途】时，把 text 作为新的 user 事件写进 stdin 并返回 True；
+        否则返回 False（调用方走正常排队）。CLI 对 mid-turn 消息的两种处理都兼容：
+        · 真 steering——在当前回合的工具间隙注入给模型，最终一并答复；
+        · 排成紧接着的下一回合——多出的 result 会在回合外到达，走"自发产出"通道
+          （_persist_event 的 spont/on_notify 路径）由上一轮设置的回调投回房间。
+        检查与写入之间回合恰好结束的竞态同理落入第二种，无害。写失败（进程刚死）返回 False。"""
+        if not settings.claude_persistent:
+            return False
+        ps = self._persist.get(key)
+        if ps is None or not ps.alive() or ps.turn is None:
+            return False
+        try:
+            msg = json.dumps({"type": "user", "message": {
+                "role": "user", "content": [{"type": "text", "text": text}]}},
+                ensure_ascii=False) + "\n"
+            ps.proc.stdin.write(msg.encode())
+            await ps.proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
+            return False
+        ps.last_activity = time.time()
+        log.info("[%s] steering：追加消息已递进运行中的回合（%d 字）", key, len(text))
+        return True
+
     # ---- 只读查询（/status 用）----
     def running(self, cancel_key: str) -> int:
         """该取消维度（房间）下正在跑的子进程数。"""

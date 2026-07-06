@@ -11,7 +11,7 @@ import state
 from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
                    _last_project_by_room, _save_last_projects, _project_last_active)
 from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
-                       _thread_of, _thread_root_of, _ack, _FILE_SEND_HINT)
+                       _thread_of, _thread_root_of, _ack, _react, _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
 from addressing import _strip_reply_fallback
 from dispatch import _dispatch, _general_rec
@@ -245,8 +245,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                           reply_to=None, sess_thread: str | None = None,
                           mention_note: str = ""):
     """在某项目上跑任务并回发。"正在输入"由调用方 handle_task 的 _typing 统一负责。
-    skip_body：当前这条消息在背景上下文里的原文，用于从背景里剔除它免得重复喂。
-    媒体走的是 "[文件]…" 那行，和 event.body（文件名/caption）不一样，必须由调用方显式传。
+    skip_body：当前这条消息在背景上下文里的原文（连发合并任务是原文列表），用于从背景里
+    剔除它们免得重复喂。媒体走的是 "[文件]…" 那行，和 event.body 不一样，必须由调用方显式传。
     mention_note：这条消息「@了 谁」的附注，由接收方（on_message/media）算好一次传进来——
     这里不自己重算：附注含显示名解析，接收和派活隔着排队/clone 等长间隙，两次算可能不同，
     而 skip/mark_after 靠与落背景时的原文【逐字节】匹配，重算一漂移去重就失效。
@@ -377,8 +377,10 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             answer = await _emit_files(room, answer, cwd, thread_root)
             await send(rid, answer, track=True, thread_root=thread_root, reply_to=_reply_eid())
         log.info("[%s] 完成 %d 字", rid, len(answer))
-        if mark_after:   # 走到这里 = ask 成功、答复已发：这条确实进了会话，现在才标 dispatched，下轮背景剔掉它
-            _mark_dispatched(rid, *mark_after)
+        if mark_after:   # 走到这里 = ask 成功、答复已发：这些消息确实进了会话，现在才标 dispatched，下轮背景剔掉
+            m_sender, m_bodies = mark_after
+            for b in (m_bodies if isinstance(m_bodies, list) else [m_bodies]):
+                _mark_dispatched(rid, m_sender, b)
         if not rec.get("general"):   # 回复里若开了本项目的 PR，记进台账，由跟进循环盯到合并
             pr = _extract_pr(answer, rec)
             if pr and pr_ledger.record(rec["id"], pr[0], pr[1], rid):
@@ -505,6 +507,24 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                     _context[rid].clear()   # 连背景一起清，别让旧对话漏进新会话
                     await send(rid, "已开启新对话 ✅", thread_root=thr)
                 return
+
+            # steering：这个会话的常驻回合正在跑 → 不排队开新回合，把这条直接递进当前回合
+            # （像 Claude Code 运行中打字）。产出由在跑的回合一并答复，或作为紧随的自发回合
+            # 经 on_notify 投回。📎 回执（保留不撤）区别于排队；消息已进会话 → 标 dispatched，
+            # 下轮背景不再重复喂。被 /cancel 杀回合时追加的话随之丢弃（与 Claude Code 一致）。
+            if settings.steer_enabled:
+                steer_rec = projects.get_room(rid) or _general_rec()
+                sender0 = room.user_name(event.sender) or event.sender
+                if await runner.try_steer(_sess_key(steer_rec, rid, sess_thr),
+                                          f"[来自 {sender0}，任务进行中追加] {text}{mention_note}"):
+                    eid0 = getattr(event, "event_id", None)
+                    if eid0:
+                        await _react(rid, eid0, "📎")
+                    bodies = skip_body if isinstance(skip_body, list) else (
+                        [skip_body] if skip_body else [])
+                    for b in bodies:
+                        _mark_dispatched(rid, sender0, b)
+                    return
 
             # 解析/clone + 跑任务整段都开着"正在输入"，避免绑定首次 clone 时房间静默
             async with _typing(rid):

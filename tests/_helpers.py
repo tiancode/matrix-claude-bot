@@ -28,6 +28,8 @@ from nio import RoomMessageText            # noqa: E402,F401
 # 存量用例都是针对一次性进程路径写的（stub 掉 _run/_run_stream）；常驻进程模式有自己的
 # 专门用例（test_persistent.py，自带假 CLI），这里统一关掉，别让两套路径混跑互相踩。
 settings.claude_persistent = False
+# 连发合并窗同理关掉（存量用例都按"逐条即派"写的）；合并行为有专门用例自己开小窗验证。
+settings.message_debounce = 0
 
 __all__ = [
     "asyncio", "json", "os", "sys", "time", "types",

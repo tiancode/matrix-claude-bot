@@ -24,6 +24,13 @@ def _i(key, default):
         return default
 
 
+def _f(key, default):
+    try:
+        return float(_s(key, str(default)))
+    except ValueError:
+        return default
+
+
 def _b(key, default=False):
     v = _s(key)
     if not v:                # 未设置 / 空值 / 纯空白 → 用默认
@@ -80,6 +87,13 @@ class Settings:
     send_files_back = _b("SEND_FILES_BACK", True)
     # /summarize 不带参数时默认回看多少条对话。
     summary_lines = _i("SUMMARY_LINES", 60)
+    # 同一个人连发的消息在这个窗口（秒）内合并成一个任务再派——一句话分几条打是聊天里的常态，
+    # 排两个任务不如并成一个。每来一条窗口顺延，最多总等 6s；代价是每个任务开跑晚这么点。
+    # 0=关（逐条即派）。默认 1.5。
+    message_debounce = _f("MESSAGE_DEBOUNCE", 1.5)
+    # 任务进行中收到的新点名不再排队，而是把消息直接递进正在跑的回合（像 Claude Code 运行中
+    # 打字），打 📎 回执。仅常驻进程模式（CLAUDE_PERSISTENT=1）生效。默认开。
+    steer_enabled = _b("STEER_WHILE_RUNNING", True)
     trigger_phrase = _s("TRIGGER_PHRASE")
     context_lines  = _i("CONTEXT_LINES", 20)
     process_backlog = _b("PROCESS_BACKLOG", False)
