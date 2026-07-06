@@ -169,8 +169,10 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
             line = f"[文件] {fname}（{saved.get('error', '未处理')}）"
         if caption:
             line += f"\n说明：{caption}"
-        # 配文里 @ 了谁也补附注（与文本消息一致）；skip_body 传的就是这个 line，天然保持匹配
-        line += _mention_note(room, (event.source or {}).get("content", {}))
+        # 配文里 @ 了谁也补附注（与文本消息一致）。只算这一次，随 skip_body/mention_note 透传：
+        # skip_body 传的就是这个 line，去重天然逐字节匹配，派活层不再重算（防显示名漂移）。
+        mention_note = _mention_note(room, (event.source or {}).get("content", {}))
+        line += mention_note
         _context[rid].append((time.time(), sender, line, _thread_of(event)))   # 本地时钟+线程标记，与文本一致
         transcript.append(rid, sender, line, event_id=getattr(event, "event_id", ""))
 
@@ -200,7 +202,8 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
         else:
             parts.append(f"（用户发来文件 {fname}，但未取到内容：{saved.get('error', '未知')}）")
         # skip_body=line：派活时这个文件已经写进任务正文了，把背景里那行 "[文件]…" 剔掉别重复喂
-        state._spawn(handle_task(room, event, "\n\n".join(parts), skip_body=line))
+        state._spawn(handle_task(room, event, "\n\n".join(parts),
+                                 skip_body=line, mention_note=mention_note))
     except Exception:
         log.exception("处理媒体失败")
 

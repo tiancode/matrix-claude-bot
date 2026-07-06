@@ -16,7 +16,7 @@ def test_media_download_and_dispatch():
     settings.media_root, settings.media_enabled = tmp, True
     captured = {}
 
-    async def fake_handle(rm, ev, text, skip_body=None):
+    async def fake_handle(rm, ev, text, skip_body=None, **kw):
         captured["text"] = text
 
     class FC:
@@ -254,7 +254,7 @@ def test_group_url_with_task_binds():
     bot.projects.get_room = lambda r: None
     captured = {}
 
-    async def fake_do_bind(room, repo, event=None, task_text=""):
+    async def fake_do_bind(room, repo, event=None, task_text="", **kw):
         captured["repo"], captured["task"] = repo, task_text
 
     bot.do_bind = fake_do_bind

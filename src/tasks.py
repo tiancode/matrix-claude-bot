@@ -13,7 +13,7 @@ from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
 from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
                        _thread_of, _thread_root_of, _ack, _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
-from addressing import _strip_reply_fallback, _mention_note
+from addressing import _strip_reply_fallback
 from dispatch import _dispatch, _general_rec
 from projects import projects, trusted_repo_info, _valid_name
 from claude_runner import runner, ClaudeCancelled
@@ -116,7 +116,8 @@ def _employee_prompt(info: dict) -> str:
 
 
 async def do_bind(room: MatrixRoom, repo: dict,
-                  event: RoomMessageText | None = None, task_text: str = ""):
+                  event: RoomMessageText | None = None, task_text: str = "",
+                  skip_body: str | None = None, mention_note: str = ""):
     rid = room.room_id
     try:
         prev = projects.get_room(rid)   # 换绑判断：还是同一个仓库就别重置会话（重发 URL 不该清掉多轮上下文）
@@ -136,7 +137,7 @@ async def do_bind(room: MatrixRoom, repo: dict,
         await send(rid, f"绑定失败：{e}")
         return
     if task_text and event is not None:   # 绑定后若还跟了任务，接着派下去
-        await handle_task(room, event, task_text)
+        await handle_task(room, event, task_text, skip_body=skip_body, mention_note=mention_note)
 
 
 
@@ -241,10 +242,14 @@ async def _thread_origin_line(room: MatrixRoom, thread_root: str) -> str:
 
 async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, rec: dict,
                           skip_body: str | None = None, thread_root: str | None = None,
-                          reply_to=None, sess_thread: str | None = None):
+                          reply_to=None, sess_thread: str | None = None,
+                          mention_note: str = ""):
     """在某项目上跑任务并回发。"正在输入"由调用方 handle_task 的 _typing 统一负责。
     skip_body：当前这条消息在背景上下文里的原文，用于从背景里剔除它免得重复喂。
     媒体走的是 "[文件]…" 那行，和 event.body（文件名/caption）不一样，必须由调用方显式传。
+    mention_note：这条消息「@了 谁」的附注，由接收方（on_message/media）算好一次传进来——
+    这里不自己重算：附注含显示名解析，接收和派活隔着排队/clone 等长间隙，两次算可能不同，
+    而 skip/mark_after 靠与落背景时的原文【逐字节】匹配，重算一漂移去重就失效。
     thread_root：用户在线程里说话（或旧式 REPLY_IN_THREAD=1）时把答复挂进该线程。
     reply_to：零参可调用，发送/占位那一刻求值——群里已插进别的消息就返回触发消息 event_id
     （改用引用回复指明在回哪条），房间安静就返回 None（顶层直答）。
@@ -253,10 +258,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     要隔离的串台源），只补一行线程起点。"""
     rid = room.room_id
     sender = room.user_name(event.sender) or event.sender
-    # 这条消息 @ 了谁的附注：拼进任务正文让 Claude 看到点名对象（@pill 纯文本里只剩显示名）。
-    # 落背景时（bot.py）正文尾部也带同一附注，下面 skip/mark_after 的原文匹配要按同样规则拼。
-    note = _mention_note(room, (event.source or {}).get("content", {}))
-    text += note
+    text += mention_note   # 拼进任务正文让 Claude 看到点名对象（@pill 纯文本里只剩显示名）
     mark_after = None   # 顶层任务：等派活【成功】后再把这条标 dispatched（见下方 log「完成」处），
                         # 别在 ask 之前抢标——否则取消/报错、根本没进会话的消息也被标，下轮反被剔出背景
     if sess_thread:   # 线程任务：背景只带线程起点；fork 前的房间历史已在父会话里，fork 后要的就是隔离
@@ -265,7 +267,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     else:
         cur_body = (skip_body if skip_body is not None
                     else _strip_reply_fallback(event.body or "",
-                                               (event.source or {}).get("content", {})) + note)
+                                               (event.source or {}).get("content", {})) + mention_note)
         # 已有可续接的房间会话（--resume 会带上历次派过的消息）→ 背景里就别再喂「以前派过的用户消息」；
         # 没有会话（首轮/reset/过期）→ 背景是唯一来源，drop_dispatched=False 照常全带。
         resuming = runner.session_ts(_sess_key(rec, rid)) is not None
@@ -425,7 +427,7 @@ async def _quoted_subject(room: MatrixRoom, event: RoomMessageText) -> str:
 
 
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
-                      skip_body: str | None = None):
+                      skip_body: str | None = None, mention_note: str = ""):
     rid = room.room_id
     # 回执：接手就给触发消息打 👀，处理完（含报错/取消）撤掉——用户不用盯 typing 猜有没有人接。
     # 包住整个函数体（引用回复拉取、线程解析等都在内）：不管走哪条调用路径（强点名/续话/reset），
@@ -483,7 +485,8 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                     _last_project_by_room[rid] = rec["id"]
                     _save_last_projects()   # 落盘：记录"这个房间在弄哪个项目"，供自驱心跳/Gitea 健康度找汇报口
                 await _run_on_project(room, event, text, rec, skip_body=skip_body,
-                                      thread_root=thr, reply_to=reply_to, sess_thread=sess_thr)
+                                      thread_root=thr, reply_to=reply_to, sess_thread=sess_thr,
+                                      mention_note=mention_note)
         except ClaudeCancelled:
             try:
                 await send(rid, "🛑 已停止。", thread_root=thr,

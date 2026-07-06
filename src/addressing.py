@@ -23,22 +23,31 @@ def _addresses_other_user(content: dict) -> bool:
 
 
 
+def _strip_mx_reply(fb: str) -> str:
+    """去掉富文本里的 <mx-reply> 引用块——判点名/找 @pill 都只看正文，别把回复引文里的 @ 算上。"""
+    return re.sub(r"<mx-reply>.*?</mx-reply>", "", fb, flags=re.S | re.I)
+
+
+
 def _mention_note(room: MatrixRoom, content: dict) -> str:
     """这条消息 @ 了谁（bot 自己除外）→ 渲染成正文附注，如「〔@了 张三、李四〕」；没 @ 人返回空串。
     客户端发 @pill 时纯文本 body 里往往只剩显示名（连 @ 都没有），光看正文分不清「正式点名」和
     「顺嘴提个名字」——落背景/拼任务时把这附注补在正文后，Claude 才知道谁被点名了；点名判定本身
-    不用它（那边直接读元数据）。以 m.mentions 为准，兼容只发富文本 pill 的老客户端
-    （剔 <mx-reply> 引用块再扫，同点名判定，别把回复引文里的 @ 也算上）。"""
-    ids = list(content.get("m.mentions", {}).get("user_ids", []) or [])
-    fb = re.sub(r"<mx-reply>.*?</mx-reply>", "",
-                content.get("formatted_body", "") or "", flags=re.S | re.I)
-    for raw in re.findall(r"matrix\.to/#/([^\"'<>?#\s]+)", fb):
-        uid = unquote(raw)          # pill 的 MXID 可能被百分号转义
-        if uid.startswith("@"):     # 只认用户（房间/事件链接以 #、! 开头）
-            ids.append(uid)
+    不用它（那边直接读元数据）。以 m.mentions 为准，兼容只发富文本 pill 的老客户端。
+    event content 是发送方任意可控的 JSON：字段类型全都不可信，逐层校验，畸形的当没有——
+    这里每条消息都要跑，一个非字符串条目就抛异常的话，一条恶意消息就能把整个 bot 打死。"""
+    mm = content.get("m.mentions")
+    ids = mm.get("user_ids") if isinstance(mm, dict) else None
+    ids = list(ids) if isinstance(ids, list) else []
+    fb = content.get("formatted_body")
+    if isinstance(fb, str):
+        for raw in re.findall(r"matrix\.to/#/([^\"'<>?#\s]+)", _strip_mx_reply(fb)):
+            uid = unquote(raw)          # pill 的 MXID 可能被百分号转义
+            if uid.startswith("@"):     # 只认用户（房间/事件链接以 #、! 开头）
+                ids.append(uid)
     seen, names = set(), []
     for uid in ids:
-        if not uid or uid == state.MY_ID or uid in seen:
+        if not uid or not isinstance(uid, str) or uid == state.MY_ID or uid in seen:
             continue
         seen.add(uid)
         names.append(room.user_name(uid) or uid)
@@ -183,8 +192,7 @@ def _address_kind(room: MatrixRoom, event: RoomMessageText) -> tuple[str, str]:
     # 真正的点名（剔除富文本 <mx-reply> 引用块，只看正文 @pill）
     mentioned = state.MY_ID in content.get("m.mentions", {}).get("user_ids", [])
     if not mentioned and state.MY_ID:
-        fb = re.sub(r"<mx-reply>.*?</mx-reply>", "",
-                    content.get("formatted_body", "") or "", flags=re.S | re.I)
+        fb = _strip_mx_reply(content.get("formatted_body", "") or "")
         if state.MY_ID in fb:
             mentioned = True
     if not mentioned:

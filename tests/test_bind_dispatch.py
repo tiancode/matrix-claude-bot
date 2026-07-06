@@ -23,7 +23,7 @@ def test_bind_carries_trailing_task():
     async def fake_bind_room(rid, info):
         return rec
 
-    async def fake_handle_task(rm, ev, text):
+    async def fake_handle_task(rm, ev, text, **kw):
         ran["text"] = text
 
     class FC:

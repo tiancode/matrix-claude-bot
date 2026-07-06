@@ -406,6 +406,50 @@ def test_mention_note_in_context_and_prompt():
         settings.stream_replies, settings.reply_in_thread = orig
         bot._context[rid].clear()
 
+# ---------- 附注抗显示名漂移：接收时算一次随派活透传，派活前改名不破坏去重/正文 ----------
+def test_mention_note_immune_to_displayname_drift():
+    set_identity(); state._synced = True
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    captured = {}
+    async def fake_ask(key, prompt, **_kw):
+        captured["prompt"] = prompt
+        return "搞定"
+    bot.runner.ask = fake_ask
+
+    class DriftRoom(FakeRoom):
+        def __init__(self, rid, n):
+            super().__init__(rid, n)
+            self.names = {"@alice:ex.org": "Alice", "@claudebot:ex.org": "claude-bot"}
+        def user_name(self, uid):
+            return self.names.get(uid, uid)
+
+    room = DriftRoom("!drift:ex.org", 3)
+    rid = room.room_id
+    orig = (settings.stream_replies, settings.reply_in_thread)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    try:
+        bot._context[rid].clear()
+        bot._context[rid].append((time.time(), "Bob", "垫一条背景"))
+        ev = make_event("@claude-bot 问下 Alice 的进度", sender="@bob:ex.org", event_id="$dr1",
+                        mentions=["@claudebot:ex.org", "@alice:ex.org"])
+        async def go():
+            await bot.on_message(room, ev)                    # 接收：存 ctx_body、spawn 派活（尚未跑）
+            room.names["@alice:ex.org"] = "Alice·改名了"       # 派活跑起来之前显示名变了
+            for _ in range(50):
+                pend = [t for t in state._tasks if not t.done()]
+                if not pend:
+                    break
+                await asyncio.gather(*pend, return_exceptions=True)
+        asyncio.run(go())
+        head, _, task_part = captured["prompt"].partition("【当前要你处理的任务】")
+        assert "〔@了 Alice〕" in task_part                    # 用的是接收时的附注，不是派活时重算的
+        assert "Alice·改名了" not in captured["prompt"]
+        assert "问下 Alice 的进度" not in head                 # 去重没被漂移打破：当前消息未混进背景区
+    finally:
+        settings.stream_replies, settings.reply_in_thread = orig
+        bot._context[rid].clear()
+
 # ---------- 新增能力 2) /help + 进房欢迎 ----------
 def test_help_and_welcome():
     set_identity(); state._synced = True
@@ -538,6 +582,7 @@ TESTS = [
     ('runner fork 接上父会话时不误触发 on_reset', test_runner_on_reset_skipped_when_fork_rescues_expired_thread),
     ('线程会话细分+起点背景+线程reset', test_thread_scoped_session_forks),
     ('「@了 谁」附注贯通背景/任务正文', test_mention_note_in_context_and_prompt),
+    ('「@了 谁」附注抗显示名漂移', test_mention_note_immune_to_displayname_drift),
     ('/help + 进房欢迎', test_help_and_welcome),
     ('/summarize 小结最近对话', test_summarize_command),
     ('/cancel 停当前任务', test_cancel_command),

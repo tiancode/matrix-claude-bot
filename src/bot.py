@@ -93,8 +93,11 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     # 用本地接收时刻而非 event.server_timestamp：与 send() 里 bot 回复同一时钟，
     # _format_context 的"间隔"提示才不会因收/发两端时钟偏差算错。
     # 正文后补「@了 谁」附注（有才补）：@pill 在纯文本里只剩显示名，不补这个 Claude 看不到点名。
-    # 只加在落背景/逐字记录的副本上，命令解析、URL 识别等仍用原文。
-    ctx_body = body + _mention_note(room, content)
+    # 只加在落背景/逐字记录的副本上，命令解析、URL 识别等仍用原文。附注在这里【只算这一次】，
+    # 随派活透传（skip_body/mention_note）：它含显示名解析，派活时重算可能已漂移，
+    # 而背景去重靠与 ctx_body 逐字节匹配。
+    mention_note = _mention_note(room, content)
+    ctx_body = body + mention_note
     _context[room.room_id].append((time.time(), sender_name, ctx_body, _thread_of(event)))
     transcript.append(room.room_id, sender_name, ctx_body, event_id=event.event_id)  # 落盘逐字记录，供回溯
     if digest.should_digest(room.room_id):   # 攒够量 / 跨天残留就后台把原始日志预压成日摘要+主题索引
@@ -157,7 +160,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
                 task_text = task_text[len("/bind"):].strip()
             task_text = re.sub(r"\S*://\S+|git@\S+", "", task_text, count=1).strip()
             task_text = _strip_self_mentions(task_text).strip()   # 去掉 @bot，别把点名混进任务正文
-            state._spawn(do_bind(room, repo, event, task_text))
+            state._spawn(do_bind(room, repo, event, task_text,
+                                 skip_body=ctx_body, mention_note=mention_note))
             return
         # 群已绑别的仓库：裸 URL 不自动换绑（防误触），给个提示而非静默（私聊上面已直接换绑，不到这）
         if not dm and just_url and bound and proj_id(repo) != bound["id"]:
@@ -168,9 +172,11 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     if kind == "strong":
         if not is_self and not _is_dm(room):   # 群里被点名 → 开/续"对话延续窗口"，下条免重复 @
             _mark_engaged(room.room_id, event.sender)
-        state._spawn(handle_task(room, event, cleaned))
+        state._spawn(handle_task(room, event, cleaned,
+                                 skip_body=ctx_body, mention_note=mention_note))
     elif kind == "weak":   # 仅续话窗口命中的弱信号：先过语义闸确认是在跟我说，再决定接不接
-        state._spawn(_maybe_followup_task(room, event, cleaned, body, is_self))
+        state._spawn(_maybe_followup_task(room, event, cleaned, body, is_self,
+                                          skip_body=ctx_body, mention_note=mention_note))
     elif body.strip() in RESET_CMDS:   # 群里不点名也认重置（重置是元命令，不必 @ 机器人）
         state._spawn(handle_task(room, event, body.strip()))
     elif settings.proactive:
@@ -178,7 +184,8 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
 
 
 async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
-                               cleaned: str, body: str, is_self: bool):
+                               cleaned: str, body: str, is_self: bool,
+                               skip_body: str | None = None, mention_note: str = ""):
     """续话窗口命中（弱信号）时的接活闸：语义闸确认"确实在接着跟我说"才派活并续窗口；
     判为"不是对我说"则不接，转交主动插话闸判断该不该纠错/帮忙（软窗口把这条从"没点名→直接
     进主动判断"的老路截走了，这里补回那次机会），它拿不准会 __PASS__，不会没话找话。
@@ -198,7 +205,7 @@ async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
             return
     if not is_self:   # 弱信号只出现在群里（DM 恒 strong），确认接活后再续窗口
         _mark_engaged(room.room_id, event.sender)
-    await handle_task(room, event, cleaned)
+    await handle_task(room, event, cleaned, skip_body=skip_body, mention_note=mention_note)
 
 
 async def on_invite(room: MatrixRoom, event: InviteMemberEvent):

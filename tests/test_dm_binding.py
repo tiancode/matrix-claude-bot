@@ -34,7 +34,7 @@ def test_dm_bind_binds_and_needs_url():
     settings.gitea_host = "https://gitea.example.com"
     state.client = FC()
     state._spawn = lambda coro: pend.append(coro)
-    bot.do_bind = lambda room, repo, ev, task: bound.append((repo, task))   # 同步桩：记 (仓库, 任务正文)
+    bot.do_bind = lambda room, repo, ev, task, **kw: bound.append((repo, task))   # 同步桩：记 (仓库, 任务正文)
     bot.projects.get_room = lambda rid: None
     try:
         async def go(body, eid):

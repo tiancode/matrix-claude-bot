@@ -341,6 +341,16 @@ def test_mention_note():
         room, {"m.mentions": {"user_ids": ["@alice:ex.org"]},
                "formatted_body": '<a href="https://matrix.to/#/@alice:ex.org">Alice</a>'}) == "〔@了 Alice〕"
 
+    # 畸形内容（event content 发送方任意可控）：不崩、当没有。回归点：user_ids 里混非字符串
+    # 条目曾让 `uid in seen` / join 抛 TypeError，异常穿透 sync 循环，一条恶意消息打死整个 bot。
+    for bad in ({"m.mentions": None}, {"m.mentions": "x"}, {"m.mentions": {"user_ids": 5}},
+                {"m.mentions": {"user_ids": "abc"}}, {"m.mentions": {"user_ids": None}},
+                {"formatted_body": {"a": 1}}, {"formatted_body": 7}):
+        assert addressing._mention_note(room, bad) == ""
+    assert addressing._mention_note(
+        room, {"m.mentions": {"user_ids": [123, {"x": 1}, None, "", ["y"], "@alice:ex.org"]}}
+    ) == "〔@了 Alice〕"                                                # 垃圾条目剔掉，合法的照常
+
 
 TESTS = [
     ('认 reply / 点名', test_reply_addressing),
