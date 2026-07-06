@@ -107,6 +107,10 @@ class Settings:
     # 仅连续 CLAUDE_TIMEOUT 秒无任何输出才判为卡死；非流式回退路径下退化为整体超时。
     claude_timeout = _i("CLAUDE_TIMEOUT", 600)
     quick_timeout  = _i("CLAUDE_QUICK_TIMEOUT", 300)  # quick()/consult()/摘要 等一次性判断的超时，别和 claude_timeout 混用
+    # 上游瞬时故障（API Error: Overloaded / 限流 / 5xx）自动重试次数（退避 5s/15s/45s）。
+    # 结果型错误会 --resume 原会话续跑、不重做已完成的工作；轻判断（quick/consult）固定最多重试
+    # 1 次、短退避，不受此值影响（0 时也一并关掉）。0=关。默认 2。
+    claude_transient_retries = _i("CLAUDE_TRANSIENT_RETRIES", 2)
     claude_system_prompt = _s(
         "CLAUDE_SYSTEM_PROMPT",
         "你是通过 Matrix 接入的助手，会被派来干活（写代码、查问题、做方案等）。用简洁中文回复。",

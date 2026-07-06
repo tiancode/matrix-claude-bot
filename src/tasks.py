@@ -16,7 +16,7 @@ from fmt import _format_context, _safe_name, _human_gap
 from addressing import _strip_reply_fallback
 from dispatch import _dispatch, _general_rec
 from projects import projects, trusted_repo_info, _valid_name
-from claude_runner import runner, ClaudeCancelled
+from claude_runner import runner, ClaudeCancelled, _looks_transient
 import memory
 import issue_ledger
 import pr_ledger
@@ -359,7 +359,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                 # 就地收尾即是给用户的唯一报错，故 return——不再往上抛给 handle_task 二次发一条"出错了"。
                 log.exception("流式任务失败")
                 try:
-                    await live.finalize(f"出错了：{e}", track=False)
+                    await live.finalize(_friendly_err(e), track=False)
                 except Exception:
                     log.exception("占位收尾成报错也失败了")
                 return
@@ -385,6 +385,18 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                 log.info("[%s] PR #%d 进台账，开始跟进", rid, pr[0])
     finally:
         inflight.remove(inflight_key)
+
+
+
+def _friendly_err(e: BaseException) -> str:
+    """任务失败回报给用户的文案。上游瞬时故障（过载/限流）翻译成人话——runner 的自动重试已经
+    试过了，走到这说明几轮都没救回来；会话没丢（sid 在抛错前已落盘），提示发「继续」即可接着跑，
+    别让用户对着英文报错猜。其它错误维持原样。"""
+    msg = str(e)
+    if _looks_transient(msg):
+        return ("🌊 上游模型服务过载/限流，自动重试几次仍未恢复。会话没丢——"
+                f"稍等片刻发「继续」即可接着跑。\n（{msg[:160]}）")
+    return f"出错了：{msg}"
 
 
 
@@ -496,7 +508,7 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
         except Exception as e:
             log.exception("处理失败")
             try:
-                await send(rid, f"出错了：{e}", thread_root=thr,
+                await send(rid, _friendly_err(e), thread_root=thr,
                            reply_to=reply_to() if callable(reply_to) else None)
             except Exception:
                 pass

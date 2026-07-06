@@ -371,6 +371,82 @@ def test_summarize_zero_does_not_dump_full_context():
         state.client, tasks.runner.quick, settings.transcript_enabled = orig
 
 
+# ---------- 上游瞬时故障（Overloaded/限流/5xx）自动重试 ----------
+def test_transient_overloaded_resume_retry():
+    """结果型瞬时错误（CLI 退出 0、result="API Error: Overloaded"）→ 退避后 --resume 同一会话，
+    用接续提示续跑而不是把原任务重新注入；非瞬时错误不重试。"""
+    set_identity()
+    orig_delay = claude_runner._TRANSIENT_BASE_DELAY
+    claude_runner._TRANSIENT_BASE_DELAY = 0          # 单测不真等退避
+    try:
+        r = claude_runner.ClaudeRunner()
+        cmds = []
+        async def fake_run(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            cmds.append(cmd)
+            if len(cmds) == 1:   # 第一跳：上游过载，但 CLI 正常退出并给了 session_id
+                return 0, json.dumps({"result": "API Error: Overloaded", "is_error": True,
+                                      "session_id": "SID-OV"}).encode(), b""
+            return 0, json.dumps({"result": "搞定", "session_id": "SID-OV"}).encode(), b""
+        r._run = fake_run
+        assert asyncio.run(r.ask("ov|room", "干活")) == "搞定"
+        assert len(cmds) == 2
+        c2 = cmds[1]
+        assert c2[c2.index("--resume") + 1] == "SID-OV"       # 续跑同一会话，不整个重跑
+        assert "接着完成" in c2[c2.index("-p") + 1]           # 用接续提示，原任务不重复注入
+        assert r._sessions["ov|room"][0] == "SID-OV"
+
+        r2 = claude_runner.ClaudeRunner()                     # 非零退出 + 瞬时特征 → 原样重跑
+        n = {"v": 0}
+        async def flaky(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            n["v"] += 1
+            if n["v"] == 1:
+                return 1, b"", b"API Error: 529 overloaded_error"
+            return 0, json.dumps({"result": "ok", "session_id": "S2"}).encode(), b""
+        r2._run = flaky
+        assert asyncio.run(r2.ask("ov2|room", "hi")) == "ok" and n["v"] == 2
+
+        r3 = claude_runner.ClaudeRunner()                     # 非瞬时错误：一次都不重试
+        m = {"v": 0}
+        async def broken(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            m["v"] += 1
+            return 1, b"", b"fatal: not a git repository"
+        r3._run = broken
+        try:
+            asyncio.run(r3.ask("bad|room", "hi"))
+            assert False, "should raise"
+        except RuntimeError as e:
+            assert "not a git repository" in str(e)
+        assert m["v"] == 1
+    finally:
+        claude_runner._TRANSIENT_BASE_DELAY = orig_delay
+
+
+def test_transient_quick_retry_and_friendly_message():
+    """轻判断（quick）遇瞬时故障原样重跑一次；任务层重试耗尽后给人话文案（会话没丢、发「继续」）。"""
+    set_identity()
+    orig_delay = claude_runner._TRANSIENT_BASE_DELAY
+    claude_runner._TRANSIENT_BASE_DELAY = 0
+    try:
+        r = claude_runner.ClaudeRunner()
+        n = {"v": 0}
+        async def flaky(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            n["v"] += 1
+            if n["v"] == 1:
+                return 0, json.dumps({"result": "API Error: Overloaded",
+                                      "is_error": True}).encode(), b""
+            return 0, json.dumps({"result": "__YES__"}).encode(), b""
+        r._run = flaky
+        assert asyncio.run(r.quick("判断一下")) == "__YES__" and n["v"] == 2
+
+        # 文案分级：瞬时错误翻译成人话并提示「继续」；其它错误保持"出错了：…"原样
+        friendly = tasks._friendly_err(RuntimeError("claude: API Error: Overloaded"))
+        assert "继续" in friendly and "过载" in friendly and "出错了" not in friendly
+        plain = tasks._friendly_err(RuntimeError("claude 退出码 1: boom"))
+        assert plain.startswith("出错了：") and "boom" in plain
+    finally:
+        claude_runner._TRANSIENT_BASE_DELAY = orig_delay
+
+
 TESTS = [
     ('自驱/跟进任务可被 /cancel', test_autonomous_tasks_cancellable_by_room),
     ('/cancel 停排队任务+三种文案', test_cancel_stops_queued_task),
@@ -382,4 +458,6 @@ TESTS = [
     ('PR 跟进忽略自己的评论', test_followup_ignores_own_reviews),
     ('/summarize 剔除命令变体', test_summarize_excludes_command_variants),
     ('/summarize 0 不当成"全部背景"', test_summarize_zero_does_not_dump_full_context),
+    ('瞬时故障 resume 续跑重试/非瞬时不重试', test_transient_overloaded_resume_retry),
+    ('quick 瞬时重试 + 过载人话文案', test_transient_quick_retry_and_friendly_message),
 ]
