@@ -359,7 +359,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                 # 就地收尾即是给用户的唯一报错，故 return——不再往上抛给 handle_task 二次发一条"出错了"。
                 log.exception("流式任务失败")
                 try:
-                    await live.finalize(_friendly_err(e), track=False)
+                    await live.finalize(_friendly_err(e, sess_key=sess), track=False)
                 except Exception:
                     log.exception("占位收尾成报错也失败了")
                 return
@@ -388,15 +388,31 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
 
 
 
-def _friendly_err(e: BaseException) -> str:
-    """任务失败回报给用户的文案。上游瞬时故障（过载/限流）翻译成人话——runner 的自动重试已经
-    试过了，走到这说明几轮都没救回来；会话没丢（sid 在抛错前已落盘），提示发「继续」即可接着跑，
-    别让用户对着英文报错猜。其它错误维持原样。"""
+def _transient_blurb(e: BaseException) -> str | None:
+    """若是已知的上游瞬时故障/超时，返回一句人话定性（不含操作指引），否则 None。
+    自驱/跟进等没有人类在场的路径直接用它（`_transient_blurb(e) or e`）——
+    翻译瞬时性质但不给「发继续」这类没人能执行的指引。"""
     msg = str(e)
+    if "响应超时" in msg:
+        # 超时特意不进自动重试（回合可能已有副作用，重放不安全），只在文案层翻译
+        return "⌛ Claude 响应超时（上游可能卡住了，这类不自动重试）"
     if _looks_transient(msg):
-        return ("🌊 上游模型服务过载/限流，自动重试几次仍未恢复。会话没丢——"
-                f"稍等片刻发「继续」即可接着跑。\n（{msg[:160]}）")
-    return f"出错了：{msg}"
+        return "🌊 上游模型服务过载/限流，自动重试几次仍未恢复"
+    return None
+
+
+
+def _friendly_err(e: BaseException, sess_key: str | None = None) -> str:
+    """任务失败回报给用户的文案。已知瞬时故障/超时翻译成人话；操作指引按会话实况给：
+    sess_key 查得到存活会话才承诺「发继续」（全新任务非零退出耗尽重试时从没存过 sid，
+    喊继续只会开个对任务零记忆的空会话），否则引导重发任务。其它错误维持「出错了：…」原样。"""
+    blurb = _transient_blurb(e)
+    if blurb is None:
+        return f"出错了：{e}"
+    hint = ("会话没丢——稍等片刻发「继续」即可接着跑。"
+            if sess_key and runner.session_ts(sess_key) is not None
+            else "稍等片刻把任务重新发一遍即可。")
+    return f"{blurb}。{hint}\n（{str(e)[:160]}）"
 
 
 
@@ -508,7 +524,13 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
         except Exception as e:
             log.exception("处理失败")
             try:
-                await send(rid, _friendly_err(e), thread_root=thr,
+                # 尽力算出这次任务本会用的会话 key（异常可能发生在 _dispatch 之前，rec 未必有），
+                # 供文案层判断「发继续」是否真有会话可续
+                try:
+                    sess = _sess_key(projects.get_room(rid) or _general_rec(), rid, sess_thr)
+                except Exception:
+                    sess = None
+                await send(rid, _friendly_err(e, sess_key=sess), thread_root=thr,
                            reply_to=reply_to() if callable(reply_to) else None)
             except Exception:
                 pass

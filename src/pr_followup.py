@@ -7,7 +7,7 @@ from config import settings
 import state
 from state import _sess_key
 from matrix_io import send, _typing
-from tasks import _employee_prompt
+from tasks import _employee_prompt, _transient_blurb
 from projects import projects
 from claude_runner import runner, ClaudeCancelled
 import gitea
@@ -71,7 +71,7 @@ async def _followup_dispatch(rec: dict, entry: dict, detail: str):
         await send(room, f"🛑 已停止 PR #{n} 的跟进任务。")
     except Exception as e:
         log.exception("PR #%s 跟进任务失败", n)
-        await send(room, f"PR #{n} 跟进出错：{e}")
+        await send(room, f"PR #{n} 跟进出错：{_transient_blurb(e) or e}")
 
 
 

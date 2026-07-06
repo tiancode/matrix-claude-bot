@@ -9,7 +9,7 @@ from config import settings, fixed_tz
 import state
 from state import _sess_key, _last_project_by_room, _project_last_active
 from matrix_io import send, _typing, _is_dm
-from tasks import _employee_prompt, _extract_pr
+from tasks import _employee_prompt, _extract_pr, _transient_blurb
 from projects import projects
 from claude_runner import runner, ClaudeCancelled
 import pr_ledger
@@ -60,7 +60,7 @@ async def _heartbeat_execute(rec: dict, room: str, proposal: str):
         await send(room, "🛑 已停止这次自驱任务。")
     except Exception as e:
         log.exception("自驱执行失败")
-        await send(room, f"自驱执行出错：{e}")
+        await send(room, f"自驱执行出错：{_transient_blurb(e) or e}")
 
 
 

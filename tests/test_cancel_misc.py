@@ -422,7 +422,7 @@ def test_transient_overloaded_resume_retry():
 
 
 def test_transient_quick_retry_and_friendly_message():
-    """轻判断（quick）遇瞬时故障原样重跑一次；任务层重试耗尽后给人话文案（会话没丢、发「继续」）。"""
+    """轻判断（quick）遇瞬时故障原样重跑一次；文案分级按会话实况给指引，不空头承诺「继续」。"""
     set_identity()
     orig_delay = claude_runner._TRANSIENT_BASE_DELAY
     claude_runner._TRANSIENT_BASE_DELAY = 0
@@ -438,11 +438,147 @@ def test_transient_quick_retry_and_friendly_message():
         r._run = flaky
         assert asyncio.run(r.quick("判断一下")) == "__YES__" and n["v"] == 2
 
-        # 文案分级：瞬时错误翻译成人话并提示「继续」；其它错误保持"出错了：…"原样
-        friendly = tasks._friendly_err(RuntimeError("claude: API Error: Overloaded"))
-        assert "继续" in friendly and "过载" in friendly and "出错了" not in friendly
+        # 文案分级：查得到存活会话才承诺「发继续」；查不到引导重发任务（全新任务非零退出
+        # 耗尽重试时从没存过 sid，喊继续只会开个空会话）；超时单独定性；其它错误原样。
+        tasks.runner._sessions["fx|room"] = ("SID-F", time.time())
+        try:
+            ok = tasks._friendly_err(RuntimeError("claude: API Error: Overloaded"),
+                                     sess_key="fx|room")
+            assert "继续" in ok and "过载" in ok
+            no = tasks._friendly_err(RuntimeError("claude: API Error: Overloaded"),
+                                     sess_key="nosess|room")
+            assert "重新发" in no and "继续" not in no
+            to = tasks._friendly_err(RuntimeError("Claude 响应超时"), sess_key="fx|room")
+            assert "超时" in to and "继续" in to
+        finally:
+            del tasks.runner._sessions["fx|room"]
         plain = tasks._friendly_err(RuntimeError("claude 退出码 1: boom"))
         assert plain.startswith("出错了：") and "boom" in plain
+        # 自驱/跟进路径用的定性短句：瞬时给人话、非瞬时 None（调用方回退原始报错）
+        assert "过载" in (tasks._transient_blurb(RuntimeError("claude: API Error: Overloaded")) or "")
+        assert tasks._transient_blurb(RuntimeError("boom")) is None
+    finally:
+        claude_runner._TRANSIENT_BASE_DELAY = orig_delay
+
+
+def test_transient_regex_precision():
+    """瞬时特征分两档：明确短语单独认；裸状态码/rate limit/connection 词必须紧邻 API/HTTP
+    上下文——堆栈行号、普通计数、被测代码自己的话题不得误判（误判会整任务重放、重复副作用）。"""
+    lt = claude_runner._looks_transient
+    assert lt("API Error: Overloaded")
+    assert lt("API Error: 529 overloaded_error")
+    assert lt("API Error: 429 rate_limit_error")
+    assert lt("upstream connection reset")
+    assert lt("fetch failed") and lt("ECONNRESET") and lt("Too Many Requests")
+    assert not lt("at compile (foo.js:503:10)")
+    assert not lt("processed 500 files")
+    assert not lt("we should rate limit this endpoint")
+    assert not lt("connection refused by local test server")
+    assert not lt("fatal: not a git repository")
+
+
+def test_transient_wait_trailing_cancel_check():
+    """/cancel 落在退避最后一个睡片里也不能漏：_transient_wait 出循环后必须再验一次令牌，
+    否则重试会起新子进程把整个回合（含副作用）跑完，cancel 杀不到后起的进程。"""
+    tok = claude_runner._CancelToken()
+    tok.cancelled = True
+    orig = claude_runner._TRANSIENT_BASE_DELAY
+    claude_runner._TRANSIENT_BASE_DELAY = 0   # delay=0 → 循环体一次不跑，全靠尾部检查兜底
+    try:
+        try:
+            asyncio.run(claude_runner.ClaudeRunner._transient_wait(0, tok, "x"))
+            assert False, "should raise ClaudeCancelled"
+        except claude_runner.ClaudeCancelled:
+            pass
+    finally:
+        claude_runner._TRANSIENT_BASE_DELAY = orig
+
+
+def test_transient_stream_crash_resumes_with_sid():
+    """流式回合跑过工具后进程死于瞬时错误：凭流里已捕获的 sid 改走 resume+接续提示（不整任务
+    重放）；连 sid 都没有且已跑过工具的全新任务则拒绝重试——重放会重做已落地的副作用。"""
+    set_identity()
+    orig_delay = claude_runner._TRANSIENT_BASE_DELAY
+    claude_runner._TRANSIENT_BASE_DELAY = 0
+    async def nd(text, tool):
+        pass
+    try:
+        r = claude_runner.ClaudeRunner()
+        calls = []
+        async def fake_stream(cmd, cwd, on_proc, on_line):
+            calls.append(cmd)
+            if len(calls) == 1:   # 首跳：报过 sid、跑过工具，然后死于瞬时网络错误
+                await on_line({"session_id": "SID-ST", "type": "assistant",
+                               "message": {"content": [{"type": "tool_use", "name": "Bash"}]}})
+                return 1, b"api error: connection reset"
+            await on_line({"session_id": "SID-ST", "type": "result",
+                           "result": "搞定", "is_error": False})
+            return 0, b""
+        r._run_stream = fake_stream
+        assert asyncio.run(r.ask("st|room", "干活", on_delta=nd)) == "搞定"
+        assert len(calls) == 2
+        c2 = calls[1]
+        assert c2[c2.index("--resume") + 1] == "SID-ST"      # 凭死前捕获的 sid 续跑
+        assert "接着完成" in c2[c2.index("-p") + 1]          # 接续提示，不重放原任务
+
+        r2 = claude_runner.ClaudeRunner()
+        n = {"v": 0}
+        async def stream_no_sid(cmd, cwd, on_proc, on_line):
+            n["v"] += 1
+            await on_line({"type": "assistant",
+                           "message": {"content": [{"type": "tool_use", "name": "Bash"}]}})
+            return 1, b"API Error: Overloaded"
+        r2._run_stream = stream_no_sid
+        try:
+            asyncio.run(r2.ask("st2|room", "干活", on_delta=nd))
+            assert False, "should raise"
+        except RuntimeError as e:
+            assert "Overloaded" in str(e)
+        assert n["v"] == 1                                    # 拒绝重试：一次都没重放
+    finally:
+        claude_runner._TRANSIENT_BASE_DELAY = orig_delay
+
+
+def test_transient_retry_honors_reset_and_fork():
+    """① 退避期间被 /reset：重试作废按原错误收场，不 resume 用户刚丢弃的会话；
+    ② fork 首跳失败且结果里没有子会话 sid：保持原参数重新 fork（原 prompt），
+       绝不把接续提示 resume 进父会话（父从未收到该任务）。"""
+    set_identity()
+    orig_delay = claude_runner._TRANSIENT_BASE_DELAY
+    claude_runner._TRANSIENT_BASE_DELAY = 0
+    try:
+        r = claude_runner.ClaudeRunner()
+        calls = {"n": 0}
+        async def reset_mid(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            calls["n"] += 1
+            r.reset("rst|room")   # 模拟重试间隙用户 /reset（epoch 抬升）
+            return 0, json.dumps({"result": "API Error: Overloaded", "is_error": True,
+                                  "session_id": "SID-R"}).encode(), b""
+        r._run = reset_mid
+        try:
+            asyncio.run(r.ask("rst|room", "干活"))
+            assert False, "should raise"
+        except RuntimeError as e:
+            assert "Overloaded" in str(e)
+        assert calls["n"] == 1                       # epoch 检查中止重试
+        assert "rst|room" not in r._sessions         # reset 生效，会话没被写回
+
+        r2 = claude_runner.ClaudeRunner()
+        r2._sessions["proj|room"] = ("SID-PARENT", time.time())
+        cmds = []
+        async def fork_flaky(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            cmds.append(cmd)
+            if len(cmds) == 1:   # fork 首跳过载，且结果里没有 session_id
+                return 0, json.dumps({"result": "API Error: Overloaded",
+                                      "is_error": True}).encode(), b""
+            return 0, json.dumps({"result": "ok", "session_id": "SID-CHILD"}).encode(), b""
+        r2._run = fork_flaky
+        assert asyncio.run(r2.ask("proj|room|$T", "线程活", fork_from="proj|room")) == "ok"
+        c2 = cmds[1]
+        assert c2[c2.index("--resume") + 1] == "SID-PARENT" and "--fork-session" in c2
+        assert c2[c2.index("-p") + 1] == "线程活"    # 原 prompt 重新 fork，而非 nudge 进父会话
+        assert r2._sessions["proj|room|$T"][0] == "SID-CHILD"
+        assert r2._sessions["proj|room"][0] == "SID-PARENT"   # 父会话原样
     finally:
         claude_runner._TRANSIENT_BASE_DELAY = orig_delay
 
@@ -459,5 +595,9 @@ TESTS = [
     ('/summarize 剔除命令变体', test_summarize_excludes_command_variants),
     ('/summarize 0 不当成"全部背景"', test_summarize_zero_does_not_dump_full_context),
     ('瞬时故障 resume 续跑重试/非瞬时不重试', test_transient_overloaded_resume_retry),
-    ('quick 瞬时重试 + 过载人话文案', test_transient_quick_retry_and_friendly_message),
+    ('quick 瞬时重试 + 会话感知人话文案', test_transient_quick_retry_and_friendly_message),
+    ('瞬时特征正则 裸数字/话题词不误判', test_transient_regex_precision),
+    ('退避尾部 /cancel 不漏检', test_transient_wait_trailing_cancel_check),
+    ('流式带 sid 续跑/无 sid 有副作用拒重放', test_transient_stream_crash_resumes_with_sid),
+    ('退避中 /reset 作废重试 + fork 不误入父会话', test_transient_retry_honors_reset_and_fork),
 ]

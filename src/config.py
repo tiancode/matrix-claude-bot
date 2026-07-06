@@ -109,7 +109,8 @@ class Settings:
     quick_timeout  = _i("CLAUDE_QUICK_TIMEOUT", 300)  # quick()/consult()/摘要 等一次性判断的超时，别和 claude_timeout 混用
     # 上游瞬时故障（API Error: Overloaded / 限流 / 5xx）自动重试次数（退避 5s/15s/45s）。
     # 结果型错误会 --resume 原会话续跑、不重做已完成的工作；轻判断（quick/consult）固定最多重试
-    # 1 次、短退避，不受此值影响（0 时也一并关掉）。0=关。默认 2。
+    # 1 次、短退避，不受此值影响（0 时也一并关掉）。注意退避睡眠发生在项目串行锁内（续跑必须
+    # 守住同一 checkout），调大次数会按 5·3^n 秒拉长同项目排队任务的空等。0=关。默认 2。
     claude_transient_retries = _i("CLAUDE_TRANSIENT_RETRIES", 2)
     claude_system_prompt = _s(
         "CLAUDE_SYSTEM_PROMPT",

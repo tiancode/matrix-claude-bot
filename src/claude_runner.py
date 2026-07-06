@@ -21,10 +21,16 @@ log = logging.getLogger("matrix-claude.runner")
 
 # 上游瞬时故障（过载/限流/5xx/网络抖动）的报错特征：这类几乎都会在几十秒内自愈，值得自动重试。
 # 只用来匹配 CLI 的报错文本（stderr / is_error 的 result），不会碰正常回答。
+# 两档：特征明确的短语单独出现即认；泛化 token（裸状态码、rate limit、connection 词）太容易
+# 撞上普通报错里的行号（foo.js:503:10）、计数（processed 500 files）、被测代码自己的输出
+# （做限流功能的任务回显 rate limit）——必须紧邻 API/HTTP 错误上下文才认，否则确定性失败
+# 会被误判成瞬时而重试（rc!=0 分支是整任务重放，误判代价是重复副作用）。
 _TRANSIENT_RE = re.compile(
-    r"overloaded|rate.?limit|too many requests|internal server error|service unavailable|"
-    r"connection (error|reset|refused)|socket hang up|fetch failed|econnreset|etimedout|"
-    r"\b(429|500|502|503|504|529)\b", re.I)
+    r"overloaded|too many requests|internal server error|service unavailable|"
+    r"socket hang up|fetch failed|econnreset|etimedout"
+    r"|(?:api.?error|http|status|upstream)[^\n]{0,40}"
+    r"(?:\b(?:429|500|502|503|504|529)\b|rate.?limit|connection\s+(?:error|reset|refused))",
+    re.I)
 
 _TRANSIENT_BASE_DELAY = 5.0   # 退避基数（秒）：5 → 15 → 45。单测置 0 免真等。
 
@@ -494,9 +500,10 @@ class ClaudeRunner:
 
     async def _persist_once(self, key: str, sid: str | None, fork: bool, prompt: str,
                             system_prompt: str | None, cwd: str | None,
-                            on_delta, on_notify, on_proc):
+                            on_delta, on_notify, on_proc, fail_info: dict | None = None):
         """常驻进程跑一个回合。返回值形状与 ask._once 相同：
-        rc==0 → (0, 结果字符串, b"", (session_id, is_error))；失败 → (rc, b"", stderr尾, None)。"""
+        rc==0 → (0, 结果字符串, b"", (session_id, is_error))；失败 → (rc, b"", stderr尾, None)。
+        fail_info：失败返回前把进程已报过的 session_id 记进去（供瞬时重试改走 resume 而非重放）。"""
         async with self._sema:   # 并发额度只在回合期间占用；空闲常驻进程不占
             ps = self._persist.get(key)
             if ps is not None and not ps.alive():
@@ -521,6 +528,8 @@ class ClaudeRunner:
             except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
                 ps.turn = None
                 _kill_group(ps.proc)
+                if fail_info is not None and ps.sid:
+                    fail_info["sid"] = ps.sid
                 return 1, b"", bytes(ps.err_tail), None
             eff = settings.claude_timeout or 600
             # 空闲超时语义同 _run_stream：持续产出不限总时长，静默 eff 秒才判卡死
@@ -548,6 +557,8 @@ class ClaudeRunner:
                 # 回合中进程退出（被 /cancel 杀、崩溃、--resume 失败秒退）：
                 # 交回非零 rc + stderr 尾，让 ask() 现有的"会话失效重试"逻辑接手判断
                 ps.turn = None
+                if fail_info is not None and ps.sid:
+                    fail_info["sid"] = ps.sid
                 return (ps.proc.returncode if ps.proc.returncode is not None else 1), \
                     b"", bytes(ps.err_tail), None
             ps.turn = None
@@ -593,7 +604,9 @@ class ClaudeRunner:
 
     @staticmethod
     async def _transient_wait(attempt: int, token: "_CancelToken | None", what: str) -> None:
-        """瞬时故障重试前的退避等待（5s→15s→45s），小步睡以便 /cancel 能即时打断。"""
+        """瞬时故障重试前的退避等待（5s→15s→45s），小步睡以便 /cancel 能即时打断。
+        注意这段睡眠发生在项目串行锁内（resume 续跑必须守住同一 checkout，锁不能放）：
+        调大 CLAUDE_TRANSIENT_RETRIES 会按 5·3^n 拉长同项目排队任务的空等。"""
         delay = _TRANSIENT_BASE_DELAY * (3 ** attempt)
         log.warning("上游瞬时故障，%.0fs 后自动重试（第 %d 次）：%s", delay, attempt + 1, what[:200])
         end = time.monotonic() + delay
@@ -601,6 +614,10 @@ class ClaudeRunner:
             if token is not None and token.cancelled:
                 raise ClaudeCancelled()
             await asyncio.sleep(min(0.5, max(0.0, end - time.monotonic())))
+        # 落在最后一个睡片里的 /cancel 会躲过循环顶部的检查：这里必须再验一次，
+        # 否则 continue 会起新子进程把整个回合跑完（cancel 已执行过，杀不到后起的进程）。
+        if token is not None and token.cancelled:
+            raise ClaudeCancelled()
 
     @staticmethod
     def _looks_like_session_error(out: bytes, err: bytes) -> bool:
@@ -654,14 +671,20 @@ class ClaudeRunner:
             my_procs.append(proc)
             self._active.setdefault(ckey, []).append(proc)
 
+        # 上次失败回合的残留信号（供瞬时重试决策）：sid=进程死前已捕获的会话、tool=是否已跑过工具。
+        # rc!=0 时 meta 是 None，这些信号只能从这里拿。
+        last_fail: dict = {}
+
         async def _once(sid, fork=False, prompt_override=None):
             """跑一次。返回 (rc, payload, err, meta)：
             rc==0 → payload=结果字符串, meta=(session_id, is_error)；rc!=0 → payload=原始 stdout 字节, meta=None。
             prompt_override：瞬时故障重试续跑时用接续提示替代原 prompt（原任务已在会话里，别再注入一遍）。"""
             p = prompt_override or prompt
+            last_fail.clear()
             if settings.claude_persistent:
                 return await self._persist_once(key, sid, fork, p, system_prompt,
-                                                cwd, on_delta, on_notify, _reg)
+                                                cwd, on_delta, on_notify, _reg,
+                                                fail_info=last_fail)
             if on_delta is None:
                 rc, out, err = await self._run(self._cmd(p, sid, True, system_prompt, fork=fork),
                                                cwd, on_proc=_reg)
@@ -669,7 +692,7 @@ class ClaudeRunner:
                     return rc, out, err, None
                 result, new_sid, is_err = self._parse(out)
                 return rc, result, err, (new_sid, is_err)
-            st = {"sid": None, "result": None, "text": "", "is_err": False}
+            st = {"sid": None, "result": None, "text": "", "is_err": False, "tool": False}
 
             async def _on_line(obj):
                 if obj.get("session_id"):
@@ -681,6 +704,7 @@ class ClaudeRunner:
                             st["text"] += (("\n\n" if st["text"] else "") + blk["text"])
                             await on_delta(st["text"], None)
                         elif blk.get("type") == "tool_use":
+                            st["tool"] = True   # 已有工具落地（可能含 push 等副作用）：重试决策要知道
                             await on_delta(st["text"], blk.get("name"))
                 elif t == "result":
                     if isinstance(obj.get("result"), str):
@@ -690,6 +714,9 @@ class ClaudeRunner:
                 self._cmd(p, sid, True, system_prompt, stream=True, fork=fork),
                 cwd, _reg, _on_line)
             if rc != 0:
+                # 进程死了也别把流里已捕获的会话/工具信号丢掉：有 sid 重试就能 resume 续跑
+                # 而不是整任务重放；跑过工具则重放有重复副作用（重复 push/PR）的风险。
+                last_fail.update(sid=st["sid"], tool=st["tool"])
                 return rc, b"", err, None
             result = st["result"] if st["result"] is not None else st["text"]
             return rc, (result or "").strip(), err, (st["sid"], st["is_err"])
@@ -773,8 +800,18 @@ class ClaudeRunner:
                         if not detail and isinstance(payload, bytes):
                             detail = redact(payload.decode(errors="ignore").strip())
                         if attempt < retries and _looks_transient(detail):
+                            fail_sid, ran_tool = last_fail.get("sid"), last_fail.get("tool")
+                            if fail_sid is None and run_sid is None and ran_tool:
+                                # 全新任务已跑过工具（可能已 push/开 PR）却没捕获到会话：
+                                # 整任务重放会重做副作用，这一注不赌——按失败收场。
+                                raise RuntimeError(f"claude 退出码 {rc}: {detail[:400]}")
                             await self._transient_wait(attempt, token, detail)
-                            continue   # 原样重跑（run_sid/nudge 不变）
+                            if self._epoch.get(key, 0) != epoch:
+                                # 退避期间被 /reset：会话已翻篇，这次重试作废，按原错误收场
+                                raise RuntimeError(f"claude 退出码 {rc}: {detail[:400]}")
+                            if fail_sid:   # 进程死前已捕获会话 → 改走 resume+接续提示，别整任务重放
+                                run_sid, run_fork, nudge = fail_sid, False, _RESUME_NUDGE
+                            continue   # 否则原样重跑（run_sid/nudge 不变）
                         raise RuntimeError(f"claude 退出码 {rc}: {detail[:400]}")
                     new_sid, is_err = meta
                     if new_sid and self._epoch.get(key, 0) == epoch:  # 运行期间被 /reset 过就别写回旧会话
@@ -784,9 +821,14 @@ class ClaudeRunner:
                         detail = redact(payload)
                         if attempt < retries and _looks_transient(detail):
                             await self._transient_wait(attempt, token, detail)
-                            resume_sid = new_sid or run_sid
-                            if resume_sid:   # 会话在：续跑 + 接续提示；罕见拿不到 sid 就原样重跑
-                                run_sid, run_fork, nudge = resume_sid, False, _RESUME_NUDGE
+                            if self._epoch.get(key, 0) != epoch:
+                                # 退避期间被 /reset：别 resume 用户刚丢弃的会话把旧任务跑完
+                                raise RuntimeError(f"claude: {detail}")
+                            if new_sid:   # 本次回合的会话在：续跑 + 接续提示
+                                run_sid, run_fork, nudge = new_sid, False, _RESUME_NUDGE
+                            # 没拿到本回合 sid（三条路径都会报 sid，几乎不可能）：保持原参数重跑。
+                            # 特意不回退到 run_sid——fork 场景那是【父】会话，nudge 打进去会让
+                            # 从未收到任务的房间共享会话去"接着完成"一个不存在的上文。
                             continue
                         raise RuntimeError(f"claude: {detail}")
                     answer = (payload if isinstance(payload, str) else "") or "(空回复)"
@@ -812,28 +854,29 @@ class ClaudeRunner:
 
     async def _oneshot(self, cmd: list[str], cwd: str | None = None) -> str:
         """跑一次性纯文本判断（quick / consult 共用）：短超时、独立并发池、剔密钥环境，不复用会话。
-        无状态无副作用，上游瞬时故障（过载/限流）原样重跑一次即可；这类轻判断多在消息处理链上，
+        无状态无副作用，上游瞬时故障（过载/限流）原样重跑一次即可（固定最多一次，不跟
+        CLAUDE_TRANSIENT_RETRIES 的次数走、只认它的开关）；这类轻判断多在消息处理链上，
         退避取短（基数的 0.6 倍，默认 3s），别把语义闸/插话判断拖太久。"""
-        attempt = 0
-        while True:
+        for attempt in range(2):
             rc, out, err = await self._run(cmd, cwd=cwd, sema=self._quick_sema,
                                            env=_quick_env(), timeout=settings.quick_timeout)
-            if rc != 0:
-                detail = redact(err.decode(errors="ignore"))[:300]
-                if attempt == 0 and settings.claude_transient_retries > 0 and _looks_transient(detail):
-                    attempt += 1
-                    await asyncio.sleep(_TRANSIENT_BASE_DELAY * 0.6)
-                    continue
-                raise RuntimeError(f"claude 退出码 {rc}: {detail}")
-            result, _, is_err = self._parse(out)
-            if not is_err:
-                return result
-            detail = redact(result)
-            if attempt == 0 and settings.claude_transient_retries > 0 and _looks_transient(detail):
-                attempt += 1
+            if rc != 0:   # 瞬时判定用未截断原文（别让长前缀把特征挤出截断窗），截断只在报错时做
+                detail = redact(err.decode(errors="ignore"))
+                msg = f"claude 退出码 {rc}: {detail[:300]}"
+            else:
+                result, _, is_err = self._parse(out)
+                if not is_err:
+                    return result
+                detail = redact(result)
+                msg = f"claude: {detail}"
+            if (attempt == 0 and settings.claude_transient_retries > 0
+                    and _looks_transient(detail)):
+                log.warning("上游瞬时故障，%.0fs 后重跑轻判断：%s",
+                            _TRANSIENT_BASE_DELAY * 0.6, detail[:200])
                 await asyncio.sleep(_TRANSIENT_BASE_DELAY * 0.6)
                 continue
-            raise RuntimeError(f"claude: {detail}")
+            raise RuntimeError(msg)
+        raise AssertionError("unreachable")   # range(2) 的末轮必 return/raise，兜底防悄悄返回 None
 
     async def quick(self, prompt: str) -> str:
         """一次性纯文本判断，不带危险权限、不复用会话。"""

@@ -13,7 +13,7 @@ from config import settings
 import state
 from state import _sess_key, _project_last_active
 from matrix_io import send, _typing
-from tasks import _employee_prompt, _extract_pr
+from tasks import _employee_prompt, _extract_pr, _transient_blurb
 from heartbeat import _project_home_room
 from projects import projects
 from claude_runner import runner, ClaudeCancelled
@@ -73,7 +73,7 @@ async def _issue_execute(rec: dict, room: str, issue: dict):
             await send(room, f"🛑 已停止工单 #{n} 的处理。")
         except Exception as e:
             log.exception("工单 #%s 处理失败", n)
-            await send(room, f"工单 #{n} 处理出错：{e}")
+            await send(room, f"工单 #{n} 处理出错：{_transient_blurb(e) or e}")
     finally:
         inflight.remove(inflight_key)
 
