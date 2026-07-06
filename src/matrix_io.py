@@ -213,10 +213,11 @@ async def _unreact(room_id: str, reaction_eid: str) -> None:
 
 
 @asynccontextmanager
-async def _ack(room_id: str, event_id: str | None):
+async def _ack(room_id: str, event_id: str | None, pre_eid: str | None = None):
     """任务期间的 reaction 回执：进入时给触发消息打 👀（"看到了，在办"），退出时撤掉。
-    覆盖成功/报错/取消所有路径；打/撤失败都不影响任务本身。"""
-    eid = await _react(room_id, event_id, _ACK_EMOJI) if event_id else None
+    覆盖成功/报错/取消所有路径；打/撤失败都不影响任务本身。
+    pre_eid：调用方（连发合并层）已提前打过 👀 时传入其 event_id——只接管撤销、不重复打。"""
+    eid = pre_eid or (await _react(room_id, event_id, _ACK_EMOJI) if event_id else None)
     try:
         yield
     finally:

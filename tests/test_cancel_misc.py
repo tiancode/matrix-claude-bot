@@ -583,6 +583,37 @@ def test_transient_retry_honors_reset_and_fork():
         claude_runner._TRANSIENT_BASE_DELAY = orig_delay
 
 
+# ---------- steering 进的消息在回合被 /cancel 杀掉时撤销 dispatched 标记 ----------
+def test_steered_marks_unmarked_on_cancel():
+    """steered 消息随被杀的回合丢弃：撤掉它的 dispatched 标记让它回到背景，
+    别落得"没被回答、下轮背景又被剔掉"的双头落空。"""
+    from _helpers import FakeRoom, _CapClient, make_event, _task_fixtures
+    set_identity()
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    async def cancelled_ask(*a, **k):
+        raise claude_runner.ClaudeCancelled()
+    bot.runner.ask = cancelled_ask
+    room = FakeRoom("!sc:ex.org", 3)
+    rid = room.room_id
+    orig = (settings.stream_replies, settings.reply_in_thread)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    try:
+        bot._context[rid].clear()
+        # 预置：一条已被 steering 标了 dispatched 的追加消息 + 撤销登记
+        bot._context[rid].append((time.time(), "Alice", "追加的话", None, True))
+        state._steered_dispatched[rid] = [("Alice", "追加的话")]
+        asyncio.run(bot.handle_task(
+            room, make_event("@claude-bot 干活", mentions=[state.MY_ID], event_id="$sc1"), "干活"))
+        assert any("已停止" in (m.get("body") or "") for m in c.sent)
+        assert not any(state._ctx_dispatched(it) for it in bot._context[rid])   # 标记已撤，回到背景
+        assert rid not in state._steered_dispatched                             # 登记已清
+    finally:
+        settings.stream_replies, settings.reply_in_thread = orig
+        bot._context[rid].clear()
+        state._steered_dispatched.pop(rid, None)
+
+
 TESTS = [
     ('自驱/跟进任务可被 /cancel', test_autonomous_tasks_cancellable_by_room),
     ('/cancel 停排队任务+三种文案', test_cancel_stops_queued_task),
@@ -596,6 +627,7 @@ TESTS = [
     ('/summarize 0 不当成"全部背景"', test_summarize_zero_does_not_dump_full_context),
     ('瞬时故障 resume 续跑重试/非瞬时不重试', test_transient_overloaded_resume_retry),
     ('quick 瞬时重试 + 会话感知人话文案', test_transient_quick_retry_and_friendly_message),
+    ('steered 消息 回合被杀撤 dispatched', test_steered_marks_unmarked_on_cancel),
     ('瞬时特征正则 裸数字/话题词不误判', test_transient_regex_precision),
     ('退避尾部 /cancel 不漏检', test_transient_wait_trailing_cancel_check),
     ('流式带 sid 续跑/无 sid 有副作用拒重放', test_transient_stream_crash_resumes_with_sid),

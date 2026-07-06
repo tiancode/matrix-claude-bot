@@ -490,8 +490,117 @@ def test_debounce_merges_rapid_messages():
         # 两条原文事后都标 dispatched（续接轮背景不再重复喂）
         marked = [it for it in bot._context[rid] if state._ctx_dispatched(it)]
         assert len(marked) == 2
+        # 合并窗期间不冷场：👀 在等待前就打在首条触发消息上，任务收尾时照常撤掉
+        acks = [m for m in c.sent if (m.get("m.relates_to") or {}).get("key") == "👀"
+                and m["m.relates_to"].get("event_id") == "$db1"]
+        assert len(acks) == 1 and c.redacted        # 只打一次（handle_task 不重复打），且已撤
     finally:
         settings.stream_replies, settings.reply_in_thread, settings.message_debounce = orig
+        bot._pending_dispatch.clear()
+        bot._context[rid].clear()
+
+
+# ---------- 合并窗不吞控制消息：重置/取消/换绑/引用回复各走各的路 ----------
+def test_debounce_guards_commands():
+    set_identity(); state._synced = True
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    asked = {"n": 0, "prompts": []}
+    async def fake_ask(key, prompt, **_kw):
+        asked["n"] += 1
+        asked["prompts"].append(prompt)
+        return "搞定"
+    bot.runner.ask = fake_ask
+    resets = []
+    orig_reset = bot.runner.reset
+    bot.runner.reset = lambda k: resets.append(k)
+    room = FakeRoom("!dg:ex.org", 3)
+    rid = room.room_id
+    orig = (settings.stream_replies, settings.reply_in_thread, settings.message_debounce,
+            settings.gitea_host)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    settings.message_debounce = 0.2
+    settings.gitea_host = "https://gitea.example.com"   # parse_repo_url fail-closed，认 URL 需受信主机
+    try:
+        # ① 窗内发重置词：不被吸收进任务正文，正常翻篇；待派的半截话一并作废（翻篇的意图涵盖它）
+        bot._context[rid].clear()
+        _drain_and_run(bot.on_message(room, make_event(
+            "@claude-bot 修登录", mentions=[state.MY_ID], sender="@alice:ex.org", event_id="$g1")))
+        # ↑ drain 会把 waiter 也等完——所以这里用手工时序：重开一个缓冲再立刻发 /reset
+        async def go():
+            await bot.on_message(room, make_event(
+                "@claude-bot 改注册", mentions=[state.MY_ID], sender="@alice:ex.org", event_id="$g2"))
+            # 重置词由另一人发（engaged 用户的裸 reset 会先过续话语义闸，测试里别去碰真 quick 调用；
+            # 作废合并窗对全房间生效，谁发的都一样）
+            await bot.on_message(room, make_event(
+                "/reset", sender="@bob:ex.org", event_id="$g3"))
+            for _ in range(80):
+                pend = [t for t in state._tasks if not t.done()]
+                if not pend:
+                    break
+                await asyncio.gather(*pend, return_exceptions=True)
+        n0 = asked["n"]                     # ①里第一条正常派掉的不算
+        asyncio.run(go())
+        assert resets                                        # reset 真的执行了
+        assert asked["n"] == n0                              # "改注册"被翻篇作废，没派
+        assert not any("改注册" in p for p in asked["prompts"])
+        assert any("已开启新对话" in (m.get("body") or "") for m in c.sent)
+
+        # ② 窗内 /cancel：作废待派缓冲并告知，任务不再开跑
+        c.sent.clear()
+        async def go2():
+            await bot.on_message(room, make_event(
+                "@claude-bot 跑个大活", mentions=[state.MY_ID], sender="@alice:ex.org", event_id="$g4"))
+            await bot.on_message(room, make_event(
+                "/cancel", sender="@alice:ex.org", event_id="$g5"))
+            for _ in range(80):
+                pend = [t for t in state._tasks if not t.done()]
+                if not pend:
+                    break
+                await asyncio.gather(*pend, return_exceptions=True)
+        n1 = asked["n"]
+        asyncio.run(go2())
+        assert asked["n"] == n1                              # 被取消，没派
+        assert any("已取消排队中的任务" in (m.get("body") or "") for m in c.sent)
+
+        # ③ 窗内粘仓库 URL：不被吸收，走换绑提示分支
+        c.sent.clear()
+        async def go3():
+            await bot.on_message(room, make_event(
+                "@claude-bot 看下代码", mentions=[state.MY_ID], sender="@alice:ex.org", event_id="$g6"))
+            await bot.on_message(room, make_event(
+                "https://gitea.example.com/other/repo2", sender="@alice:ex.org", event_id="$g7"))
+            for _ in range(80):
+                pend = [t for t in state._tasks if not t.done()]
+                if not pend:
+                    break
+                await asyncio.gather(*pend, return_exceptions=True)
+        asyncio.run(go3())
+        assert any("换绑" in (m.get("body") or "") for m in c.sent)   # URL 到达了绑定分支
+        # URL 没被并进任何任务的正文（出现在背景区是正常的——它照常入上下文）
+        assert not any("other/repo2" in p.partition("【当前要你处理的任务】")[2]
+                       for p in asked["prompts"])
+
+        # ④ 窗内的引用回复（strong）：不并入缓冲，独立成任务并解析引文
+        async def go4():
+            await bot.on_message(room, make_event(
+                "@claude-bot 修这个", mentions=[state.MY_ID], sender="@alice:ex.org", event_id="$g8"))
+            await bot.on_message(room, make_event(
+                "@claude-bot 就是这条", mentions=[state.MY_ID], sender="@alice:ex.org",
+                event_id="$g9", in_reply_to="$q1"))
+            for _ in range(80):
+                pend = [t for t in state._tasks if not t.done()]
+                if not pend:
+                    break
+                await asyncio.gather(*pend, return_exceptions=True)
+        n2 = asked["n"]
+        asyncio.run(go4())
+        assert asked["n"] == n2 + 2                          # 两个独立任务
+        assert any("root-of-$q1" in p for p in asked["prompts"])   # 引文被解析（没有丢）
+    finally:
+        (settings.stream_replies, settings.reply_in_thread, settings.message_debounce,
+         settings.gitea_host) = orig
+        bot.runner.reset = orig_reset
         bot._pending_dispatch.clear()
         bot._context[rid].clear()
 
@@ -628,7 +737,8 @@ TESTS = [
     ('线程会话细分+起点背景+线程reset', test_thread_scoped_session_forks),
     ('「@了 谁」附注贯通背景/任务正文', test_mention_note_in_context_and_prompt),
     ('「@了 谁」附注抗显示名漂移', test_mention_note_immune_to_displayname_drift),
-    ('连发合并 一个任务/去重/标记', test_debounce_merges_rapid_messages),
+    ('连发合并 一个任务/去重/标记/提前回执', test_debounce_merges_rapid_messages),
+    ('合并窗不吞 重置/取消/换绑/引用回复', test_debounce_guards_commands),
     ('/help + 进房欢迎', test_help_and_welcome),
     ('/summarize 小结最近对话', test_summarize_command),
     ('/cancel 停当前任务', test_cancel_command),

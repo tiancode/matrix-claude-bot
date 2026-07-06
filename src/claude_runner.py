@@ -70,6 +70,14 @@ _QUICK_STRIP_ENV = ("GITEA_TOKEN", "MATRIX_PASSWORD")
 _NO_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 
 
+def _user_msg(text: str) -> bytes:
+    """stream-json 输入的一条 user 消息帧（编码好、带换行）。try_steer 与常驻回合共用——
+    CLI 的信封若有变动只改这一处，别让两处手拼各自漂移（漂了 steering 会静默失效）。"""
+    return (json.dumps({"type": "user", "message": {
+        "role": "user", "content": [{"type": "text", "text": text}]}},
+        ensure_ascii=False) + "\n").encode()
+
+
 def _quick_env() -> dict:
     env = os.environ.copy()
     for k in _QUICK_STRIP_ENV:
@@ -148,22 +156,23 @@ class ClaudeRunner:
 
     # ---- steering：任务进行中把追加消息递进当前回合（像 Claude Code 运行中打字）----
     async def try_steer(self, key: str, text: str) -> bool:
-        """该 key 的常驻进程【回合在途】时，把 text 作为新的 user 事件写进 stdin 并返回 True；
-        否则返回 False（调用方走正常排队）。CLI 对 mid-turn 消息的两种处理都兼容：
+        """该 key 的常驻进程【聊天回合在途】时，把 text 作为新的 user 事件写进 stdin 并返回 True；
+        否则返回 False（调用方走正常排队）。只认 turn["steerable"] 的回合——自驱/PR 跟进/工单
+        与聊天共用同一个会话 key，但那些回合正带着危险权限写代码/推 PR，且没设 on_notify 投递口，
+        把用户的话塞进去要么污染自驱产出、要么答案没处送；非聊天回合一律回落排队。
+        CLI 对 mid-turn 消息的两种处理都兼容：
         · 真 steering——在当前回合的工具间隙注入给模型，最终一并答复；
-        · 排成紧接着的下一回合——多出的 result 会在回合外到达，走"自发产出"通道
-          （_persist_event 的 spont/on_notify 路径）由上一轮设置的回调投回房间。
-        检查与写入之间回合恰好结束的竞态同理落入第二种，无害。写失败（进程刚死）返回 False。"""
+        · 排成紧接着的下一回合——多出的 result 走"自发产出"通道（_persist_event 的
+          spont/on_notify 路径）投回房间（聊天回合必设 on_notify，投递有保障）。
+        写入前后回合恰好结束的竞态同理落入第二种，无害。写失败（进程刚死）返回 False。"""
         if not settings.claude_persistent:
             return False
         ps = self._persist.get(key)
-        if ps is None or not ps.alive() or ps.turn is None:
+        if (ps is None or not ps.alive() or ps.turn is None
+                or not ps.turn.get("steerable")):
             return False
         try:
-            msg = json.dumps({"type": "user", "message": {
-                "role": "user", "content": [{"type": "text", "text": text}]}},
-                ensure_ascii=False) + "\n"
-            ps.proc.stdin.write(msg.encode())
+            ps.proc.stdin.write(_user_msg(text))
             await ps.proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
             return False
@@ -525,10 +534,12 @@ class ClaudeRunner:
 
     async def _persist_once(self, key: str, sid: str | None, fork: bool, prompt: str,
                             system_prompt: str | None, cwd: str | None,
-                            on_delta, on_notify, on_proc, fail_info: dict | None = None):
+                            on_delta, on_notify, on_proc, fail_info: dict | None = None,
+                            steerable: bool = False):
         """常驻进程跑一个回合。返回值形状与 ask._once 相同：
         rc==0 → (0, 结果字符串, b"", (session_id, is_error))；失败 → (rc, b"", stderr尾, None)。
-        fail_info：失败返回前把进程已报过的 session_id 记进去（供瞬时重试改走 resume 而非重放）。"""
+        fail_info：失败返回前把进程已报过的 session_id 记进去（供瞬时重试改走 resume 而非重放）。
+        steerable：这是不是聊天回合（try_steer 只允许把追加消息递进聊天回合）。"""
         async with self._sema:   # 并发额度只在回合期间占用；空闲常驻进程不占
             ps = self._persist.get(key)
             if ps is not None and not ps.alive():
@@ -542,13 +553,10 @@ class ClaudeRunner:
                 ps.on_notify = on_notify
             fut = asyncio.get_running_loop().create_future()
             turn = {"fut": fut, "on_delta": on_delta, "text": "", "result": None,
-                    "is_err": False, "last_io": time.time()}
+                    "is_err": False, "last_io": time.time(), "steerable": steerable}
             ps.turn = turn
             try:
-                msg = json.dumps({"type": "user", "message": {
-                    "role": "user", "content": [{"type": "text", "text": prompt}]}},
-                    ensure_ascii=False) + "\n"
-                ps.proc.stdin.write(msg.encode())
+                ps.proc.stdin.write(_user_msg(prompt))
                 await ps.proc.stdin.drain()
             except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
                 ps.turn = None
@@ -665,7 +673,8 @@ class ClaudeRunner:
     async def ask(self, key: str, prompt: str, cwd: str | None = None,
                   system_prompt: str | None = None, lock_key: str | None = None,
                   prepare=None, on_delta=None, cancel_key: str | None = None,
-                  fork_from: str | None = None, on_reset=None, on_notify=None) -> str:
+                  fork_from: str | None = None, on_reset=None, on_notify=None,
+                  steerable: bool = False) -> str:
         """带工具、带会话上下文地干活；cwd=该项目的仓库目录。
 
         key:        会话维度（项目+房间[+线程]），不同房间/私聊用户互不串台。
@@ -682,6 +691,9 @@ class ClaudeRunner:
         on_notify:  常驻进程模式下"回合外自发产出"（后台任务完成后 CLI 自动续跑）的投递回调
                     async fn(text)。不传则沿用该会话上次设置的回调（心跳/工单等复用聊天会话时
                     别把聊天设好的投递口冲掉）。
+        steerable:  这是不是聊天回合——只有聊天回合允许 try_steer 把追加消息递进来。
+                    自驱/PR 跟进/工单不传（False），它们与聊天共用会话 key，但用户的话
+                    绝不能被注入进那些带危险权限的自动化回合。
         """
         lock_key = lock_key or key
         ckey = cancel_key or lock_key
@@ -709,7 +721,7 @@ class ClaudeRunner:
             if settings.claude_persistent:
                 return await self._persist_once(key, sid, fork, p, system_prompt,
                                                 cwd, on_delta, on_notify, _reg,
-                                                fail_info=last_fail)
+                                                fail_info=last_fail, steerable=steerable)
             if on_delta is None:
                 rc, out, err = await self._run(self._cmd(p, sid, True, system_prompt, fork=fork),
                                                cwd, on_proc=_reg)

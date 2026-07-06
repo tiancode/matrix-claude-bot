@@ -38,7 +38,7 @@ from nio import (
 
 from config import settings, register_secret
 import state
-from state import _context, _sent_events, _last_project_by_room
+from state import _context, _sent_events, _last_project_by_room, _pending_dispatch, _drop_pending
 from claude_runner import runner  # noqa: F401
 from projects import projects, parse_repo_url, proj_id
 import transcript
@@ -52,7 +52,8 @@ import gitea
 # 用，仅作 `bot.X` 兼容再导出留着（测试仍按这个名字访问）；其余纯测试用的再导出已退役。
 from fmt import _format_context  # noqa: F401  # 测试专用再导出（本文件未直接用）
 from matrix_io import (send, _is_dm, _thread_of,
-                       _resolve_reply_author, _edit_message)
+                       _resolve_reply_author, _edit_message,
+                       _react, _unreact, _ACK_EMOJI)
 from addressing import (_address_kind, _has_trigger, _strip_reply_fallback,
                         _strip_self_mentions, _mark_engaged, _mention_note,
                         _addresses_other_user)
@@ -75,64 +76,85 @@ _UNDECRYPT_NOTICE_COOLDOWN = 600   # 秒（10 分钟）
 _last_undecrypt_notice: dict[str, float] = {}
 
 # 连发合并（debounce）：同一个人短窗内连发的消息并成一个任务再派——一句话分几条打是聊天常态。
-# (room_id, sender, 线程) -> 待派缓冲；首条 strong 建缓冲并起等待协程，窗内后续消息（含没点名的
-# 纯补充）只并入缓冲。窗口每来一条顺延（MESSAGE_DEBOUNCE），总等待封顶 _DEBOUNCE_CAP。
-_pending_dispatch: dict[tuple, dict] = {}
+# 缓冲本体在 state._pending_dispatch（/cancel、退房清理要能作废它）：(room_id, sender, 线程) ->
+# {"room","event","msgs":[(text,ctx_body,note)],"last"}。首条 strong 建缓冲并起等待协程，
+# 窗内后续消息（含没点名的纯补充）只并入。窗口每来一条顺延（MESSAGE_DEBOUNCE），总等待封顶 _DEBOUNCE_CAP。
 _DEBOUNCE_CAP = 6.0   # 秒：连续说话也最多攒这么久就派，别让任务无限延后
 
 
 def _absorb_into_pending(room, event, body: str, ctx_body: str, note: str) -> bool:
     """没点名的消息若落在同一人的连发合并窗内 → 并进待派任务，返回 True（调用方不再走
-    续话/主动插话）。转头 @ 了别人、回复了别的消息、空正文都不算同一段话。"""
+    续话/主动插话）。不算"同一段话"的都放行给正常流程：转头 @ 了别人、回复了别的消息、
+    空正文；重置词/斜杠命令/仓库 URL 更是绝不能吞——它们各有专门分支（reset 精确匹配、
+    /bind、自动绑定），吸收进任务正文等于让这些功能在合并窗内静默失效。"""
     pend = _pending_dispatch.get((room.room_id, event.sender, _thread_of(event)))
-    if pend is None or not body.strip():
+    b = body.strip()
+    if pend is None or not b:
+        return False
+    if b in RESET_CMDS or b.startswith("/") or parse_repo_url(body):
         return False
     content = (event.source or {}).get("content", {})
     if _addresses_other_user(content) or content.get("m.relates_to", {}).get("m.in_reply_to"):
         return False
-    pend["texts"].append(body.strip())
-    pend["ctx_bodies"].append(ctx_body)
-    pend["notes"].append(note)
+    pend["msgs"].append((b, ctx_body, note))
     pend["last"] = time.time()
     return True
 
 
 def _queue_strong_task(room, event, cleaned: str, ctx_body: str, note: str) -> None:
-    """strong 点名的派活入口：开着合并窗就先进缓冲攒一小会儿，关着（=0）逐条即派（老行为）。"""
-    if settings.message_debounce <= 0:
+    """strong 点名的派活入口：开着合并窗就先进缓冲攒一小会儿，关着（=0）逐条即派（老行为）。
+    两类消息绕过缓冲：重置词（必须逐字精确匹配才生效，还顺带作废同人待派缓冲——翻篇的意图
+    涵盖刚攒的半截话）；引用回复（引文/回复目标都从它自己的 event 解析，并进以首条 event 为
+    准的缓冲会把引文弄丢）。"""
+    key = (room.room_id, event.sender, _thread_of(event))
+    if settings.message_debounce <= 0 or cleaned.strip() in RESET_CMDS:
+        if cleaned.strip() in RESET_CMDS:
+            _drop_pending(room.room_id)   # 翻篇作废本房间待派缓冲；waiter 醒来发现缓冲没了会直接退出
         state._spawn(handle_task(room, event, cleaned, skip_body=ctx_body, mention_note=note))
         return
-    key = (room.room_id, event.sender, _thread_of(event))
     pend = _pending_dispatch.get(key)
     if pend is not None:   # 窗内又点名一次 → 并进去，别排第二个任务
-        pend["texts"].append(cleaned)
-        pend["ctx_bodies"].append(ctx_body)
-        pend["notes"].append(note)
+        if (event.source or {}).get("content", {}).get("m.relates_to", {}).get("m.in_reply_to"):
+            state._spawn(handle_task(room, event, cleaned,          # 引用回复独立派，别丢引文
+                                     skip_body=ctx_body, mention_note=note))
+            return
+        pend["msgs"].append((cleaned, ctx_body, note))
         pend["last"] = time.time()
         return
-    _pending_dispatch[key] = {"room": room, "event": event, "texts": [cleaned],
-                              "ctx_bodies": [ctx_body], "notes": [note], "last": time.time()}
+    _pending_dispatch[key] = {"room": room, "event": event,
+                              "msgs": [(cleaned, ctx_body, note)], "last": time.time()}
     state._spawn(_debounced_dispatch(key))
 
 
 async def _debounced_dispatch(key: tuple) -> None:
     """等合并窗静默（或总等待到顶）后把缓冲派出去。单条=与逐条即派完全同参（skip/附注不变形）；
-    多条=正文逐条带各自的 @附注拼接，skip 带全部原文列表逐条剔重。"""
+    多条=正文逐条带各自的 @附注拼接，skip 带全部原文列表逐条剔重。
+    进等待前先打 👀 回执——合并窗期间房间不能毫无反应（单条消息占绝大多数，不该为合并白等
+    还没人搭理）；回执 eid 透传给 handle_task 的 _ack 接管撤销，不重复打。"""
     pend = _pending_dispatch[key]
+    room, event = pend["room"], pend["event"]
+    eid0 = getattr(event, "event_id", None)
+    ack_eid = await _react(room.room_id, eid0, _ACK_EMOJI) if eid0 else None
     start = time.time()
     while True:
         remain = settings.message_debounce - (time.time() - pend["last"])
         if remain <= 0 or time.time() - start >= _DEBOUNCE_CAP:
             break
-        await asyncio.sleep(remain)
-    _pending_dispatch.pop(key, None)   # 先摘缓冲：任务开跑后再来的消息走 steering/新任务，不进死缓冲
-    room, event = pend["room"], pend["event"]
-    if len(pend["texts"]) == 1:
-        await handle_task(room, event, pend["texts"][0],
-                          skip_body=pend["ctx_bodies"][0], mention_note=pend["notes"][0])
+        # 睡眠也受封顶预算约束，别在 5.9s 时又整睡一个窗口把"最多 6s"变成 7.5s
+        await asyncio.sleep(min(remain, max(0.0, _DEBOUNCE_CAP - (time.time() - start))))
+    if _pending_dispatch.get(key) is not pend:   # 等待期间被 /cancel、退房清理作废（或已被重建）
+        if ack_eid:
+            await _unreact(room.room_id, ack_eid)
         return
-    text = "\n".join(t + n for t, n in zip(pend["texts"], pend["notes"]))
-    await handle_task(room, event, text, skip_body=pend["ctx_bodies"], mention_note="")
+    _pending_dispatch.pop(key, None)   # 先摘缓冲：任务开跑后再来的消息走 steering/新任务，不进死缓冲
+    msgs = pend["msgs"]
+    if len(msgs) == 1:
+        t, cb, n = msgs[0]
+        await handle_task(room, event, t, skip_body=cb, mention_note=n, ack_eid=ack_eid)
+        return
+    text = "\n".join(t + n for t, _, n in msgs)
+    await handle_task(room, event, text, skip_body=[cb for _, cb, _ in msgs],
+                      mention_note="", ack_eid=ack_eid)
 
 
 async def on_message(room: MatrixRoom, event: RoomMessageText):
@@ -209,6 +231,12 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     if kind != "strong" and not is_self and _absorb_into_pending(
             room, event, body, ctx_body, mention_note):
         return
+
+    # 翻篇作废合并窗：重置词不管接下来走哪条路（强点名 /「弱信号→语义闸」/ 下面的 elif），
+    # 本房间还没派出去的半截话都该随之作废——在分派前统一处理，别指望每条路径各自记得。
+    # （"@bot /reset" 的 body 带 @ 前缀匹配不上，由 _queue_strong_task 按 cleaned 再兜一层。）
+    if body.strip() in RESET_CMDS:
+        _drop_pending(room.room_id)
 
     # 绑定仓库：/bind 永远显式绑；私聊里【任何】带仓库 URL 的消息都绑到它——私聊已没有别的路由方式
     # （分诊已删），URL 后面若还带话就绑完接着当任务派；群里限"未绑定 + 纯链接/被点名"才自动绑，
@@ -404,6 +432,7 @@ async def _cleanup_room(rid: str):
     拖累其它清理，更别把异常冒回退房流程。"""
     try:
         runner.cancel(rid)   # ① 停掉房内在跑的任务（与 /cancel 同一路径，按房间取消）
+        _drop_pending(rid)   # 连发合并窗里还没派出去的也作废，别对着死房间白跑一轮
     except Exception:
         log.exception("退房清理：取消在跑任务失败 %s", rid)
     try:

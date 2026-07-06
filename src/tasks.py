@@ -9,6 +9,7 @@ from nio import MatrixRoom, RoomMessageText
 from config import settings
 import state
 from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
+                   _drop_pending, _steered_dispatched, _unmark_dispatched,
                    _last_project_by_room, _save_last_projects, _project_last_active)
 from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
                        _thread_of, _thread_root_of, _ack, _react, _FILE_SEND_HINT)
@@ -350,8 +351,10 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                                           lock_key=lock_key, prepare=prepare,
                                           on_delta=_relay, cancel_key=rid,
                                           on_reset=lambda: _clear_dispatched(rid),
-                                          on_notify=_bg_notify, **fork_kw)
+                                          on_notify=_bg_notify, steerable=True, **fork_kw)
             except ClaudeCancelled:
+                for s_, b_ in _steered_dispatched.pop(rid, ()):   # 回合被杀：steered 的话没被处理，
+                    _unmark_dispatched(rid, s_, b_)               # 撤标记让它回到背景别双头落空
                 await live.finalize("🛑 已停止。", track=False)
                 return
             except Exception as e:
@@ -370,8 +373,10 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                 answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
                                           lock_key=lock_key, prepare=prepare, cancel_key=rid,
                                           on_reset=lambda: _clear_dispatched(rid),
-                                          on_notify=_bg_notify, **fork_kw)
+                                          on_notify=_bg_notify, steerable=True, **fork_kw)
             except ClaudeCancelled:
+                for s_, b_ in _steered_dispatched.pop(rid, ()):   # 回合被杀：steered 的话没被处理，
+                    _unmark_dispatched(rid, s_, b_)               # 撤标记让它回到背景别双头落空
                 await send(rid, "🛑 已停止。", thread_root=thread_root, reply_to=_reply_eid())
                 return
             answer = await _emit_files(room, answer, cwd, thread_root)
@@ -379,8 +384,9 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         log.info("[%s] 完成 %d 字", rid, len(answer))
         if mark_after:   # 走到这里 = ask 成功、答复已发：这些消息确实进了会话，现在才标 dispatched，下轮背景剔掉
             m_sender, m_bodies = mark_after
-            for b in (m_bodies if isinstance(m_bodies, list) else [m_bodies]):
+            for b in (m_bodies if isinstance(m_bodies, (list, tuple)) else [m_bodies]):
                 _mark_dispatched(rid, m_sender, b)
+        _steered_dispatched.pop(rid, None)   # 回合善终：期间 steered 进来的话都被处理了，撤销记录不再需要
         if not rec.get("general"):   # 回复里若开了本项目的 PR，记进台账，由跟进循环盯到合并
             pr = _extract_pr(answer, rec)
             if pr and pr_ledger.record(rec["id"], pr[0], pr[1], rid):
@@ -457,12 +463,13 @@ async def _quoted_subject(room: MatrixRoom, event: RoomMessageText) -> str:
 
 
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
-                      skip_body: str | None = None, mention_note: str = ""):
+                      skip_body: str | list[str] | None = None, mention_note: str = "",
+                      ack_eid: str | None = None):
     rid = room.room_id
     # 回执：接手就给触发消息打 👀，处理完（含报错/取消）撤掉——用户不用盯 typing 猜有没有人接。
-    # 包住整个函数体（引用回复拉取、线程解析等都在内）：不管走哪条调用路径（强点名/续话/reset），
-    # 都在函数入口就立刻打上，不必再靠调用方各自提前打一次、传标志位告诉这里别重复打。
-    async with _ack(rid, getattr(event, "event_id", None)):
+    # 包住整个函数体（引用回复拉取、线程解析等都在内）。ack_eid：连发合并层已在等待窗前打过 👀
+    # 时传入（房间不能在合并窗里毫无反应），这里只接管撤销、不重复打。
+    async with _ack(rid, getattr(event, "event_id", None), pre_eid=ack_eid):
         # 引用回复：客户端常只发 m.in_reply_to 指针、不内联引文，本条正文可能只剩一个 @。把被引用的
         # 消息拉进来——正文空时它就是要处理的主题（否则会被下面的空正文闸静默丢掉）；正文非空时作为
         # "用户在指这条"的上文附带过去。重置类元命令不动，别把 /reset 揉进引文。
@@ -520,10 +527,13 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                     eid0 = getattr(event, "event_id", None)
                     if eid0:
                         await _react(rid, eid0, "📎")
-                    bodies = skip_body if isinstance(skip_body, list) else (
+                    bodies = skip_body if isinstance(skip_body, (list, tuple)) else (
                         [skip_body] if skip_body else [])
                     for b in bodies:
                         _mark_dispatched(rid, sender0, b)
+                        # 记下"这条是 steering 标的"：回合若被 /cancel 杀掉，消息随进程丢弃，
+                        # 得撤标记让它回到背景（否则没被回答又被剔出背景，双头落空）
+                        _steered_dispatched.setdefault(rid, []).append((sender0, b))
                     return
 
             # 解析/clone + 跑任务整段都开着"正在输入"，避免绑定首次 clone 时房间静默
@@ -597,11 +607,13 @@ async def handle_summarize(room: MatrixRoom, event: RoomMessageText, body: str):
 
 
 async def handle_cancel(room: MatrixRoom):
-    """/cancel：停掉本房间在途的任务——运行中的杀进程、排队/准备中的取消掉。文案按实际区分三种情况。"""
+    """/cancel：停掉本房间在途的任务——运行中的杀进程、排队/准备中的取消掉，
+    连发合并窗里还没派出去的缓冲也一并作废（否则"已取消"几秒后任务照跑）。文案按实际区分。"""
     rid = room.room_id
     res = runner.cancel(rid)
     # runner.cancel 返回 (运行中被停, 排队中被取消)；兼容旧式只返回单个 int（测试里的假 runner）。
     running, queued = res if isinstance(res, tuple) else (res, 0)
+    queued += _drop_pending(rid)   # 合并窗中的待派消息：runner 还不知道它们，这里直接作废
     if running:
         msg = "🛑 已停止正在运行的任务。"
         if queued:

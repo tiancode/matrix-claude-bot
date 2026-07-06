@@ -124,8 +124,10 @@ def test_try_steer_injects_only_mid_turn():
     settings.claude_persistent = True
     try:
         assert asyncio.run(r.try_steer("k|r", "x")) is False        # 回合外不注入（会被当下一任务）
-        ps.turn = {"fut": None}
-        assert asyncio.run(r.try_steer("k|r", "追加一句")) is True  # 回合中注入
+        ps.turn = {"fut": None}                                     # 非聊天回合（自驱/PR 跟进/工单）：
+        assert asyncio.run(r.try_steer("k|r", "x")) is False        # 绝不把用户的话注入进去
+        ps.turn = {"fut": None, "steerable": True}
+        assert asyncio.run(r.try_steer("k|r", "追加一句")) is True  # 聊天回合才注入
         obj = _json.loads(written[0].decode())
         assert obj["type"] == "user"
         assert obj["message"]["content"][0]["text"] == "追加一句"
