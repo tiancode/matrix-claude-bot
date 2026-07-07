@@ -2,7 +2,7 @@
 from _helpers import (
     FakeRoom, _reset_ledger, asyncio, bot, heartbeat, make_event, matrix_io, os, pr_followup, set_identity, settings, state, tasks, time, types)
 
-# ---------- 35b) 排队回执：项目锁被占时立即知会"已排队"，空闲时不发 ----------
+# ---------- 35b) 排队回执：项目锁被占/并发额度占满时立即知会"已排队"，空闲时不发 ----------
 def test_queue_receipt_when_busy():
     set_identity()
     rid = "!queue:ex.org"
@@ -11,9 +11,10 @@ def test_queue_receipt_when_busy():
     sent = []
 
     class R:
-        def __init__(self): self.is_busy = False; self.n_running = 0
+        def __init__(self): self.is_busy = False; self.n_running = 0; self.cap_full = False
         def busy(self, k): return self.is_busy
         def running(self, k): return self.n_running
+        def capacity_full(self): return self.cap_full
         def session_ts(self, k): return None
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
                       on_delta=None, cancel_key=None, **_kw):
@@ -41,6 +42,26 @@ def test_queue_receipt_when_busy():
         r.n_running = 0                                        # 忙但占用来自别处 → 说明 /cancel 停不了
         asyncio.run(tasks._run_on_project(room, ev, "第三个", rec))
         assert any("已排队" in m and "停不了" in m for m in sent)
+
+        sent.clear()
+        r.is_busy, r.cap_full = False, True                    # 锁空闲但全局并发额度占满 → 也要知会
+        asyncio.run(tasks._run_on_project(room, ev, "第四个", rec))
+        assert any("并发额度已满" in m and "已排队" in m for m in sent)
+
+        sent.clear()
+        r.cap_full = False                                     # 两层都空闲 → 不发回执
+        asyncio.run(tasks._run_on_project(room, ev, "第五个", rec))
+        assert not any("已排队" in m for m in sent)
+
+        # 真 runner 的 capacity_full：额度未满 False，占满 True（fake 只验派活层接线）
+        from claude_runner import ClaudeRunner
+        async def _cap():
+            real = ClaudeRunner()
+            assert not real.capacity_full()
+            for _ in range(max(1, settings.max_concurrency)):
+                await real._sema.acquire()
+            assert real.capacity_full()
+        asyncio.run(_cap())
     finally:
         (tasks.runner, state.client, settings.stream_replies) = orig
         bot._context[rid].clear()

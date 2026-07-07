@@ -330,13 +330,19 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
         except Exception:
             log.exception("[%s] 后台任务产出投递失败", rid)
     try:
-        # 排队回执：串行锁被占（同项目已有任务在跑）时立即知会，别让用户对着 typing 猜消息丢没丢。
-        # 尽力而为——与对方拿锁存在竞态，漏发只影响提示不影响排队本身。
+        # 排队回执：串行锁被占（同项目已有任务在跑）或全局并发额度（MAX_CONCURRENCY）占满时
+        # 立即知会，别让用户对着 typing 猜消息丢没丢。两层闸分开说：锁是同一 checkout 必须串行，
+        # 额度是全局在跑的回合太多。尽力而为——与对方拿锁/占额度存在竞态，漏发只影响提示不影响
+        # 排队本身。capacity_full 走 getattr 兜底：测试里的假 runner 不必都认识它。
         if runner.busy(lock_key or sess):
             note = "⏳ 上一个任务还在跑，这条已排队，轮到会自动开始"
             note += ("；等不及可发 /cancel 停掉当前任务。" if runner.running(rid)
                      else "（正忙的是其它房间或自驱/工单任务，本房间 /cancel 停不了它）。")
             await send(rid, note, thread_root=thread_root, reply_to=_reply_eid())
+        elif getattr(runner, "capacity_full", lambda: False)():
+            await send(rid, "⏳ 并发额度已满（其它房间/后台任务正在跑），这条已排队，"
+                            "轮到会自动开始（管理员可调大 MAX_CONCURRENCY 提升并行度）。",
+                       thread_root=thread_root, reply_to=_reply_eid())
         if settings.stream_replies:                      # 流式：边生成边编辑同一条占位消息
             live = _LiveReply(rid, thread_root=thread_root, reply_to=reply_to)
             _attached = {"v": False}

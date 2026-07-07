@@ -190,6 +190,11 @@ class ClaudeRunner:
         lock = self._locks.get(lock_key)
         return bool(lock and lock.locked())
 
+    def capacity_full(self) -> bool:
+        """全局 agentic 并发额度（MAX_CONCURRENCY）是否已占满——此刻新派的回合起跑前得先等空位。
+        只查不占；与真实获取存在竞态，同 busy 一样只供派活层发"已排队"的尽力知会。"""
+        return self._sema.locked()
+
     def session_ts(self, key: str) -> float | None:
         """该会话最近一次活跃的时刻；无有效会话（不存在/已过 TTL）返回 None。不产生副作用。"""
         item = self._sessions.get(key)
