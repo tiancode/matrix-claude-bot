@@ -195,6 +195,11 @@ class ClaudeRunner:
         只查不占；与真实获取存在竞态，同 busy 一样只供派活层发"已排队"的尽力知会。"""
         return self._sema.locked()
 
+    def pending(self, cancel_key: str) -> int:
+        """该取消维度（房间）下在途任务数——排队等锁、prepare 中、运行中的都算，
+        即 /cancel 此刻能停掉的任务数。与 running 的区别：running 只数已起子进程的。"""
+        return len(self._tokens.get(cancel_key) or ())
+
     def session_ts(self, key: str) -> float | None:
         """该会话最近一次活跃的时刻；无有效会话（不存在/已过 TTL）返回 None。不产生副作用。"""
         item = self._sessions.get(key)
@@ -257,6 +262,17 @@ class ClaudeRunner:
         return sid, False
 
     # ---- 进程调用 ----
+    @staticmethod
+    async def _notify_queued(sema: asyncio.Semaphore, on_queued) -> None:
+        """即将在并发额度上真正阻塞（信号量已满）时通知调用方。派发时刻的预检
+        （capacity_full）有竞态窗口——等锁/prepare 期间额度可能被占满——这里才是
+        排队确实发生的时刻，兜底补发知会。回调失败只记日志，不影响排队本身。"""
+        if on_queued is not None and sema.locked():
+            try:
+                await on_queued()
+            except Exception:
+                log.exception("on_queued 回调失败（忽略，继续排队）")
+
     async def _run(self, cmd: list[str], cwd: str | None = None,
                    sema: asyncio.Semaphore | None = None,
                    env: dict | None = None,
@@ -679,7 +695,7 @@ class ClaudeRunner:
                   system_prompt: str | None = None, lock_key: str | None = None,
                   prepare=None, on_delta=None, cancel_key: str | None = None,
                   fork_from: str | None = None, on_reset=None, on_notify=None,
-                  steerable: bool = False) -> str:
+                  steerable: bool = False, on_queued=None) -> str:
         """带工具、带会话上下文地干活；cwd=该项目的仓库目录。
 
         key:        会话维度（项目+房间[+线程]），不同房间/私聊用户互不串台。
@@ -699,6 +715,10 @@ class ClaudeRunner:
         steerable:  这是不是聊天回合——只有聊天回合允许 try_steer 把追加消息递进来。
                     自驱/PR 跟进/工单不传（False），它们与聊天共用会话 key，但用户的话
                     绝不能被注入进那些带危险权限的自动化回合。
+        on_queued:  即将在全局并发额度上真正阻塞（信号量已满）时回调 async fn()。
+                    派活层的派发时刻预检（capacity_full）有竞态窗口——等锁/prepare
+                    （git fetch 可数十秒）期间额度可能被别人占满——这里兜底补发"已排队"
+                    知会。瞬时重试会再次经过信号量，回调可能多次触发，去重由调用方负责。
         """
         lock_key = lock_key or key
         ckey = cancel_key or lock_key
@@ -723,6 +743,10 @@ class ClaudeRunner:
             prompt_override：瞬时故障重试续跑时用接续提示替代原 prompt（原任务已在会话里，别再注入一遍）。"""
             p = prompt_override or prompt
             last_fail.clear()
+            # 三条执行路径进门第一件事都是抢全局并发额度（_sema）：额度已满就在这里统一
+            # 发"真要排队了"的兜底通知——不把 on_queued 下传进内部签名，测试里 monkeypatch
+            # 的假 _run/_persist_once 就不必跟着认识它。
+            await self._notify_queued(self._sema, on_queued)
             if settings.claude_persistent:
                 return await self._persist_once(key, sid, fork, p, system_prompt,
                                                 cwd, on_delta, on_notify, _reg,

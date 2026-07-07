@@ -11,10 +11,12 @@ def test_queue_receipt_when_busy():
     sent = []
 
     class R:
-        def __init__(self): self.is_busy = False; self.n_running = 0; self.cap_full = False
+        def __init__(self):
+            self.is_busy = False; self.n_running = 0; self.cap_full = False; self.n_pending = 0
         def busy(self, k): return self.is_busy
         def running(self, k): return self.n_running
         def capacity_full(self): return self.cap_full
+        def pending(self, k): return self.n_pending
         def session_ts(self, k): return None
         async def ask(self, key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
                       on_delta=None, cancel_key=None, **_kw):
@@ -53,18 +55,36 @@ def test_queue_receipt_when_busy():
         asyncio.run(tasks._run_on_project(room, ev, "第五个", rec))
         assert not any("已排队" in m for m in sent)
 
-        # 真 runner 的 capacity_full：额度未满 False，占满 True（fake 只验派活层接线）
-        from claude_runner import ClaudeRunner
-        async def _cap():
-            real = ClaudeRunner()
-            assert not real.capacity_full()
-            for _ in range(max(1, settings.max_concurrency)):
-                await real._sema.acquire()
-            assert real.capacity_full()
-        asyncio.run(_cap())
+        sent.clear()
+        r.is_busy = r.cap_full = True                          # 两闸同时关 → 只发一条，锁文案优先
+        asyncio.run(tasks._run_on_project(room, ev, "第六个", rec))
+        assert len([m for m in sent if "已排队" in m]) == 1
+        assert any("上一个任务" in m for m in sent)
+
+        sent.clear()
+        r.is_busy, r.cap_full, r.n_pending = False, True, 1    # 占额度的是本房间自己排队的任务
+        asyncio.run(tasks._run_on_project(room, ev, "第七个", rec))  # → 给 /cancel 提示而非怪罪别处
+        assert any("并发额度已满" in m and "/cancel" in m for m in sent)
     finally:
         (tasks.runner, state.client, settings.stream_replies) = orig
         bot._context[rid].clear()
+
+# ---------- capacity_full：真 runner 的全局并发信号量占满判定 ----------
+def test_capacity_full_semaphore():
+    from claude_runner import ClaudeRunner
+
+    async def go():
+        real = ClaudeRunner()
+        assert not real.capacity_full()          # 初始有空位
+        # 按观测排空而非复制 __init__ 的 max(1, MAX_CONCURRENCY) 容量公式：
+        # 公式将来变了这里也不会多 acquire 一次把无超时的套件挂死
+        while not real.capacity_full():
+            await real._sema.acquire()
+        assert real.capacity_full()              # 占满即判满
+        real._sema.release()
+        assert not real.capacity_full()          # 释放一个空位即不再判满
+    asyncio.run(go())
+
 
 # ---------- 自驱心跳：巡检时段只在工作日白天（默认东八区 9~19 点） ----------
 def test_heartbeat_schedule_window():
@@ -540,6 +560,7 @@ def test_livereply_finalize_edit_fallback():
 
 TESTS = [
     ('排队回执 忙时知会/空闲不发', test_queue_receipt_when_busy),
+    ('capacity_full 信号量占满判定', test_capacity_full_semaphore),
     ('模型拆分 干活大/轻判断小', test_quick_model_split),
     ('聊天逐字记录 落盘/回溯/删旧/开关', test_transcript_log_and_recall),
     ('聊天日摘要 触发/东八区分桶/落盘/水位线/合并/注入', test_digest_layer),

@@ -192,6 +192,27 @@ def test_handle_task_steers_when_turn_running():
         bot._context[rid].clear()
 
 
+def test_on_queued_fires_when_capacity_waited():
+    """on_queued：额度有空位时不回调；占满时在真正阻塞前回调一次（排队知会的兜底时机）。"""
+    async def go(r):
+        d = tempfile.mkdtemp()
+        fired = []
+
+        async def on_q():
+            fired.append(1)
+            r._sema.release()   # 腾出一个空位，让被阻塞的回合能继续跑完
+
+        a1 = await r.ask("kq", "hello", cwd=d, on_queued=on_q)
+        assert "hello" in a1 and not fired, "有空位时不该回调 on_queued"
+        while not r.capacity_full():
+            await r._sema.acquire()          # 占满全局并发额度
+        # 带超时兜底：若 on_queued 没触发（没人释放空位），ask 会永久阻塞——宁可报错别挂死套件
+        a2 = await asyncio.wait_for(r.ask("kq", "again", cwd=d, on_queued=on_q), timeout=30)
+        assert "again" in a2, "回调释放空位后回合应正常完成"
+        assert len(fired) == 1, f"占满时应恰好回调一次，实际 {len(fired)}"
+    _with_persistent(go)
+
+
 TESTS = [
     ('常驻进程 跨轮复用同一进程', test_persistent_reuse_across_turns),
     ('常驻进程 后台自发产出经 on_notify 投递', test_persistent_spontaneous_notify),
@@ -199,4 +220,5 @@ TESTS = [
     ('常驻进程 死后凭 sid 重生', test_persistent_respawn_after_death),
     ('steering 仅回合中注入 stdin', test_try_steer_injects_only_mid_turn),
     ('steering 点名递进当前回合+📎+标记', test_handle_task_steers_when_turn_running),
+    ('on_queued 额度满才回调（排队知会兜底）', test_on_queued_fires_when_capacity_waited),
 ]
