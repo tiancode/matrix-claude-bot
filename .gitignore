@@ -11,5 +11,7 @@ homeserver.crt
 
 # Python
 .venv/
+# CI 步骤（.gitea/workflows/ci.yml）在工作区里建的虚拟环境，本地照跑 CI 时也会产生
+.venv-ci/
 __pycache__/
 *.pyc
