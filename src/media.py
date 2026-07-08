@@ -179,8 +179,10 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
         # 与文本相同的派活闸：自己账号无触发词不派活
         if is_self and not _has_trigger(event.body or ""):
             return
-        # 已知机器人（KNOWN_BOTS）：文件已落上下文，但绝不应答（与文本入口同一断环闸）
+        # 已知机器人（KNOWN_BOTS）：文件已落上下文，但绝不应答（与文本入口同一断环闸）。
+        # 显示名同样记入 _known_bot_names——bot 发的文件也不该算"第三人插话"。
         if not is_self and _is_known_bot(event.sender):
+            state._known_bot_names.setdefault(rid, set()).add(sender)
             return
         # 与文本一致：回复的若是 bot 重启前的旧消息，先补认；点名后开/续"对话延续窗口"
         await _resolve_reply_author(rid, (event.source or {}).get("content", {}))

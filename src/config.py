@@ -43,6 +43,15 @@ def _csv(key):
     return tuple(x.strip() for x in _s(key).split(",") if x.strip())
 
 
+def _parse_known_bots(entries):
+    """KNOWN_BOTS 条目 → (完整 MXID 集, localpart 集)。带 : 的当完整 MXID，漏写 @ 自动补——
+    localpart 简写不用 @，操作者很容易在完整形式上也漏掉它，而 sender 恒以 @ 开头，
+    不补的话这条名单项会静默失效（bot 照旧互答，正是这配置要防的事故）。"""
+    full = frozenset((b if b.startswith("@") else "@" + b) for b in entries if ":" in b)
+    local = frozenset(b.lstrip("@") for b in entries if ":" not in b)
+    return full, local
+
+
 class Settings:
     # Matrix 账号
     homeserver   = _s("MATRIX_HOMESERVER", "https://matrix.org")
@@ -104,11 +113,10 @@ class Settings:
     process_backlog = _b("PROCESS_BACKLOG", False)
     # 已知机器人名单：逗号分隔。这些 sender 的消息照常进上下文/逐字记录（真人接手时背景完整），
     # 但 bot 对它们【绝不应答】——点名/回复/元命令/续话/主动插话一概不认，防两个 bot 互相
-    # 应答陷入死循环。带 : 的条目按完整 MXID 精确匹配（@weather:example.com）；不带 : 的按
-    # localpart 匹配、不限 homeserver（weather 命中 @weather:任何服务器）。留空=没有已知机器人。
-    known_bots = _csv("KNOWN_BOTS")
-    known_bots_full  = frozenset(b for b in known_bots if ":" in b)
-    known_bots_local = frozenset(b.lstrip("@") for b in known_bots if ":" not in b)
+    # 应答陷入死循环。带 : 的条目按完整 MXID 精确匹配（@weather:example.com，漏写 @ 会自动补）；
+    # 不带 : 的按 localpart 匹配、不限 homeserver（weather 命中 @weather:任何服务器）。
+    # 留空=没有已知机器人。
+    known_bots_full, known_bots_local = _parse_known_bots(_csv("KNOWN_BOTS"))
 
     # Gitea / 项目路由
     gitea_token    = _s("GITEA_TOKEN")

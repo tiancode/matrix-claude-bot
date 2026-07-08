@@ -146,6 +146,7 @@ def test_media_known_bot_silent():
         (settings.media_root, settings.media_enabled, state.client, media.handle_task,
          settings.known_bots_full, settings.known_bots_local) = orig
         bot._context[rid].clear()
+        state._known_bot_names.pop(rid, None)
     assert in_ctx == 1                              # 文件行照常进上下文
     assert not handled and not sent                 # 但既不派活、也不回任何消息
 

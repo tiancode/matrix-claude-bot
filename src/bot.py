@@ -193,7 +193,9 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     # 已知机器人（KNOWN_BOTS）：消息照常进上下文/逐字记录（上面已落，真人接手时背景完整），
     # 但绝不应答——元命令/点名/回复/续话/主动插话一概不认。两个 bot 互相应答会陷入死循环，
     # 名单式全静默是最稳的断环：想恢复互动，把对方从名单里拿掉即可。
+    # 顺手记下它的显示名：续话窗口的"第三人插话"判定按显示名比对，名单 bot 的播报不算第三人。
     if not is_self and _is_known_bot(event.sender):
+        state._known_bot_names.setdefault(room.room_id, set()).add(sender_name)
         return
 
     # 元命令：群里不必 @ 也认（与 /reset 同类）。help/summarize/cancel 走各自快路径，不进任务分诊。
@@ -348,12 +350,17 @@ async def on_undecrypted(room: MatrixRoom, event: MegolmEvent):
         pass                                   # 已在要这把密钥了，别重复请求
     except Exception:
         log.exception("请求会话密钥失败 %s", room.room_id)
-    # ② 限流：仅对"明文提示"限流；密钥请求每条都试（nio 自身按 session 去重，不会真刷屏）。
+    # ② 已知机器人：密钥照要（上面已发，to-device 不进房间；解开后它的消息还要进上下文），
+    #    但绝不回明文提示——这是名单闸外唯一会"应答"bot 的路径，漏了它 E2EE 房里就还剩
+    #    一条 bot 互答通道（对面 bot 若也逢消息必回，就是一个 10 分钟一轮的慢速死循环）。
+    if _is_known_bot(getattr(event, "sender", "")):
+        return
+    # ③ 限流：仅对"明文提示"限流；密钥请求每条都试（nio 自身按 session 去重，不会真刷屏）。
     now = time.time()
     if now - _last_undecrypt_notice.get(room.room_id, 0.0) < _UNDECRYPT_NOTICE_COOLDOWN:
         return
     _last_undecrypt_notice[room.room_id] = now
-    # ③ 回一条明文提示，让用户至少知道发生了什么、下一步怎么办。发失败只记日志。
+    # ④ 回一条明文提示，让用户至少知道发生了什么、下一步怎么办。发失败只记日志。
     try:
         await send(room.room_id,
                    "这条加密消息我解不开（密钥缺失），已尝试向你的客户端要密钥——"
@@ -439,6 +446,7 @@ async def _cleanup_room(rid: str):
     try:
         runner.cancel(rid)   # ① 停掉房内在跑的任务（与 /cancel 同一路径，按房间取消）
         _drop_pending(rid)   # 连发合并窗里还没派出去的也作废，别对着死房间白跑一轮
+        state._known_bot_names.pop(rid, None)   # 名单 bot 显示名记录随房间一并清
     except Exception:
         log.exception("退房清理：取消在跑任务失败 %s", rid)
     try:

@@ -71,15 +71,19 @@ def _third_party_spoke_since(rid: str, ts: float, sender_name: str) -> bool:
     "还在跟我续话"这个假设不再成立，作废窗口。数据取自内存背景缓冲 _context（存的是显示名）；
     缓冲为空时（如单测直连 _is_addressed）判无第三人，保持原纯时间窗行为。
     续话窗口只在顶层主时间线成立（线程内消息带 in_reply_to，不走续话），故只看顶层消息——
-    别让线程里别人说的话（与主时间线隔离）误作废你在主聊天里的续话窗口。"""
+    别让线程里别人说的话（与主时间线隔离）误作废你在主聊天里的续话窗口。
+    KNOWN_BOTS 名单 bot 的消息也不算第三人：它们进上下文但不参与对话（绝不应答），定时播报
+    若算插话，有播报 bot 的房间里真人的免 @ 续话就永远被掐。按显示名比对（上下文里没有 MXID），
+    名单见 state._known_bot_names（消息入口与上下文同源记录）。"""
     bot_name = state.MY_NAME or "bot"   # 与 _track_reply 落上下文时用的名字一致，别把 bot 自己的答复当第三人
+    bot_names = state._known_bot_names.get(rid, ())
     for item in list(state._context.get(rid, ())):
         t, name = item[0], item[1]
         if t <= ts:
             continue
         if _ctx_thread(item) is not None:   # 线程里的话不算主时间线的第三人插话
             continue
-        if name == sender_name or name == bot_name:
+        if name == sender_name or name == bot_name or name in bot_names:
             continue
         return True
     return False

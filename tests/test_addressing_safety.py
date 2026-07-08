@@ -352,8 +352,13 @@ def test_mention_note():
     ) == "〔@了 Alice〕"                                                # 垃圾条目剔掉，合法的照常
 
 
-# ---------- KNOWN_BOTS：名单匹配（完整 MXID / localpart 简写 / 空名单） ----------
+# ---------- KNOWN_BOTS：名单匹配（完整 MXID / localpart 简写 / 空名单 / 漏 @ 自动补） ----------
 def test_known_bot_matching():
+    import config
+    # 解析：带 : 漏写 @ 自动补（否则该条目永远匹配不上任何 sender，断环保护静默失效）
+    full, local = config._parse_known_bots(("weather:ex.org", "@w2:ex.org", "rss", "@news"))
+    assert full == frozenset(("@weather:ex.org", "@w2:ex.org"))
+    assert local == frozenset(("rss", "news"))
     orig = (settings.known_bots_full, settings.known_bots_local)
     try:
         settings.known_bots_full = frozenset(("@weather:ex.org",))
@@ -397,6 +402,42 @@ def test_known_bot_silent_but_in_context():
         state._spawn = orig_spawn
         settings.known_bots_full, settings.known_bots_local = orig_bots
         bot._context[rid].clear()
+        state._known_bot_names.pop(rid, None)
+
+# ---------- KNOWN_BOTS：加密消息解不开也不回明文提示（密钥照要），真人不受影响 ----------
+def test_known_bot_no_undecrypt_notice():
+    set_identity()
+    state._synced = True
+    rid = "!enckb:ex.org"
+    room = FakeRoom(rid, 2)
+    sent, key_reqs = [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"])
+            return types.SimpleNamespace(event_id="$x%d" % len(sent))
+
+        async def request_room_key(self, event, tx_id=None):
+            key_reqs.append(event)
+            return types.SimpleNamespace()
+
+    orig = (state.client, settings.process_backlog,
+            settings.known_bots_full, settings.known_bots_local)
+    state.client, settings.process_backlog = FC(), False
+    settings.known_bots_full = frozenset(("@weather:ex.org",))
+    settings.known_bots_local = frozenset()
+    bot._last_undecrypt_notice.pop(rid, None)
+    try:
+        ev_bot = types.SimpleNamespace(session_id="s1", room_id=rid, sender="@weather:ex.org")
+        asyncio.run(bot.on_undecrypted(room, ev_bot))
+        assert len(key_reqs) == 1 and sent == []     # 密钥照要（to-device 不进房），明文提示绝不发
+        ev_human = types.SimpleNamespace(session_id="s2", room_id=rid, sender="@alice:ex.org")
+        asyncio.run(bot.on_undecrypted(room, ev_human))
+        assert len(sent) == 1                        # 真人解不开照常提示，名单闸不误伤
+    finally:
+        (state.client, settings.process_backlog,
+         settings.known_bots_full, settings.known_bots_local) = orig
+        bot._last_undecrypt_notice.pop(rid, None)
 
 
 TESTS = [
@@ -414,4 +455,5 @@ TESTS = [
     ('「@了 谁」附注 解析/排己/去重', test_mention_note),
     ('KNOWN_BOTS 名单匹配', test_known_bot_matching),
     ('KNOWN_BOTS 全静默但进上下文', test_known_bot_silent_but_in_context),
+    ('KNOWN_BOTS 解不开不提示 密钥照要', test_known_bot_no_undecrypt_notice),
 ]

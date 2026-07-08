@@ -81,6 +81,35 @@ def test_followup_window_third_party_invalidates():
         state._group_engaged.clear()
         bot._context[rid].clear()
 
+# ---------- 8b') 续话窗口：KNOWN_BOTS 名单 bot 的播报不算第三人插话 ----------
+def test_followup_window_known_bot_not_third_party():
+    set_identity()
+    rid = "!fwkb:ex.org"
+    room = FakeRoom(rid, 3)
+    orig_win = settings.group_followup_window
+    settings.group_followup_window = 180
+    state._group_engaged.clear()
+    bot._context[rid].clear()
+    state._known_bot_names[rid] = {"weather-bot"}     # 名单 bot 在本房用过的显示名（消息入口记录）
+    try:
+        t0 = time.time()
+        state._group_engaged[(rid, "@alice:ex.org")] = t0        # alice 在 t0 点过名
+
+        # 名单 bot 的定时播报插在中间 → 不算第三人，alice 的免 @ 续话仍成立
+        bot._context[rid].append((t0 + 1, "weather-bot", "今日多云 3℃"))
+        kind, _ = bot._address_kind(room, make_event("接着再改一处", sender="@alice:ex.org"))
+        assert kind == "weak"
+
+        # 真人插话仍然作废（只放过名单 bot，不放过人）
+        bot._context[rid].append((t0 + 2, "Bob", "对了你们看球了吗"))
+        kind, _ = bot._address_kind(room, make_event("哈哈是啊", sender="@alice:ex.org"))
+        assert kind == ""
+    finally:
+        settings.group_followup_window = orig_win
+        state._group_engaged.clear()
+        bot._context[rid].clear()
+        state._known_bot_names.pop(rid, None)
+
 def test_address_kind_strong_vs_weak():
     set_identity()
     rid = "!ak:ex.org"
@@ -330,6 +359,7 @@ def test_retry_only_on_session_error():
 TESTS = [
     ('群对话延续窗口', test_group_followup_window),
     ('续话窗口第三人插话作废+强弱分级', test_followup_window_third_party_invalidates),
+    ('续话窗口 名单bot播报不算第三人', test_followup_window_known_bot_not_third_party),
     ('_address_kind 强/弱信号分级', test_address_kind_strong_vs_weak),
     ('续话软窗口 硬窗外交给语义闸', test_followup_semantic_window),
     ('线程消息不当顶层weak续话', test_thread_msg_not_top_level_weak),
