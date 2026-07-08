@@ -38,6 +38,11 @@ def _b(key, default=False):
     return v.lower() in ("1", "true", "yes", "on")
 
 
+def _csv(key):
+    """逗号分隔列表：去空白、去空项。未设置 → 空元组。"""
+    return tuple(x.strip() for x in _s(key).split(",") if x.strip())
+
+
 class Settings:
     # Matrix 账号
     homeserver   = _s("MATRIX_HOMESERVER", "https://matrix.org")
@@ -97,6 +102,13 @@ class Settings:
     trigger_phrase = _s("TRIGGER_PHRASE")
     context_lines  = _i("CONTEXT_LINES", 20)
     process_backlog = _b("PROCESS_BACKLOG", False)
+    # 已知机器人名单：逗号分隔。这些 sender 的消息照常进上下文/逐字记录（真人接手时背景完整），
+    # 但 bot 对它们【绝不应答】——点名/回复/元命令/续话/主动插话一概不认，防两个 bot 互相
+    # 应答陷入死循环。带 : 的条目按完整 MXID 精确匹配（@weather:example.com）；不带 : 的按
+    # localpart 匹配、不限 homeserver（weather 命中 @weather:任何服务器）。留空=没有已知机器人。
+    known_bots = _csv("KNOWN_BOTS")
+    known_bots_full  = frozenset(b for b in known_bots if ":" in b)
+    known_bots_local = frozenset(b.lstrip("@") for b in known_bots if ":" not in b)
 
     # Gitea / 项目路由
     gitea_token    = _s("GITEA_TOKEN")

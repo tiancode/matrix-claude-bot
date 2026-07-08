@@ -12,7 +12,7 @@ import state
 from state import _context
 from fmt import _safe_name, _human_bytes
 from matrix_io import send, _is_dm, _resolve_reply_author, _thread_of
-from addressing import _has_trigger, _is_addressed, _mark_engaged, _mention_note
+from addressing import _has_trigger, _is_addressed, _is_known_bot, _mark_engaged, _mention_note
 from tasks import handle_task
 import transcript
 
@@ -178,6 +178,9 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
 
         # 与文本相同的派活闸：自己账号无触发词不派活
         if is_self and not _has_trigger(event.body or ""):
+            return
+        # 已知机器人（KNOWN_BOTS）：文件已落上下文，但绝不应答（与文本入口同一断环闸）
+        if not is_self and _is_known_bot(event.sender):
             return
         # 与文本一致：回复的若是 bot 重启前的旧消息，先补认；点名后开/续"对话延续窗口"
         await _resolve_reply_author(rid, (event.source or {}).get("content", {}))

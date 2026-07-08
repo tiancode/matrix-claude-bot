@@ -352,6 +352,53 @@ def test_mention_note():
     ) == "〔@了 Alice〕"                                                # 垃圾条目剔掉，合法的照常
 
 
+# ---------- KNOWN_BOTS：名单匹配（完整 MXID / localpart 简写 / 空名单） ----------
+def test_known_bot_matching():
+    orig = (settings.known_bots_full, settings.known_bots_local)
+    try:
+        settings.known_bots_full = frozenset(("@weather:ex.org",))
+        settings.known_bots_local = frozenset(("rss",))
+        assert addressing._is_known_bot("@weather:ex.org")           # 完整 MXID 精确匹配
+        assert not addressing._is_known_bot("@weather:other.org")    # 完整 MXID 不跨 homeserver
+        assert addressing._is_known_bot("@rss:ex.org")               # localpart 简写不限 homeserver
+        assert addressing._is_known_bot("@rss:another.org")
+        assert not addressing._is_known_bot("@rss2:ex.org")          # localpart 全等，不是前缀匹配
+        assert not addressing._is_known_bot("")                      # 空 sender 不误伤
+        settings.known_bots_full = frozenset()
+        settings.known_bots_local = frozenset()
+        assert not addressing._is_known_bot("@weather:ex.org")       # 空名单=没有已知机器人
+    finally:
+        settings.known_bots_full, settings.known_bots_local = orig
+
+# ---------- KNOWN_BOTS：名单 bot 全静默——消息进上下文，但 DM 必回/元命令都不应答 ----------
+def test_known_bot_silent_but_in_context():
+    set_identity()
+    state._synced = True
+    rid = "!dmbot:ex.org"
+    room = FakeRoom(rid, 2)                      # DM → 人发的话必回，静默只可能来自名单闸
+    bot._context[rid].clear()
+    spawned = []
+    orig_spawn = state._spawn
+    orig_bots = (settings.known_bots_full, settings.known_bots_local)
+    settings.known_bots_full = frozenset(("@weather:ex.org",))
+    settings.known_bots_local = frozenset()
+    state._spawn = lambda coro: (spawned.append(1), coro.close())
+    try:
+        asyncio.run(bot.on_message(room, make_event(
+            "现在气温 3℃", sender="@weather:ex.org", event_id="$kb1")))
+        asyncio.run(bot.on_message(room, make_event(
+            "/status", sender="@weather:ex.org", event_id="$kb2")))   # 元命令也不认
+        assert not spawned                                            # DM 里 bot 说啥都不应答
+        assert len(bot._context[rid]) == 2                            # 但消息照常进上下文
+        asyncio.run(bot.on_message(room, make_event(
+            "帮我看下这个报错", sender="@alice:ex.org", event_id="$kb3")))
+        assert len(spawned) == 1                                      # 真人照常派活，名单不误伤
+    finally:
+        state._spawn = orig_spawn
+        settings.known_bots_full, settings.known_bots_local = orig_bots
+        bot._context[rid].clear()
+
+
 TESTS = [
     ('认 reply / 点名', test_reply_addressing),
     ('引用回退块剥离', test_reply_fallback_strip),
@@ -365,4 +412,6 @@ TESTS = [
     ('退房清尾巴 绑定/路由/任务/记录', test_leave_cleans_up_room),
     ('加密解不开 要密钥+提示+限流', test_undecryptable_notifies_and_rate_limits),
     ('「@了 谁」附注 解析/排己/去重', test_mention_note),
+    ('KNOWN_BOTS 名单匹配', test_known_bot_matching),
+    ('KNOWN_BOTS 全静默但进上下文', test_known_bot_silent_but_in_context),
 ]

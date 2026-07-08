@@ -16,6 +16,17 @@ ACTIONABLE_HINTS = ("?", "？", "帮", "求", "怎么", "如何", "能不能", "
 
 
 
+def _is_known_bot(sender: str) -> bool:
+    """sender 是否在 KNOWN_BOTS 名单里（完整 MXID 精确匹配，或 localpart 简写匹配）。
+    名单里的 bot 消息只进上下文、绝不应答——bot 互相应答会陷入死循环。"""
+    if not sender:
+        return False
+    if sender in settings.known_bots_full:
+        return True
+    return sender.lstrip("@").split(":")[0] in settings.known_bots_local
+
+
+
 def _addresses_other_user(content: dict) -> bool:
     """这条消息是否 @ 了 bot 以外的人（@别人 → 在跟别人说话，不当成对 bot 的续话）。"""
     ids = content.get("m.mentions", {}).get("user_ids", []) or []

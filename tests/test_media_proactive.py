@@ -108,6 +108,47 @@ def test_media_failure_notifies_when_addressed():
         bot._context[rid].clear()
     assert any("没能处理" in m and "下载失败" in m for m in sent)   # 文件失败且无 caption → 回错误
 
+# ---------- 20c) KNOWN_BOTS：名单 bot 发的文件进上下文，但不派活也不回错（全静默） ----------
+def test_media_known_bot_silent():
+    import tempfile
+    set_identity()
+    state._synced = True
+    rid = "!botmedia:ex.org"
+    room = FakeRoom(rid, 2)                       # DM → 本会必回，静默只可能来自名单闸
+    bot._context[rid].clear()
+    sent, handled = [], []
+
+    class FC:
+        async def room_send(self, r, mt, content, **k):
+            sent.append(content["body"]); return types.SimpleNamespace(event_id="$x")
+        async def download(self, mxc=None, save_to=None, **k):
+            with open(save_to, "wb") as f:
+                f.write(b"weather-data")
+            return types.SimpleNamespace(content_type="text/plain", filename="w.txt")
+
+    async def fake_handle(rm, ev, text, skip_body=None, **kw):
+        handled.append(text)
+
+    orig = (settings.media_root, settings.media_enabled, state.client, media.handle_task,
+            settings.known_bots_full, settings.known_bots_local)
+    settings.media_root, settings.media_enabled = tempfile.mkdtemp(), True
+    settings.known_bots_full, settings.known_bots_local = frozenset(), frozenset(("weather",))
+    state.client = FC()
+    media.handle_task = fake_handle
+    try:
+        async def go():
+            await media._process_media(
+                room, make_media_event(sender="@weather:ex.org", event_id="$kbm1"), False)
+            await _drain_tasks()
+        asyncio.run(go())
+        in_ctx = len(bot._context[rid])
+    finally:
+        (settings.media_root, settings.media_enabled, state.client, media.handle_task,
+         settings.known_bots_full, settings.known_bots_local) = orig
+        bot._context[rid].clear()
+    assert in_ctx == 1                              # 文件行照常进上下文
+    assert not handled and not sent                 # 但既不派活、也不回任何消息
+
 # ---------- 21) 媒体文件名消毒：挡掉 ../ 路径穿越 ----------
 def test_media_safe_name():
     s = fmt._safe_name("../../etc/passwd", "f")
@@ -291,6 +332,7 @@ TESTS = [
     ('媒体下载落盘+入上下文+派活', test_media_download_and_dispatch),
     ('媒体超体积跳过', test_media_oversize_skipped),
     ('媒体失败无caption 明确回错误', test_media_failure_notifies_when_addressed),
+    ('KNOWN_BOTS 文件进上下文不应答', test_media_known_bot_silent),
     ('媒体文件名消毒', test_media_safe_name),
     ('媒体滚动删旧', test_media_prune),
     ('主动 PASS 只占短冷却', test_proactive_pass_keeps_short_cooldown),

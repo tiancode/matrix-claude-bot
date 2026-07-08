@@ -56,7 +56,7 @@ from matrix_io import (send, _is_dm, _thread_of,
                        _react, _unreact, _ACK_EMOJI)
 from addressing import (_address_kind, _has_trigger, _strip_reply_fallback,
                         _strip_self_mentions, _mark_engaged, _mention_note,
-                        _addresses_other_user)
+                        _addresses_other_user, _is_known_bot)
 from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, do_bind,
                    handle_unbind, handle_new_project, _backfill_cmd, _auto_backfill,
                    RESET_CMDS, HELP_CMDS, SUMMARY_CMDS, CANCEL_CMDS, STATUS_CMDS, UNBIND_CMDS,
@@ -188,6 +188,12 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
 
     # 用自己账号跑时：消息照进上下文，但无触发词不当派活（否则会去回你发给别人的话）。
     if is_self and not _has_trigger(event.body or ""):
+        return
+
+    # 已知机器人（KNOWN_BOTS）：消息照常进上下文/逐字记录（上面已落，真人接手时背景完整），
+    # 但绝不应答——元命令/点名/回复/续话/主动插话一概不认。两个 bot 互相应答会陷入死循环，
+    # 名单式全静默是最稳的断环：想恢复互动，把对方从名单里拿掉即可。
+    if not is_self and _is_known_bot(event.sender):
         return
 
     # 元命令：群里不必 @ 也认（与 /reset 同类）。help/summarize/cancel 走各自快路径，不进任务分诊。
