@@ -402,7 +402,9 @@ class ClaudeRunner:
         cmd = [settings.claude_bin, "-p",
                "--input-format", "stream-json",
                "--output-format", "stream-json", "--verbose"]
-        if settings.claude_model:
+        if settings.claude_model and not sid:
+            # 只在开新会话时传（同 _cmd）：--resume 时带 --model 会把会话连同被恢复的
+            # 子代理一起强制成该模型，覆盖子代理的模型路由，续跑烧错额度
             cmd += ["--model", settings.claude_model]
         if settings.claude_dangerous:
             cmd += ["--dangerously-skip-permissions"]
@@ -634,9 +636,13 @@ class ClaudeRunner:
         cmd = [settings.claude_bin, "-p", prompt]
         cmd += (["--output-format", "stream-json", "--verbose"] if stream
                 else ["--output-format", "json"])
-        # 干活用 CLAUDE_MODEL；轻判断（非 agentic 的 quick）优先 CLAUDE_QUICK_MODEL（小模型省钱提速）
+        # 干活用 CLAUDE_MODEL；轻判断（非 agentic 的 quick）优先 CLAUDE_QUICK_MODEL（小模型省钱提速）。
+        # 只在开新会话时传（同 --append-system-prompt）：--resume 时再带 --model 会把恢复出的
+        # 会话【连同被恢复的子代理】整体强制成该模型，覆盖掉子代理各自的模型路由——被中断的
+        # opus 子代理续跑时会被打回主模型，烧错额度。不传则会话沿用中断前各自记录的模型。
+        # 代价：改了 CLAUDE_MODEL 后既有会话仍用旧模型，/reset 或等 TTL 过期后才生效。
         model = settings.claude_model if agentic else (settings.claude_quick_model or settings.claude_model)
-        if model:
+        if model and not sid:
             cmd += ["--model", model]
         if agentic:
             if settings.claude_dangerous:

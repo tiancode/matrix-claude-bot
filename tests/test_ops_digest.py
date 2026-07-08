@@ -166,6 +166,27 @@ def test_quick_model_split():
     finally:
         settings.claude_model, settings.claude_quick_model = orig
 
+def test_model_only_on_fresh_session():
+    """--model 只在开新会话时传：--resume 时再带会把恢复出的会话（连同被中断的子代理）
+    整体强制成 CLAUDE_MODEL，覆盖子代理各自的模型路由，续跑烧错额度。"""
+    from claude_runner import runner
+    orig = settings.claude_model
+    settings.claude_model = "fable"
+    try:
+        fresh = runner._cmd("p", None, agentic=True)
+        assert fresh[fresh.index("--model") + 1] == "fable"       # 新会话：正常传
+        resumed = runner._cmd("p", "sid-1", agentic=True)
+        assert "--model" not in resumed and "--resume" in resumed  # 续会话：不传，沿用会话记录的模型
+        forked = runner._cmd("p", "sid-1", agentic=True, fork=True)
+        assert "--model" not in forked                             # fork 继承父会话，同 resume
+        # 常驻进程模式同一规则
+        p_fresh = runner._cmd_persistent(None, None, fork=False)
+        assert p_fresh[p_fresh.index("--model") + 1] == "fable"
+        p_resumed = runner._cmd_persistent("sid-1", None, fork=False)
+        assert "--model" not in p_resumed and "--resume" in p_resumed
+    finally:
+        settings.claude_model = orig
+
 # ---------- 聊天逐字记录：落盘/回溯指引/保留删旧/开关 ----------
 def test_transcript_log_and_recall():
     import tempfile
@@ -562,6 +583,7 @@ TESTS = [
     ('排队回执 忙时知会/空闲不发', test_queue_receipt_when_busy),
     ('capacity_full 信号量占满判定', test_capacity_full_semaphore),
     ('模型拆分 干活大/轻判断小', test_quick_model_split),
+    ('--model 只开新会话传 resume不覆盖', test_model_only_on_fresh_session),
     ('聊天逐字记录 落盘/回溯/删旧/开关', test_transcript_log_and_recall),
     ('聊天日摘要 触发/东八区分桶/落盘/水位线/合并/注入', test_digest_layer),
     ('PR 自动合并 条件满足才合并', test_pr_automerge),
