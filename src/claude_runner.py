@@ -207,6 +207,12 @@ class ClaudeRunner:
             return None
         return item[1]
 
+    def session_model(self, key: str) -> str:
+        """该会话创建时记录的 CLAUDE_MODEL（仅观测：/status 据此提示"配置改了但对本会话
+        不生效"，绝不回传给 --resume）。无记录（旧版条目/会话不存在）返回 ""。不产生副作用。"""
+        item = self._sessions.get(key)
+        return item[2] if item and len(item) > 2 and isinstance(item[2], str) else ""
+
     # ---- 会话持久化：重启后恢复 session_id，多轮上下文不至于每次重启全断 ----
     def _sessions_file(self) -> str:
         return os.path.join(settings.store_path, "sessions.json")
@@ -217,7 +223,7 @@ class ClaudeRunner:
                 raw = json.load(f)
         except (OSError, json.JSONDecodeError):
             return {}
-        out: dict[str, tuple[str, float]] = {}
+        out: dict[str, tuple] = {}
         now = time.time()
         if isinstance(raw, dict):
             for k, v in raw.items():
@@ -225,16 +231,20 @@ class ClaudeRunner:
                     sid, ts = v[0], float(v[1])
                 except (TypeError, ValueError, IndexError):
                     continue
+                # 第三元=会话创建时的 CLAUDE_MODEL（仅观测，见 session_model）；旧版条目没有，补 ""
+                model = v[2] if len(v) > 2 and isinstance(v[2], str) else ""
                 if sid and now - ts <= settings.session_ttl:   # 早就过期的不必恢复
-                    out[k] = (sid, ts)
+                    out[k] = (sid, ts, model)
         return out
 
     def _save_sessions(self) -> None:
-        # 原子写；调用点都在事件循环里且无 await，对其它协程是原子的，不会丢更新
+        # 原子写；调用点都在事件循环里且无 await，对其它协程是原子的，不会丢更新。
+        # 按下标取值：测试/旧代码可能注入无模型元的二元组，别让落盘炸在解包上。
         path = self._sessions_file()
         try:
             atomic_write_json(
-                path, {k: [sid, ts] for k, (sid, ts) in self._sessions.items()})
+                path, {k: [v[0], v[1], v[2] if len(v) > 2 else ""]
+                       for k, v in self._sessions.items()})
         except OSError as e:
             log.warning("会话持久化失败 %s: %s", path, e)
 
@@ -255,7 +265,7 @@ class ClaudeRunner:
         item = self._sessions.get(key)
         if not item:
             return None, False
-        sid, ts = item
+        sid, ts = item[0], item[1]
         if time.time() - ts > settings.session_ttl:
             self._sessions.pop(key, None)
             return None, True
@@ -402,9 +412,7 @@ class ClaudeRunner:
         cmd = [settings.claude_bin, "-p",
                "--input-format", "stream-json",
                "--output-format", "stream-json", "--verbose"]
-        if settings.claude_model and not sid:
-            # 只在开新会话时传（同 _cmd）：--resume 时带 --model 会把会话连同被恢复的
-            # 子代理一起强制成该模型，覆盖子代理的模型路由，续跑烧错额度
+        if settings.claude_model and not sid:   # 只在开新会话时传（同 _cmd，理由见彼处）
             cmd += ["--model", settings.claude_model]
         if settings.claude_dangerous:
             cmd += ["--dangerously-skip-permissions"]
@@ -640,7 +648,9 @@ class ClaudeRunner:
         # 只在开新会话时传（同 --append-system-prompt）：--resume 时再带 --model 会把恢复出的
         # 会话【连同被恢复的子代理】整体强制成该模型，覆盖掉子代理各自的模型路由——被中断的
         # opus 子代理续跑时会被打回主模型，烧错额度。不传则会话沿用中断前各自记录的模型。
-        # 代价：改了 CLAUDE_MODEL 后既有会话仍用旧模型，/reset 或等 TTL 过期后才生效。
+        # 代价：改 CLAUDE_MODEL 对续接中的会话不生效——空闲 TTL 每轮都被刷新（见 ask 的写回），
+        # 活跃房间的会话不会自行过期，要对【房间】/reset 才切换（线程会话从房间会话分叉，线程内
+        # /reset 后仍会从房间会话重新 fork 出旧模型）。/status 会拿记录的会话模型对比配置来提示。
         model = settings.claude_model if agentic else (settings.claude_quick_model or settings.claude_model)
         if model and not sid:
             cmd += ["--model", model]
@@ -817,6 +827,11 @@ class ClaudeRunner:
                 # 是接着父对话往下走（--resume 父 sid），跟续接轮同理：算续接、不算新任务，故这里判 fresh
                 # 必须在上面的 fork 解析【之后】——否则 fork 时 sid 还是 None 会被误判成新任务而 reset。
                 fresh = sid is None
+                # 本轮会话对应的「创建时模型」（随 new_sid 记进 sessions.json 第三元，仅观测用）：
+                # 全新开=当前配置；续接/fork=沿用原会话记录的（fork 子承父）。--resume 不带 --model，
+                # 会话实际跑的就是这个记录值——/status 拿它对比当前配置，提示"改了没生效"。
+                sess_model = (settings.claude_model or "") if fresh \
+                    else self.session_model(fork_from if fork else key)
                 if expired and fresh and on_reset is not None:
                     # 拿到锁时才发现本 key 会话已过 TTL → 本轮要全新开；但拼 prompt 那刻会话还在，调用方
                     # 可能已按「续接」裁掉派过的消息（drop_dispatched）。这里 sid 从一开始就是 None，走不到
@@ -863,6 +878,7 @@ class ClaudeRunner:
                                 log.exception("on_reset 回调失败（继续全新开）")
                         epoch = self._epoch.get(key, 0)
                         run_sid, run_fork, nudge = None, False, None   # 会话没了，接续提示也无从谈起
+                        sess_model = settings.claude_model or ""       # 全新开：记当前配置的模型
                         rc, payload, err, meta = await _once(None)
                         if token.cancelled:
                             raise ClaudeCancelled()
@@ -887,7 +903,7 @@ class ClaudeRunner:
                         raise RuntimeError(f"claude 退出码 {rc}: {detail[:400]}")
                     new_sid, is_err = meta
                     if new_sid and self._epoch.get(key, 0) == epoch:  # 运行期间被 /reset 过就别写回旧会话
-                        self._sessions[key] = (new_sid, time.time())
+                        self._sessions[key] = (new_sid, time.time(), sess_model)
                         self._save_sessions()
                     if is_err:
                         detail = redact(payload)

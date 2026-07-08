@@ -170,8 +170,9 @@ def test_model_only_on_fresh_session():
     """--model 只在开新会话时传：--resume 时再带会把恢复出的会话（连同被中断的子代理）
     整体强制成 CLAUDE_MODEL，覆盖子代理各自的模型路由，续跑烧错额度。"""
     from claude_runner import runner
-    orig = settings.claude_model
+    orig = (settings.claude_model, settings.claude_extra_args)
     settings.claude_model = "fable"
+    settings.claude_extra_args = None   # 别把真实部署的额外参数混进命令（同 test_persistent）
     try:
         fresh = runner._cmd("p", None, agentic=True)
         assert fresh[fresh.index("--model") + 1] == "fable"       # 新会话：正常传
@@ -184,8 +185,18 @@ def test_model_only_on_fresh_session():
         assert p_fresh[p_fresh.index("--model") + 1] == "fable"
         p_resumed = runner._cmd_persistent("sid-1", None, fork=False)
         assert "--model" not in p_resumed and "--resume" in p_resumed
+        # 会话模型记录（sessions.json 第三元，观测用）：旧版二元条目兼容读、三元正常读，落盘不炸
+        runner._sessions["m2|room"] = ("SID-2", time.time())          # 旧版格式（无模型元）
+        runner._sessions["m3|room"] = ("SID-3", time.time(), "opus")
+        assert runner.session_model("m2|room") == ""
+        assert runner.session_model("m3|room") == "opus"
+        assert runner.session_model("不存在") == ""
+        runner._save_sessions()                                       # 混合格式可序列化
+        assert runner._load_sessions()["m3|room"][2] == "opus"        # 落盘回读模型仍在
     finally:
-        settings.claude_model = orig
+        runner._sessions.pop("m2|room", None); runner._sessions.pop("m3|room", None)
+        runner._save_sessions()
+        settings.claude_model, settings.claude_extra_args = orig
 
 # ---------- 聊天逐字记录：落盘/回溯指引/保留删旧/开关 ----------
 def test_transcript_log_and_recall():
@@ -552,6 +563,23 @@ def test_status_command():
         sent.clear()
         asyncio.run(bot.handle_status(FakeRoom("!g:ex.org", 3)))
         assert "当前不在巡检时段" in "\n".join(sent)
+
+        # 模型配置漂移：会话记录的模型 ≠ 当前 CLAUDE_MODEL → 提示"对当前会话不生效"；一致则不提
+        orig_model = settings.claude_model
+        tasks.runner._sessions["h/o/r|!g:ex.org"] = ("SID-M", time.time(), "opus")
+        try:
+            settings.claude_model = "haiku"
+            sent.clear()
+            asyncio.run(bot.handle_status(FakeRoom("!g:ex.org", 3)))
+            out = "\n".join(sent)
+            assert "会话模型：opus" in out and "haiku" in out and "/reset" in out
+            settings.claude_model = "opus"
+            sent.clear()
+            asyncio.run(bot.handle_status(FakeRoom("!g:ex.org", 3)))
+            assert "会话模型" not in "\n".join(sent)
+        finally:
+            settings.claude_model = orig_model
+            tasks.runner._sessions.pop("h/o/r|!g:ex.org", None)
     finally:
         (bot.projects.get_room, state.client, settings.proactive_heartbeat_weekdays_only,
          settings.proactive_heartbeat_start_hour, settings.proactive_heartbeat_end_hour) = orig
