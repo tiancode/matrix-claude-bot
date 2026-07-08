@@ -689,9 +689,17 @@ async def handle_status(room: MatrixRoom):
         lines.append(f"• 在办工单 #{e.get('number')}：{e.get('url', '')}"
                      + (f"（已开 PR #{e['pr']}）" if e.get("pr") else "（处理中）"))
     if rec:
-        ts = runner.session_ts(_sess_key(rec, rid))
+        skey = _sess_key(rec, rid)
+        ts = runner.session_ts(skey)
         lines.append(f"• 多轮会话：{_human_gap(max(0.0, time.time() - ts))}前活跃（/reset 可重开）"
                      if ts else "• 多轮会话：无（下次派活即新开）")
+        # 模型配置漂移提示：续接的会话沿用创建时记录的模型（--resume 不回传 --model），改了
+        # CLAUDE_MODEL 对它不生效且不会自行过期——在这里暴露出来，别让用户以为已切换。
+        # getattr 兜底同上：测试里的假 runner 不必都认识 session_model。
+        sess_model = getattr(runner, "session_model", lambda k: "")(skey)
+        if ts and sess_model and settings.claude_model and sess_model != settings.claude_model:
+            lines.append(f"• 会话模型：{sess_model}（配置已改为 {settings.claude_model}，"
+                         "对当前会话不生效，/reset 后按新值走）")
     if settings.proactive_heartbeat_enabled:
         import heartbeat   # 函数内延迟导入：heartbeat 模块顶层反过来 import 本模块，避免循环导入
         active = "" if heartbeat._in_heartbeat_window(time.time()) else "，当前不在巡检时段"
