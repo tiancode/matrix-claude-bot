@@ -108,7 +108,7 @@ journalctl --user -u matrix-claude -f
 - 项目长期记忆：值得跨周记住的事实（决策+原因、约定、坑）由它自己写进 `store/memory/<项目>/`，开新会话时按预算注入——会话过期也"记得住事"
 - 聊天逐字记录：按房间落盘（保留 30 天），系统提示里只给**路径**，被问到更早对话时它自己去读/grep——不把历史塞爆每次 prompt；`/backfill` 可回灌开启前的历史
 
-**元命令**（群里不必 @ 也认）：`/help` `/bind <URL>` `/new-project <仓库名>`（Gitea 上新建仓库并自动绑定，默认公开，见 `GITEA_NEW_REPO_PRIVATE`）`/status`（项目/在跑任务/在跟 PR/在办工单一屏可见）`/summarize [N]` `/cancel` `/reset` `/backfill [天]`
+**元命令**（群里不必 @ 也认）：`/help` `/bind <URL>` `/new-project <仓库名>`（Gitea 上新建仓库并自动绑定，默认公开，见 `GITEA_NEW_REPO_PRIVATE`）`/status`（项目/在跑任务/在跟 PR/在办工单一屏可见）`/model [名字]`（查看/单独给本房间换模型，如 fable/opus/sonnet；`/model reset` 恢复默认，改动对新会话生效）`/summarize [N]` `/cancel` `/reset` `/backfill [天]`
 
 ## 安全模型（必读）
 

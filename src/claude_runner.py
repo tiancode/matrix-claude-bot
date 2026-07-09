@@ -441,13 +441,15 @@ class ClaudeRunner:
 
     # ---- 常驻进程模式（CLAUDE_PERSISTENT）：进程跨轮次保活，后台任务不随回合死 ----
     def _cmd_persistent(self, sid: str | None, system_prompt: str | None,
-                        fork: bool) -> list[str]:
-        """常驻 agentic 进程的命令行：无位置 prompt（消息走 stdin NDJSON），其余同 _cmd(agentic)。"""
+                        fork: bool, model: str | None = None) -> list[str]:
+        """常驻 agentic 进程的命令行：无位置 prompt（消息走 stdin NDJSON），其余同 _cmd(agentic)。
+        model：调用方解析好的模型覆盖（如 /model 给房间设的），None=跟随 CLAUDE_MODEL。"""
         cmd = [settings.claude_bin, "-p",
                "--input-format", "stream-json",
                "--output-format", "stream-json", "--verbose"]
-        if settings.claude_model and not sid:   # 只在开新会话时传（同 _cmd，理由见彼处）
-            cmd += ["--model", settings.claude_model]
+        eff_model = model if model is not None else settings.claude_model
+        if eff_model and not sid:   # 只在开新会话时传（同 _cmd，理由见彼处）
+            cmd += ["--model", eff_model]
         if settings.claude_dangerous:
             cmd += ["--dangerously-skip-permissions"]
         elif settings.claude_permission_mode:
@@ -464,11 +466,12 @@ class ClaudeRunner:
         return cmd
 
     async def _persist_spawn(self, key: str, sid: str | None, fork: bool,
-                             system_prompt: str | None, cwd: str | None) -> _Persist:
+                             system_prompt: str | None, cwd: str | None,
+                             model: str | None = None) -> _Persist:
         workdir = cwd or settings.claude_workdir
         os.makedirs(workdir, exist_ok=True)
         proc = await asyncio.create_subprocess_exec(
-            *self._cmd_persistent(sid, system_prompt, fork),
+            *self._cmd_persistent(sid, system_prompt, fork, model),
             cwd=workdir,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -600,18 +603,19 @@ class ClaudeRunner:
     async def _persist_once(self, key: str, sid: str | None, fork: bool, prompt: str,
                             system_prompt: str | None, cwd: str | None,
                             on_delta, on_notify, on_proc, fail_info: dict | None = None,
-                            steerable: bool = False):
+                            steerable: bool = False, model: str | None = None):
         """常驻进程跑一个回合。返回值形状与 ask._once 相同：
         rc==0 → (0, 结果字符串, b"", (session_id, is_error))；失败 → (rc, b"", stderr尾, None)。
         fail_info：失败返回前把进程已报过的 session_id 记进去（供瞬时重试改走 resume 而非重放）。
-        steerable：这是不是聊天回合（try_steer 只允许把追加消息递进聊天回合）。"""
+        steerable：这是不是聊天回合（try_steer 只允许把追加消息递进聊天回合）。
+        model：模型覆盖，只在需要新起进程（=新开会话）时生效；已活着的常驻进程沿用它自己的。"""
         async with self._sema:   # 并发额度只在回合期间占用；空闲常驻进程不占
             ps = self._persist.get(key)
             if ps is not None and not ps.alive():
                 self._persist.pop(key, None)
                 ps = None
             if ps is None:
-                ps = await self._persist_spawn(key, sid, fork, system_prompt, cwd)
+                ps = await self._persist_spawn(key, sid, fork, system_prompt, cwd, model)
             if on_proc:
                 on_proc(ps.proc)   # 登记给 /cancel（杀常驻进程=停任务；下轮凭 sid 重生）
             if on_notify is not None:
@@ -674,20 +678,22 @@ class ClaudeRunner:
 
     def _cmd(self, prompt: str, sid: str | None, agentic: bool,
              system_prompt: str | None = None, stream: bool = False,
-             fork: bool = False) -> list[str]:
+             fork: bool = False, model: str | None = None) -> list[str]:
         cmd = [settings.claude_bin, "-p", prompt]
         cmd += (["--output-format", "stream-json", "--verbose"] if stream
                 else ["--output-format", "json"])
-        # 干活用 CLAUDE_MODEL；轻判断（非 agentic 的 quick）优先 CLAUDE_QUICK_MODEL（小模型省钱提速）。
+        # 干活用 model 参数（调用方解析好的房间 /model 覆盖）或 CLAUDE_MODEL；
+        # 轻判断（非 agentic 的 quick）优先 CLAUDE_QUICK_MODEL（小模型省钱提速）。
         # 只在开新会话时传（同 --append-system-prompt）：--resume 时再带 --model 会把恢复出的
         # 会话【连同被恢复的子代理】整体强制成该模型，覆盖掉子代理各自的模型路由——被中断的
         # opus 子代理续跑时会被打回主模型，烧错额度。不传则会话沿用中断前各自记录的模型。
         # 代价：改 CLAUDE_MODEL 对续接中的会话不生效——空闲 TTL 每轮都被刷新（见 ask 的写回），
         # 活跃房间的会话不会自行过期，要对【房间】/reset 才切换（线程会话从房间会话分叉，线程内
         # /reset 后仍会从房间会话重新 fork 出旧模型）。/status 会拿记录的会话模型对比配置来提示。
-        model = settings.claude_model if agentic else (settings.claude_quick_model or settings.claude_model)
-        if model and not sid:
-            cmd += ["--model", model]
+        eff_model = ((model if model is not None else settings.claude_model) if agentic
+                     else (settings.claude_quick_model or settings.claude_model))
+        if eff_model and not sid:
+            cmd += ["--model", eff_model]
         if agentic:
             if settings.claude_dangerous:
                 cmd += ["--dangerously-skip-permissions"]
@@ -745,7 +751,8 @@ class ClaudeRunner:
                   system_prompt: str | None = None, lock_key: str | None = None,
                   prepare=None, on_delta=None, cancel_key: str | None = None,
                   fork_from: str | None = None, on_reset=None, on_notify=None,
-                  steerable: bool = False, on_queued=None, trigger_eid: str = "") -> str:
+                  steerable: bool = False, on_queued=None, trigger_eid: str = "",
+                  model: str | None = None) -> str:
         """带工具、带会话上下文地干活；cwd=该项目的仓库目录。
 
         key:        会话维度（项目+房间[+线程]），不同房间/私聊用户互不串台。
@@ -771,9 +778,12 @@ class ClaudeRunner:
                     知会。瞬时重试会再次经过信号量，回调可能多次触发，去重由调用方负责。
         trigger_eid: 触发本任务的那条用户消息的 event_id（聊天派活传，后台任务不传）。消息被删/redact
                     时 cancel_event 据此精撤【还没起进程】的这条排队任务，别再让它开跑（见 on_redaction）。
+        model:      模型覆盖（如 /model 给房间设的），None=跟随 CLAUDE_MODEL。与全局配置同语义：
+                    只在开新会话时传 --model，续接中的会话沿用创建时的模型（/reset 后按新值走）。
         """
         lock_key = lock_key or key
         ckey = cancel_key or lock_key
+        eff_model = model if model is not None else (settings.claude_model or "")
         my_procs: list = []
         token = _CancelToken(trigger_eid)
         # 一进 ask 就登记令牌（此刻可能还在排队等锁、还没起子进程）：这样 /cancel 也能标记到
@@ -808,9 +818,11 @@ class ClaudeRunner:
             if settings.claude_persistent:
                 return await self._persist_once(key, sid, fork, p, system_prompt,
                                                 cwd, on_delta, on_notify, _reg,
-                                                fail_info=last_fail, steerable=steerable)
+                                                fail_info=last_fail, steerable=steerable,
+                                                model=model)
             if on_delta is None:
-                rc, out, err = await self._run(self._cmd(p, sid, True, system_prompt, fork=fork),
+                rc, out, err = await self._run(self._cmd(p, sid, True, system_prompt,
+                                                         fork=fork, model=model),
                                                cwd, on_proc=_reg)
                 if rc != 0:
                     return rc, out, err, None
@@ -835,7 +847,7 @@ class ClaudeRunner:
                         st["result"] = obj["result"]
                     st["is_err"] = bool(obj.get("is_error"))
             rc, err = await self._run_stream(
-                self._cmd(p, sid, True, system_prompt, stream=True, fork=fork),
+                self._cmd(p, sid, True, system_prompt, stream=True, fork=fork, model=model),
                 cwd, _reg, _on_line)
             if rc != 0:
                 # 进程死了也别把流里已捕获的会话/工具信号丢掉：有 sid 重试就能 resume 续跑
@@ -874,9 +886,10 @@ class ClaudeRunner:
                 # 必须在上面的 fork 解析【之后】——否则 fork 时 sid 还是 None 会被误判成新任务而 reset。
                 fresh = sid is None
                 # 本轮会话对应的「创建时模型」（随 new_sid 记进 sessions.json 第三元，仅观测用）：
-                # 全新开=当前配置；续接/fork=沿用原会话记录的（fork 子承父）。--resume 不带 --model，
-                # 会话实际跑的就是这个记录值——/status 拿它对比当前配置，提示"改了没生效"。
-                sess_model = (settings.claude_model or "") if fresh \
+                # 全新开=本轮生效的模型（房间 /model 覆盖或 CLAUDE_MODEL）；续接/fork=沿用原会话
+                # 记录的（fork 子承父）。--resume 不带 --model，会话实际跑的就是这个记录值——
+                # /status、/model 拿它对比当前设置，提示"改了没生效"。
+                sess_model = eff_model if fresh \
                     else self.session_model(fork_from if fork else key)
                 if expired and fresh and on_reset is not None:
                     # 拿到锁时才发现本 key 会话已过 TTL → 本轮要全新开；但拼 prompt 那刻会话还在，调用方
@@ -924,7 +937,7 @@ class ClaudeRunner:
                                 log.exception("on_reset 回调失败（继续全新开）")
                         epoch = self._epoch.get(key, 0)
                         run_sid, run_fork, nudge = None, False, None   # 会话没了，接续提示也无从谈起
-                        sess_model = settings.claude_model or ""       # 全新开：记当前配置的模型
+                        sess_model = eff_model                         # 全新开：记本轮生效的模型
                         rc, payload, err, meta = await _once(None)
                         if token.cancelled:
                             raise ClaudeCancelled(silent=token.silent)

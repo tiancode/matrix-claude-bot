@@ -59,13 +59,15 @@ async def _followup_dispatch(rec: dict, entry: dict, detail: str):
         f"**不要新开 PR。**用简洁中文回复你做了什么。"
     )
     sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
+    # 与聊天共用同一会话 key：模型也跟房间 /model 设置走（新开会话时生效）
+    model_kw = {"model": state._room_model[room]} if state._room_model.get(room) else {}
     try:
         async with _typing(room):
             # cancel_key=原房间：让房间里的 /cancel 也能停掉跟进任务
             answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"],
                                       system_prompt=sp, lock_key=rec["id"],
                                       prepare=lambda: projects.prepare_worktree(rec),
-                                      cancel_key=room)
+                                      cancel_key=room, **model_kw)
         await send(room, f"🔁 PR #{n} 跟进结果：\n{answer}", track=True)
     except ClaudeCancelled:
         await send(room, f"🛑 已停止 PR #{n} 的跟进任务。")

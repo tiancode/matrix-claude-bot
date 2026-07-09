@@ -55,12 +55,14 @@ async def _issue_execute(rec: dict, room: str, issue: dict):
             f"在 issue #{n} 下回复结论后关闭它。\n用简洁中文回复。"
         )
         sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
+        # 与聊天共用同一会话 key：模型也跟房间 /model 设置走（新开会话时生效）
+        model_kw = {"model": state._room_model[room]} if state._room_model.get(room) else {}
         try:
             async with _typing(room):
                 # cancel_key=汇报房间：房间里的 /cancel 也能停掉工单任务
                 answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"], system_prompt=sp,
                                           lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec),
-                                          cancel_key=room)
+                                          cancel_key=room, **model_kw)
             _project_last_active[rec["id"]] = time.time()
             await send(room, f"📋 工单 #{n} 处理结果：\n{answer}", track=True)
             pr = _extract_pr(answer, rec)
