@@ -42,6 +42,49 @@ def test_media_download_and_dispatch():
     assert any(files[0] in b for _, _, b, *_ in bot._context[rid])     # 上下文带本地路径
     assert files[0] in captured.get("text", "")                    # 派活时把路径喂给 Claude
 
+# ---------- 19b) 媒体：application/json 文件 nio 走内存 resp.body、不写 save_to，仍要落盘 ----------
+def test_media_json_in_memory_body():
+    """nio 对 content-type=application/json 的媒体（如用户传的 .json 配置）当成可能的错误响应，
+    直接读进 resp.body、并不写 save_to → 临时文件是空的。_download_media 必须认 resp.body，
+    否则明明拿到了 32K 内容却误判「未取到内容」把文件丢掉。"""
+    import tempfile
+    import glob
+    set_identity()
+    state._synced = True
+    rid = "!mjson:ex.org"
+    room = FakeRoom(rid, 2)                        # DM → 必回
+    bot._context[rid].clear()
+    tmp = tempfile.mkdtemp()
+    payload = b'{"rule":"PCB3","min_trace":0.15}'
+    orig = (settings.media_root, settings.media_enabled, state.client, media.handle_task)
+    settings.media_root, settings.media_enabled = tmp, True
+
+    class FC:
+        async def download(self, mxc=None, save_to=None, **k):
+            # 关键：不碰 save_to（留空文件），内容只在 body 里 —— 复刻 nio 的 JSON 分支
+            return types.SimpleNamespace(
+                body=payload, content_type="application/json", filename="conf.json")
+
+    async def fake_handle(rm, ev, text, skip_body=None, **kw):
+        pass
+
+    state.client = FC()
+    media.handle_task = fake_handle
+    try:
+        async def go():
+            await media._process_media(
+                room, make_media_event(body="conf.json", event_id="$mj1"), False)
+            await _drain_tasks()
+        asyncio.run(go())
+    finally:
+        (settings.media_root, settings.media_enabled, state.client, media.handle_task) = orig
+
+    files = glob.glob(os.path.join(tmp, "*", "*"))
+    assert files, "JSON 媒体没落盘（误判成未取到内容）"
+    with open(files[0], "rb") as f:
+        assert f.read() == payload                                 # 内存里的内容正确写盘
+    assert any(files[0] in b for _, _, b, *_ in bot._context[rid])     # 上下文带本地路径
+
 # ---------- 20) 媒体：声明体积超限则不下载，只在上下文标注 ----------
 def test_media_oversize_skipped():
     import tempfile
@@ -331,6 +374,7 @@ def test_human_gap_precision():
 
 TESTS = [
     ('媒体下载落盘+入上下文+派活', test_media_download_and_dispatch),
+    ('JSON 媒体走内存 resp.body 仍落盘', test_media_json_in_memory_body),
     ('媒体超体积跳过', test_media_oversize_skipped),
     ('媒体失败无caption 明确回错误', test_media_failure_notifies_when_addressed),
     ('KNOWN_BOTS 文件进上下文不应答', test_media_known_bot_silent),

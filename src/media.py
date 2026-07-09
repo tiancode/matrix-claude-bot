@@ -96,13 +96,26 @@ async def _download_media(event, cap: int) -> tuple[bytes, str]:
     resp = None
     try:
         resp = await state.client.download(mxc=event.url, save_to=tmp)
-        size = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-        if size == 0:                       # 下载失败时 nio 不写文件，留个空文件
-            raise RuntimeError(f"download 未取到内容: {resp}")
-        if size > cap:                      # 按落盘后的真实大小兜底，挡住不声明 size 的大文件
-            raise _MediaTooLarge(size)
-        with open(tmp, "rb") as f:
-            data = f.read()
+        # nio 把 content-type=application/json 的媒体（用户传的 .json 配置等）当成「可能是错误响应」，
+        # 直接读进内存塞到 resp.body、并【不】写 save_to——此时临时文件是空的，但内容其实拿到了。
+        # 所以先认 resp.body：是 bytes 就是这种「在内存里」的情形，直接用；否则才按落盘的临时文件读
+        # （普通二进制媒体走这条，save_to 流式落盘、超 cap 免整块读进内存）。
+        body = getattr(resp, "body", None)
+        if isinstance(body, (bytes, bytearray)):
+            data = bytes(body)
+            size = len(data)
+            if size == 0:
+                raise RuntimeError(f"download 未取到内容: {resp}")
+            if size > cap:
+                raise _MediaTooLarge(size)
+        else:
+            size = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+            if size == 0:                       # 下载失败时 nio 不写文件，留个空文件
+                raise RuntimeError(f"download 未取到内容: {resp}")
+            if size > cap:                      # 按落盘后的真实大小兜底，挡住不声明 size 的大文件
+                raise _MediaTooLarge(size)
+            with open(tmp, "rb") as f:
+                data = f.read()
     finally:
         try:
             os.remove(tmp)
