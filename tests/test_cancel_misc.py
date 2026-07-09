@@ -461,6 +461,39 @@ def test_transient_quick_retry_and_friendly_message():
         claude_runner._TRANSIENT_BASE_DELAY = orig_delay
 
 
+def test_oneshot_rc_nonzero_reads_stdout_json():
+    """claude --output-format json 失败时 rc=1 但 stderr 空、诊断在 stdout 的 JSON 里
+    （无效模型/API 4xx）。_oneshot 必须回退到 stdout：否则报错为空、且瞬时特征判不出。"""
+    set_identity()
+    orig_delay = claude_runner._TRANSIENT_BASE_DELAY
+    claude_runner._TRANSIENT_BASE_DELAY = 0
+    try:
+        # (1) 非瞬时硬失败：rc=1 + stderr 空 + stdout 带 is_error 文案 → 报错里带得上诊断，不空
+        r = claude_runner.ClaudeRunner()
+        async def bad_model(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            return 1, json.dumps({"is_error": True,
+                                  "result": "There's an issue with the selected model (x)."}).encode(), b""
+        r._run = bad_model
+        try:
+            asyncio.run(r.quick("判断一下"))
+            assert False, "should raise"
+        except RuntimeError as e:
+            assert "issue with the selected model" in str(e)   # 不再是空的「退出码 1: 」
+
+        # (2) 瞬时故障走 stdout：rc=1 + stderr 空 + stdout 带 Overloaded → 认得出瞬时并重跑一次
+        r2 = claude_runner.ClaudeRunner()
+        n = {"v": 0}
+        async def flaky(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            n["v"] += 1
+            if n["v"] == 1:
+                return 1, json.dumps({"is_error": True, "result": "API Error: Overloaded"}).encode(), b""
+            return 0, json.dumps({"result": "__PASS__"}).encode(), b""
+        r2._run = flaky
+        assert asyncio.run(r2.quick("判断一下")) == "__PASS__" and n["v"] == 2
+    finally:
+        claude_runner._TRANSIENT_BASE_DELAY = orig_delay
+
+
 def test_transient_regex_precision():
     """瞬时特征分两档：明确短语单独认；裸状态码/rate limit/connection 词必须紧邻 API/HTTP
     上下文——堆栈行号、普通计数、被测代码自己的话题不得误判（误判会整任务重放、重复副作用）。"""
@@ -627,6 +660,7 @@ TESTS = [
     ('/summarize 0 不当成"全部背景"', test_summarize_zero_does_not_dump_full_context),
     ('瞬时故障 resume 续跑重试/非瞬时不重试', test_transient_overloaded_resume_retry),
     ('quick 瞬时重试 + 会话感知人话文案', test_transient_quick_retry_and_friendly_message),
+    ('_oneshot rc≠0 stderr空时回退读 stdout JSON', test_oneshot_rc_nonzero_reads_stdout_json),
     ('steered 消息 回合被杀撤 dispatched', test_steered_marks_unmarked_on_cancel),
     ('瞬时特征正则 裸数字/话题词不误判', test_transient_regex_precision),
     ('退避尾部 /cancel 不漏检', test_transient_wait_trailing_cancel_check),
