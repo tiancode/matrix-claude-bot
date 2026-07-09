@@ -11,7 +11,7 @@ import state
 from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
                    _drop_pending, _steered_dispatched, _unmark_dispatched,
                    _last_project_by_room, _save_last_projects, _project_last_active)
-from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files,
+from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files, _redact,
                        _thread_of, _thread_root_of, _ack, _react, _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
 from addressing import _strip_reply_fallback
@@ -259,6 +259,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     要隔离的串台源），只补一行线程起点。"""
     rid = room.room_id
     sender = room.user_name(event.sender) or event.sender
+    trigger_eid = getattr(event, "event_id", "") or ""   # 触发本任务的消息 event_id：被删时据此精撤排队中的它
     text += mention_note   # 拼进任务正文让 Claude 看到点名对象（@pill 纯文本里只剩显示名）
     mark_after = None   # 顶层任务：等派活【成功】后再把这条标 dispatched（见下方 log「完成」处），
                         # 别在 ask 之前抢标——否则取消/报错、根本没进会话的消息也被标，下轮反被剔出背景
@@ -347,8 +348,9 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             note = ("⏳ 并发额度已满（MAX_CONCURRENCY，管理员可调大），这条已排队，"
                     "轮到会自动开始" + cancel_hint)
         queued_notified = {"v": note is not None}
+        queued_eid = {"v": None}   # 「⏳ 已排队」回执的 event_id：静默撤单时连它一并 redact
         if note:
-            await send(rid, note, thread_root=thread_root, reply_to=_reply_eid())
+            queued_eid["v"] = await send(rid, note, thread_root=thread_root, reply_to=_reply_eid())
 
         async def _on_queued():
             # 真要在并发额度上阻塞的那一刻（预检时还有空位、等锁/prepare 期间被占满）：
@@ -356,8 +358,18 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             if queued_notified["v"]:
                 return
             queued_notified["v"] = True
-            await send(rid, "⏳ 并发额度已满（MAX_CONCURRENCY），这条已排队，轮到会自动开始。",
-                       thread_root=thread_root, reply_to=_reply_eid())
+            queued_eid["v"] = await send(
+                rid, "⏳ 并发额度已满（MAX_CONCURRENCY），这条已排队，轮到会自动开始。",
+                thread_root=thread_root, reply_to=_reply_eid())
+
+        async def _cancelled_cleanup(silent: bool):
+            # 回合被取消的收尾：steered 进来又没被处理的话撤回背景（别双头落空）。
+            # 若是"因触发消息被删"而静默撤的排队任务，把之前发的「⏳ 已排队」回执也一并 redact——
+            # 用户把消息删了，别单留个孤零零的排队提示。普通 /cancel（非静默）不动回执。
+            for s_, b_ in _steered_dispatched.pop(rid, ()):
+                _unmark_dispatched(rid, s_, b_)
+            if silent:
+                await _redact(rid, queued_eid["v"])
         if settings.stream_replies:                      # 流式：边生成边编辑同一条占位消息
             live = _LiveReply(rid, thread_root=thread_root, reply_to=reply_to)
             _attached = {"v": False}
@@ -373,11 +385,14 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                                           on_delta=_relay, cancel_key=rid,
                                           on_reset=lambda: _clear_dispatched(rid),
                                           on_notify=_bg_notify, steerable=True,
-                                          on_queued=_on_queued, **fork_kw)
-            except ClaudeCancelled:
-                for s_, b_ in _steered_dispatched.pop(rid, ()):   # 回合被杀：steered 的话没被处理，
-                    _unmark_dispatched(rid, s_, b_)               # 撤标记让它回到背景别双头落空
-                await live.finalize("🛑 已停止。", track=False)
+                                          on_queued=_on_queued, trigger_eid=trigger_eid, **fork_kw)
+            except ClaudeCancelled as e:
+                silent = getattr(e, "silent", False)
+                await _cancelled_cleanup(silent)   # 静默撤单时连「⏳ 已排队」回执一并撤掉
+                if not silent:                     # 因删消息撤的排队任务：静默收尾，别回"已停止"
+                    await live.finalize("🛑 已停止。", track=False)
+                elif live.eid:                     # 静默撤但占位已建（流已出过内容）→ 撤掉占位，别留残卡
+                    await _redact(rid, live.eid)
                 return
             except Exception as e:
                 # 任务异常（超时 / 非零退出等）：先把占位收尾成报错，别让它永远停在"⏳ 正在干活…"。
@@ -396,11 +411,12 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                                           lock_key=lock_key, prepare=prepare, cancel_key=rid,
                                           on_reset=lambda: _clear_dispatched(rid),
                                           on_notify=_bg_notify, steerable=True,
-                                          on_queued=_on_queued, **fork_kw)
-            except ClaudeCancelled:
-                for s_, b_ in _steered_dispatched.pop(rid, ()):   # 回合被杀：steered 的话没被处理，
-                    _unmark_dispatched(rid, s_, b_)               # 撤标记让它回到背景别双头落空
-                await send(rid, "🛑 已停止。", thread_root=thread_root, reply_to=_reply_eid())
+                                          on_queued=_on_queued, trigger_eid=trigger_eid, **fork_kw)
+            except ClaudeCancelled as e:
+                silent = getattr(e, "silent", False)
+                await _cancelled_cleanup(silent)   # 静默撤单时连「⏳ 已排队」回执一并撤掉
+                if not silent:
+                    await send(rid, "🛑 已停止。", thread_root=thread_root, reply_to=_reply_eid())
                 return
             answer = await _emit_files(room, answer, cwd, thread_root)
             await send(rid, answer, track=True, thread_root=thread_root, reply_to=_reply_eid())
@@ -568,12 +584,15 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                 await _run_on_project(room, event, text, rec, skip_body=skip_body,
                                       thread_root=thr, reply_to=reply_to, sess_thread=sess_thr,
                                       mention_note=mention_note)
-        except ClaudeCancelled:
-            try:
-                await send(rid, "🛑 已停止。", thread_root=thr,
-                           reply_to=reply_to() if callable(reply_to) else None)
-            except Exception:
-                pass
+        except ClaudeCancelled as e:
+            # 静默撤（删消息）的取消绝不会外抛到这层（内层 handler 已 return），但保持一致、防御性判断：
+            # 万一有 refactor 让它逃到这，也别对着已删的消息回"已停止"。
+            if not getattr(e, "silent", False):
+                try:
+                    await send(rid, "🛑 已停止。", thread_root=thr,
+                               reply_to=reply_to() if callable(reply_to) else None)
+                except Exception:
+                    pass
         except Exception as e:
             log.exception("处理失败")
             try:

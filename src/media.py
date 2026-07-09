@@ -58,6 +58,29 @@ def discard_room(rid: str) -> None:
     shutil.rmtree(d, ignore_errors=True)
 
 
+def discard_event(rid: str, event_id: str) -> bool:
+    """删掉某条媒体消息下载到本地的文件（消息被 redact / 用户删除时用）。
+    落盘文件名前缀就是该消息的 event_id（见 _save_media：`<safe(event_id)>__<safe(文件名)>`），
+    按这个前缀删该房间目录下匹配的文件。命中任一返回 True；目录不存在 / 无匹配返回 False。"""
+    if not event_id:
+        return False
+    d = os.path.join(settings.media_root, _safe_name(rid, "room"))
+    prefix = _safe_name(event_id, "ev") + "__"
+    try:
+        entries = list(os.scandir(d))
+    except OSError:
+        return False
+    hit = False
+    for e in entries:
+        if e.name.startswith(prefix) and e.is_file():
+            try:
+                os.remove(e.path)
+                hit = True
+            except OSError:
+                pass
+    return hit
+
+
 def _prune_dir(d: str, keep: int) -> None:
     """只保留目录里最近 keep 个文件，按 mtime 删旧，防媒体无限堆积。"""
     keep = max(1, keep)   # keep<=0 时 files[:-0] 会一个都不删，至少保留刚存的那个
@@ -187,6 +210,7 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
         mention_note = _mention_note(room, (event.source or {}).get("content", {}))
         line += mention_note
         _context[rid].append((time.time(), sender, line, _thread_of(event)))   # 本地时钟+线程标记，与文本一致
+        state._ctx_recent.append((getattr(event, "event_id", ""), rid, sender, line))  # 供删消息时从背景剔除
         transcript.append(rid, sender, line, event_id=getattr(event, "event_id", ""))
 
         # 与文本相同的派活闸：自己账号无触发词不派活

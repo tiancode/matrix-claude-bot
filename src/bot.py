@@ -28,6 +28,7 @@ from nio import (
     LoginResponse,
     MatrixRoom,
     MegolmEvent,
+    RedactionEvent,
     RoomEncryptedMedia,
     RoomMemberEvent,
     RoomMessageMedia,
@@ -38,7 +39,8 @@ from nio import (
 
 from config import settings, register_secret
 import state
-from state import _context, _sent_events, _last_project_by_room, _pending_dispatch, _drop_pending
+from state import (_context, _sent_events, _last_project_by_room, _pending_dispatch,
+                   _drop_pending, _drop_pending_event, _drop_context_event)
 from claude_runner import runner  # noqa: F401
 from projects import projects, parse_repo_url, proj_id
 import transcript
@@ -65,7 +67,7 @@ from pr_followup import _pr_followup_loop
 from heartbeat import _heartbeat_loop
 from issue_intake import _issue_execute, _issue_intake_loop
 from proactive import maybe_proactive, followup_is_for_me
-from media import on_media, discard_room, sweep_stale_downloads
+from media import on_media, discard_room, sweep_stale_downloads, discard_event as _discard_media_event
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("matrix-claude")
@@ -76,9 +78,10 @@ _UNDECRYPT_NOTICE_COOLDOWN = 600   # 秒（10 分钟）
 _last_undecrypt_notice: dict[str, float] = {}
 
 # 连发合并（debounce）：同一个人短窗内连发的消息并成一个任务再派——一句话分几条打是聊天常态。
-# 缓冲本体在 state._pending_dispatch（/cancel、退房清理要能作废它）：(room_id, sender, 线程) ->
-# {"room","event","msgs":[(text,ctx_body,note)],"last"}。首条 strong 建缓冲并起等待协程，
-# 窗内后续消息（含没点名的纯补充）只并入。窗口每来一条顺延（MESSAGE_DEBOUNCE），总等待封顶 _DEBOUNCE_CAP。
+# 缓冲本体在 state._pending_dispatch（/cancel、退房清理、消息删除要能作废/修改它）：
+# (room_id, sender, 线程) -> {"room","event","msgs":[(text,ctx_body,note,event_id)],"last"}。首条 strong
+# 建缓冲并起等待协程，窗内后续消息（含没点名的纯补充）只并入（每条带自己的 event_id，供 redact 时精确摘除）。
+# 窗口每来一条顺延（MESSAGE_DEBOUNCE），总等待封顶 _DEBOUNCE_CAP。
 _DEBOUNCE_CAP = 6.0   # 秒：连续说话也最多攒这么久就派，别让任务无限延后
 
 
@@ -96,7 +99,7 @@ def _absorb_into_pending(room, event, body: str, ctx_body: str, note: str) -> bo
     content = (event.source or {}).get("content", {})
     if _addresses_other_user(content) or content.get("m.relates_to", {}).get("m.in_reply_to"):
         return False
-    pend["msgs"].append((b, ctx_body, note))
+    pend["msgs"].append((b, ctx_body, note, getattr(event, "event_id", "")))
     pend["last"] = time.time()
     return True
 
@@ -118,11 +121,12 @@ def _queue_strong_task(room, event, cleaned: str, ctx_body: str, note: str) -> N
             state._spawn(handle_task(room, event, cleaned,          # 引用回复独立派，别丢引文
                                      skip_body=ctx_body, mention_note=note))
             return
-        pend["msgs"].append((cleaned, ctx_body, note))
+        pend["msgs"].append((cleaned, ctx_body, note, getattr(event, "event_id", "")))
         pend["last"] = time.time()
         return
     _pending_dispatch[key] = {"room": room, "event": event,
-                              "msgs": [(cleaned, ctx_body, note)], "last": time.time()}
+                              "msgs": [(cleaned, ctx_body, note, getattr(event, "event_id", ""))],
+                              "last": time.time()}
     state._spawn(_debounced_dispatch(key))
 
 
@@ -149,11 +153,11 @@ async def _debounced_dispatch(key: tuple) -> None:
     _pending_dispatch.pop(key, None)   # 先摘缓冲：任务开跑后再来的消息走 steering/新任务，不进死缓冲
     msgs = pend["msgs"]
     if len(msgs) == 1:
-        t, cb, n = msgs[0]
+        t, cb, n = msgs[0][:3]
         await handle_task(room, event, t, skip_body=cb, mention_note=n, ack_eid=ack_eid)
         return
-    text = "\n".join(t + n for t, _, n in msgs)
-    await handle_task(room, event, text, skip_body=[cb for _, cb, _ in msgs],
+    text = "\n".join(t + n for t, _, n, *_ in msgs)
+    await handle_task(room, event, text, skip_body=[cb for _, cb, _, *_ in msgs],
                       mention_note="", ack_eid=ack_eid)
 
 
@@ -182,6 +186,7 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     mention_note = _mention_note(room, content)
     ctx_body = body + mention_note
     _context[room.room_id].append((time.time(), sender_name, ctx_body, _thread_of(event)))
+    state._ctx_recent.append((event.event_id, room.room_id, sender_name, ctx_body))  # 供删消息时从背景剔除
     transcript.append(room.room_id, sender_name, ctx_body, event_id=event.event_id)  # 落盘逐字记录，供回溯
     if digest.should_digest(room.room_id):   # 攒够量 / 跨天残留就后台把原始日志预压成日摘要+主题索引
         state._spawn(digest.digest_room(room.room_id))
@@ -308,6 +313,58 @@ async def _maybe_followup_task(room: MatrixRoom, event: RoomMessageText,
     if not is_self:   # 弱信号只出现在群里（DM 恒 strong），确认接活后再续窗口
         _mark_engaged(room.room_id, event.sender)
     await handle_task(room, event, cleaned, skip_body=skip_body, mention_note=mention_note)
+
+
+async def on_redaction(room: MatrixRoom, event: RedactionEvent):
+    """用户 / 管理员在 Matrix 里删一条消息 = m.room.redaction 事件，redacts 指向被删消息的 event_id。
+    把本地按 event_id 留存的东西清掉，并拦下"还没真正开跑"的活：
+      · 逐字记录那一行（物理删）、下载到本地的媒体文件；
+      · 内存背景 _context 里那条（_drop_context_event，靠 _ctx_recent 索引定位）——否则被删消息
+        （比如误粘的密钥）仍会随下一个任务喂给 Claude，直到重启才随 deque 滚掉；
+      · 连发合并缓冲里还没派出去的那条（_drop_pending_event）；
+      · 已派进 runner、但还在排队等锁 / 没起子进程的那条（cancel_event，静默撤，不回"已停止"）。
+    已压进日摘要、以及【已起进程正在跑】的活，属于追不回的边界（删除不中断在跑任务），不管。
+    best-effort，任何一步失败只记日志，不影响收发。
+
+    只处理在线收到的删除（初始 sync 的历史积压 redaction 跳过，同 on_message）；bot 自己撤 reaction
+    回执也会回灌成 redaction，按 sender 提前挡掉——那些目标是 reaction 事件，不在本地任何留存里，
+    白扫一遍存储纯属浪费。"""
+    if not settings.process_backlog and not state._synced:   # 跳过历史/离线积压
+        return
+    if getattr(event, "sender", "") == state.MY_ID:          # bot 自撤 reaction 的 redaction，别空扫
+        return
+    target = getattr(event, "redacts", "") or ""
+    if not target:
+        return
+    rid = room.room_id
+    # 先记进"已删名单"：兜住消息已派进 handle_task、但还没进 runner.ask 登记 token 的那段间隙
+    # （首次 clone / git fetch / 引文回捞可达数十秒）——ask 一登记 token 就查这份名单，中了静默了断。
+    runner.mark_redacted(target)
+    hit = False
+    try:
+        hit = transcript.discard_event(rid, target) or hit
+    except Exception:
+        log.exception("删除消息清理：逐字记录 %s", rid)
+    try:
+        hit = _discard_media_event(rid, target) or hit
+    except Exception:
+        log.exception("删除消息清理：媒体文件 %s", rid)
+    try:
+        hit = _drop_context_event(rid, target) or hit   # 从内存背景剔掉，别再喂给下一个任务
+    except Exception:
+        log.exception("删除消息清理：内存背景 %s", rid)
+    try:
+        hit = _drop_pending_event(rid, target) or hit
+    except Exception:
+        log.exception("删除消息清理：待派缓冲 %s", rid)
+    try:
+        # 已派进 runner、还在排队等锁（没起子进程）的那条也撤掉，别再拿被删的消息去派活。
+        # 只撤排队中的；已起进程在跑的不碰（删除不中断在跑任务的边界）。撤时静默，不回"已停止"。
+        hit = runner.cancel_event(rid, target) > 0 or hit
+    except Exception:
+        log.exception("删除消息清理：撤排队任务 %s", rid)
+    if hit:
+        log.info("[%s] 消息 %s 被删除，已清理本地留存", rid, target)
 
 
 async def on_invite(room: MatrixRoom, event: InviteMemberEvent):
@@ -663,6 +720,7 @@ async def main():
 
     state.client.add_event_callback(on_message, RoomMessageText)
     state.client.add_event_callback(on_media, (RoomMessageMedia, RoomEncryptedMedia))
+    state.client.add_event_callback(on_redaction, RedactionEvent)  # 消息被删：清本地留存（逐字/媒体/待派缓冲）
     state.client.add_event_callback(on_invite, InviteMemberEvent)
     state.client.add_event_callback(on_member, RoomMemberEvent)
     state.client.add_event_callback(on_undecrypted, MegolmEvent)  # 解不开的加密消息：要密钥+提示，别沉默

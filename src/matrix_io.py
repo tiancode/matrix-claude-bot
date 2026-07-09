@@ -135,12 +135,15 @@ async def send(room_id: str, text: str, track: bool = False, thread_root: str | 
     all_ok = True
     prev = thread_root
     first = True
+    first_eid = None         # 首个发成功的分块 event_id：短回执（如「⏳ 已排队」）事后要撤时按它 redact
     for chunk in _split(text):
         rel = _thread_rel(thread_root, prev) or (_reply_rel(reply_to) if first else None)
         first = False
         eid = await _send_and_register(room_id, _text_content(chunk), rel)
         if eid:
             any_ok = True
+            if first_eid is None:
+                first_eid = eid
             prev = eid           # 同一线程内后续分块回链到上一块
         else:
             all_ok = False
@@ -156,6 +159,7 @@ async def send(room_id: str, text: str, track: bool = False, thread_root: str | 
     # 整条都发出去才并入上下文：半截投递不该被当成"已完整说过"喂回后续 prompt
     if any_ok and all_ok and track:
         _track_reply(room_id, text, thread_root)
+    return first_eid   # 供调用方事后撤回该消息（多分块时撤首块即可，回执类本就单块）
 
 
 
@@ -208,6 +212,17 @@ async def _unreact(room_id: str, reaction_eid: str) -> None:
     """撤掉之前打的 reaction（redact 自己的 reaction 事件）。失败静默——回执残留无伤大雅。"""
     try:
         await state.client.room_redact(room_id, reaction_eid)
+    except Exception:
+        pass
+
+
+async def _redact(room_id: str, eid: str) -> None:
+    """撤回 bot 自己发过的一条消息（redact 该 event）。用于静默撤单时把「⏳ 已排队」回执一并抹掉。
+    失败静默——回执残留无伤大雅。bot 自撤产生的 redaction 由 on_redaction 按 sender 自挡，不成环。"""
+    if not eid:
+        return
+    try:
+        await state.client.room_redact(room_id, eid)
     except Exception:
         pass
 

@@ -76,6 +76,22 @@ def discard(room: str) -> None:
     _last_prune.pop(room, None)
 
 
+def discard_event(room: str, event_id: str) -> bool:
+    """删掉某条消息在本房间逐字记录里的那一行（消息被 redact / 用户删除时用）：物理删行。
+    按 `id == event_id` 匹配（append 落盘时把收到的 event_id 存进 id 字段）；命中并重写返回 True，
+    空 id / 没这条 / 文件不存在都返回 False。bot 自己的回复落盘时 id="" 天然不会误伤。"""
+    if not event_id:
+        return False
+    recs = _read_all(room)
+    if not recs:
+        return False
+    kept = [r for r in recs if r.get("id") != event_id]
+    if len(kept) == len(recs):
+        return False
+    _write_all(room, kept)
+    return True
+
+
 def _read_all(room: str) -> list[dict]:
     out: list[dict] = []
     try:

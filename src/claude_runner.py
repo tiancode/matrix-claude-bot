@@ -12,6 +12,7 @@ import re
 import shlex
 import signal
 import time
+from collections import deque
 
 from config import settings, redact
 from storage import atomic_write_json
@@ -46,18 +47,27 @@ def _looks_transient(text: str) -> bool:
 
 
 class ClaudeCancelled(Exception):
-    """用户 /cancel 主动停止任务——与运行出错区分开，让调用方回报"已停止"而非"出错了"。"""
+    """用户 /cancel 主动停止任务——与运行出错区分开，让调用方回报"已停止"而非"出错了"。
+    silent=True：因触发消息被删 / redact 而撤掉的【排队中】任务，调用方据此不回"🛑 已停止"文案
+    （用户自己删的消息，再吭声一句反而突兀）。默认 False，保持 /cancel 原有"已停止"回报不变。"""
+    def __init__(self, *args, silent: bool = False):
+        super().__init__(*args)
+        self.silent = silent
 
 
 class _CancelToken:
     """一次 ask() 的在途取消令牌：/cancel 把当下在途的每个令牌 cancelled 置真；
     每个任务只认自己的令牌、并在结束时把自己摘掉——所以取消只作用于"当时在途"的任务，
-    不会毒杀之后新派的活（新活拿的是干净的新令牌）。started：是否已起子进程（供 /cancel 区分运行中/排队中）。"""
-    __slots__ = ("cancelled", "started")
+    不会毒杀之后新派的活（新活拿的是干净的新令牌）。started：是否已起子进程（供 /cancel 区分运行中/排队中）。
+    event_id：触发本任务的那条消息的 event_id（消息被删时据此精撤【还没起进程】的这一个，见 cancel_event）；
+    silent：被 cancel_event 撤掉时置真，让上层不回"已停止"文案。"""
+    __slots__ = ("cancelled", "started", "event_id", "silent")
 
-    def __init__(self):
+    def __init__(self, event_id: str = ""):
         self.cancelled = False
         self.started = False
+        self.event_id = event_id
+        self.silent = False
 
 
 # quick() 处理不可信外来内容，给子进程剔除这些密钥（它用不到）。agentic 的 ask() 仍需 GITEA_TOKEN。
@@ -131,6 +141,7 @@ class ClaudeRunner:
         self._quick_sema = asyncio.Semaphore(max(1, settings.max_concurrency))  # quick 独立并发池
         self._active: dict[str, list] = {}   # cancel_key -> 正在跑的子进程列表（供 /cancel 杀）
         self._tokens: dict[str, set] = {}    # cancel_key -> 在途任务的取消令牌集合（含排队等锁、prepare 中、运行中的）
+        self._redacted: deque = deque(maxlen=4096)   # 已删/redact 的触发消息 event_id：兜住 handle_task→ask 间隙删的
         self._persist: dict[str, _Persist] = {}   # key -> 常驻进程（CLAUDE_PERSISTENT=1）
         self._reaper: asyncio.Task | None = None  # 空闲常驻进程回收循环
 
@@ -153,6 +164,29 @@ class ClaudeRunner:
         for p in live:
             _kill_group(p)
         return running, queued
+
+    def cancel_event(self, cancel_key: str, event_id: str) -> int:
+        """撤掉该维度下由某条消息触发、且【还没起子进程】的在途任务（消息被删 / redact 时用）。
+        只动排队 / 准备中的（token.started=False）——已起进程在跑的不碰，那是"删除不中断在跑任务"的
+        边界；置 cancelled+silent：排队任务在拿到锁后自我了断（见 ask 里 token.cancelled 各检查点），
+        且撤它时不回"🛑 已停止"文案。返回撤掉的任务数；event_id 空则不做（避免误伤无 eid 的后台任务）。"""
+        if not event_id:
+            return 0
+        n = 0
+        for t in self._tokens.get(cancel_key) or ():
+            if t.event_id == event_id and not t.started and not t.cancelled:
+                t.cancelled = True
+                t.silent = True
+                n += 1
+        return n
+
+    def mark_redacted(self, event_id: str) -> None:
+        """记下一个被删 / redact 的触发消息 event_id（on_redaction 调）。兜住 cancel_event 抓不到的间隙：
+        消息在派活链上（首次 clone / git fetch / 引文回捞）还没进 ask、token 尚未登记时就被删——ask 一登记
+        token 就查这份名单，中了立刻静默了断，别开跑。有界去重靠 deque(maxlen)，重启清空无妨（在途任务
+        本就随重启蒸发）。"""
+        if event_id:
+            self._redacted.append(event_id)
 
     # ---- steering：任务进行中把追加消息递进当前回合（像 Claude Code 运行中打字）----
     async def try_steer(self, key: str, text: str) -> bool:
@@ -682,12 +716,12 @@ class ClaudeRunner:
         end = time.monotonic() + delay
         while time.monotonic() < end:
             if token is not None and token.cancelled:
-                raise ClaudeCancelled()
+                raise ClaudeCancelled(silent=bool(token and token.silent))
             await asyncio.sleep(min(0.5, max(0.0, end - time.monotonic())))
         # 落在最后一个睡片里的 /cancel 会躲过循环顶部的检查：这里必须再验一次，
         # 否则 continue 会起新子进程把整个回合跑完（cancel 已执行过，杀不到后起的进程）。
         if token is not None and token.cancelled:
-            raise ClaudeCancelled()
+            raise ClaudeCancelled(silent=bool(token and token.silent))
 
     @staticmethod
     def _looks_like_session_error(out: bytes, err: bytes) -> bool:
@@ -711,7 +745,7 @@ class ClaudeRunner:
                   system_prompt: str | None = None, lock_key: str | None = None,
                   prepare=None, on_delta=None, cancel_key: str | None = None,
                   fork_from: str | None = None, on_reset=None, on_notify=None,
-                  steerable: bool = False, on_queued=None) -> str:
+                  steerable: bool = False, on_queued=None, trigger_eid: str = "") -> str:
         """带工具、带会话上下文地干活；cwd=该项目的仓库目录。
 
         key:        会话维度（项目+房间[+线程]），不同房间/私聊用户互不串台。
@@ -735,11 +769,13 @@ class ClaudeRunner:
                     派活层的派发时刻预检（capacity_full）有竞态窗口——等锁/prepare
                     （git fetch 可数十秒）期间额度可能被别人占满——这里兜底补发"已排队"
                     知会。瞬时重试会再次经过信号量，回调可能多次触发，去重由调用方负责。
+        trigger_eid: 触发本任务的那条用户消息的 event_id（聊天派活传，后台任务不传）。消息被删/redact
+                    时 cancel_event 据此精撤【还没起进程】的这条排队任务，别再让它开跑（见 on_redaction）。
         """
         lock_key = lock_key or key
         ckey = cancel_key or lock_key
         my_procs: list = []
-        token = _CancelToken()
+        token = _CancelToken(trigger_eid)
         # 一进 ask 就登记令牌（此刻可能还在排队等锁、还没起子进程）：这样 /cancel 也能标记到
         # "已派但没轮到"的任务，而不是只逮住已在跑的那个。
         self._tokens.setdefault(ckey, set()).add(token)
@@ -748,6 +784,12 @@ class ClaudeRunner:
             token.started = True   # 起了子进程：/cancel 据此把本任务算作"运行中"而非"排队中"
             my_procs.append(proc)
             self._active.setdefault(ckey, []).append(proc)
+            if token.cancelled:
+                # 排队 / 等锁 / 等 sema 期间已被取消（含删消息静默撤：token.cancelled=True 而 started 还 False，
+                # 且 sema 是在 _once 内部才抢，抢到后到这才 started=True，中间没有别的取消检查点）——子进程一
+                # 起来就立刻杀掉，否则它会背着用户把整个回合跑完（git push / 开 PR），事后才在 token.cancelled
+                # 检查点抛取消，副作用已发生、silent 下还毫无提示。杀了它下面读到死进程(rc<0)，回 ask 由检查点收场。
+                _kill_group(proc)
 
         # 上次失败回合的残留信号（供瞬时重试决策）：sid=进程死前已捕获的会话、tool=是否已跑过工具。
         # rc!=0 时 meta 是 None，这些信号只能从这里拿。
@@ -804,12 +846,16 @@ class ClaudeRunner:
             return rc, (result or "").strip(), err, (st["sid"], st["is_err"])
 
         try:
+            if trigger_eid and trigger_eid in self._redacted:
+                # 消息在进 ask 之前（首次 clone / git fetch / 引文回捞那段间隙）就被删了：那时 token 还没登记、
+                # cancel_event 抓不到；这里补一道——登记 token 后立刻查"已删名单"，中了就静默了断，别开跑。
+                raise ClaudeCancelled(silent=True)
             async with self._lock(lock_key):
                 # 拿到锁后、起子进程前先验一次：排队等锁期间若被 /cancel，这里即刻了断，
                 # 连 prepare（git fetch 可数十秒）和子进程都不再起——正是"派 A 又派 B、B 排队时 /cancel"
                 # 那条 B 该走的路：不能等它默默开跑。
                 if token.cancelled:
-                    raise ClaudeCancelled()
+                    raise ClaudeCancelled(silent=token.silent)
                 epoch = self._epoch.get(key, 0)
                 sid, expired = self._sid(key)
                 if sid is None:
@@ -851,7 +897,7 @@ class ClaudeRunner:
                     except Exception:
                         log.exception("任务前置准备失败（继续按现状跑）")
                     if token.cancelled:   # prepare（git fetch 可数十秒）跑完再验一次，别白起子进程
-                        raise ClaudeCancelled()
+                        raise ClaudeCancelled(silent=token.silent)
                 # 上游瞬时故障（Overloaded/限流/5xx）自动退避重试。重试姿势按错误形态区分：
                 # · CLI 正常退出但结果 is_error（如 "API Error: Overloaded"）→ session_id 已拿到，
                 #   --resume 它并用接续提示续跑：已完成的工作（含已 push 的）都在会话里，不会重做；
@@ -863,7 +909,7 @@ class ClaudeRunner:
                 for attempt in range(retries + 1):
                     rc, payload, err, meta = await _once(run_sid, run_fork, prompt_override=nudge)
                     if token.cancelled:
-                        raise ClaudeCancelled()
+                        raise ClaudeCancelled(silent=token.silent)
                     if rc != 0 and run_sid and self._looks_like_session_error(
                             payload if isinstance(payload, bytes) else b"", err):
                         # fork 场景失效的是【父】会话（--resume 的是它）：清父，别让房间任务再撞尸体；
@@ -881,7 +927,7 @@ class ClaudeRunner:
                         sess_model = settings.claude_model or ""       # 全新开：记当前配置的模型
                         rc, payload, err, meta = await _once(None)
                         if token.cancelled:
-                            raise ClaudeCancelled()
+                            raise ClaudeCancelled(silent=token.silent)
                     if rc != 0:
                         # 先 redact 再截断，免得 token 跨在截断边界被切成半截
                         detail = redact(err.decode(errors="ignore").strip())

@@ -13,7 +13,7 @@ import sys
 
 from _helpers import settings
 
-import test_dispatch_flow, test_addressing_safety, test_followup_gates, test_bind_dispatch, test_media_proactive, test_context_resume, test_projects_worktree, test_dm_binding, test_ledgers_reconcile, test_gitea_health, test_ops_digest, test_cancel_misc, test_persistent
+import test_dispatch_flow, test_addressing_safety, test_followup_gates, test_bind_dispatch, test_media_proactive, test_context_resume, test_projects_worktree, test_dm_binding, test_ledgers_reconcile, test_gitea_health, test_ops_digest, test_cancel_misc, test_persistent, test_redaction
 
 # 拼接顺序 == 拆分前 TESTS 的原有顺序（各段在原列表里连续）
 TESTS = (
@@ -29,7 +29,8 @@ TESTS = (
     test_gitea_health.TESTS +
     test_ops_digest.TESTS +
     test_cancel_misc.TESTS +
-    test_persistent.TESTS
+    test_persistent.TESTS +
+    test_redaction.TESTS
 )
 
 
