@@ -468,9 +468,11 @@ def test_oneshot_rc_nonzero_reads_stdout_json():
     orig_delay = claude_runner._TRANSIENT_BASE_DELAY
     claude_runner._TRANSIENT_BASE_DELAY = 0
     try:
-        # (1) 非瞬时硬失败：rc=1 + stderr 空 + stdout 带 is_error 文案 → 报错里带得上诊断，不空
+        # (1) 非瞬时硬失败：rc=1 + stderr 空 + stdout 带 is_error 文案 → 报错带得上诊断，且【不】重试
         r = claude_runner.ClaudeRunner()
+        m = {"v": 0}
         async def bad_model(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            m["v"] += 1
             return 1, json.dumps({"is_error": True,
                                   "result": "There's an issue with the selected model (x)."}).encode(), b""
         r._run = bad_model
@@ -479,6 +481,7 @@ def test_oneshot_rc_nonzero_reads_stdout_json():
             assert False, "should raise"
         except RuntimeError as e:
             assert "issue with the selected model" in str(e)   # 不再是空的「退出码 1: 」
+        assert m["v"] == 1                                     # 非瞬时 → 一次即败，不重试
 
         # (2) 瞬时故障走 stdout：rc=1 + stderr 空 + stdout 带 Overloaded → 认得出瞬时并重跑一次
         r2 = claude_runner.ClaudeRunner()
@@ -490,6 +493,29 @@ def test_oneshot_rc_nonzero_reads_stdout_json():
             return 0, json.dumps({"result": "__PASS__"}).encode(), b""
         r2._run = flaky
         assert asyncio.run(r2.quick("判断一下")) == "__PASS__" and n["v"] == 2
+
+        # (3) stdout 能解析但 result 为空 → 退回原始 stdout，别再塌成空的「退出码 1: 」
+        r3 = claude_runner.ClaudeRunner()
+        async def empty_result(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            return 1, json.dumps({"is_error": True, "result": "", "subtype": "error_x"}).encode(), b""
+        r3._run = empty_result
+        try:
+            asyncio.run(r3.quick("判断一下"))
+            assert False, "should raise"
+        except RuntimeError as e:
+            assert str(e).rstrip().endswith("退出码 1:") is False and "error_x" in str(e)  # 有兜底诊断
+
+        # (4) stderr 只有无害 node 警告、真·过载文案在 stdout → 瞬时特征要扫全量，仍重试
+        r4 = claude_runner.ClaudeRunner()
+        c = {"v": 0}
+        async def noisy_stderr(cmd, cwd=None, sema=None, env=None, timeout=None, on_proc=None):
+            c["v"] += 1
+            if c["v"] == 1:
+                return (1, json.dumps({"is_error": True, "result": "API Error: Overloaded"}).encode(),
+                        b"(node:1) DeprecationWarning: punycode")
+            return 0, json.dumps({"result": "__PASS__"}).encode(), b""
+        r4._run = noisy_stderr
+        assert asyncio.run(r4.quick("判断一下")) == "__PASS__" and c["v"] == 2
     finally:
         claude_runner._TRANSIENT_BASE_DELAY = orig_delay
 

@@ -948,28 +948,33 @@ class ClaudeRunner:
         for attempt in range(2):
             rc, out, err = await self._run(cmd, cwd=cwd, sema=self._quick_sema,
                                            env=_quick_env(), timeout=settings.quick_timeout)
-            if rc != 0:   # 瞬时判定用未截断原文（别让长前缀把特征挤出截断窗），截断只在报错时做
-                detail = redact(err.decode(errors="ignore").strip())
-                if not detail:
-                    # claude --output-format json 失败时（无效模型/API 4xx/过载）rc=1 但 stderr
-                    # 常为空，诊断与 is_error 文案都在 stdout 的 JSON 里。跟 ask() 一样回退到 stdout：
-                    # 否则不但报错为空，_looks_transient 还拿不到特征——过载/限流这类本可自动重试的
-                    # 也一并漏成硬失败。优先取 JSON 的 result（干净文案），解析不了再用原始 stdout。
-                    try:
-                        detail = redact((json.loads(out.decode()).get("result") or "").strip())
-                    except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
-                        detail = redact(out.decode(errors="ignore").strip())
+            if rc != 0:
+                # 失败诊断：优先 stderr。claude --output-format json 失败时（无效模型/API 4xx/过载）
+                # rc=1 但 stderr 常为空，is_error 文案写在 stdout 的 JSON result 里——取它当干净文案；
+                # 连 result 都空（解析失败或字段为空）就退回原始 stdout。总之别塌成空的「退出码 1: 」。
+                # （截断只在最后做：瞬时判定用未截断原文，别让长前缀把特征挤出窗口。）
+                err_txt = redact(err.decode(errors="ignore").strip())
+                raw_out = out.decode(errors="ignore")
+                try:
+                    result = (json.loads(raw_out).get("result") or "").strip()
+                except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                    result = ""
+                out_txt = redact(raw_out.strip())
+                detail = err_txt or redact(result) or out_txt
                 msg = f"claude 退出码 {rc}: {detail[:300]}"
+                # 瞬时判定要看【全量】：过载/限流特征可能只在 stdout，而 stderr 恰好有句无害的
+                # node 警告——只认 stderr（或只认干净 result）会把本可自动重试的漏成硬失败。两边一起扫。
+                scan = "\n".join(t for t in (err_txt, out_txt) if t)
             else:
                 result, _, is_err = self._parse(out)
                 if not is_err:
                     return result
-                detail = redact(result)
+                detail = scan = redact(result)
                 msg = f"claude: {detail}"
             if (attempt == 0 and settings.claude_transient_retries > 0
-                    and _looks_transient(detail)):
+                    and _looks_transient(scan)):
                 log.warning("上游瞬时故障，%.0fs 后重跑轻判断：%s",
-                            _TRANSIENT_BASE_DELAY * 0.6, detail[:200])
+                            _TRANSIENT_BASE_DELAY * 0.6, scan[:200])
                 await asyncio.sleep(_TRANSIENT_BASE_DELAY * 0.6)
                 continue
             raise RuntimeError(msg)
