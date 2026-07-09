@@ -10,7 +10,8 @@ from config import settings
 import state
 from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
                    _drop_pending, _steered_dispatched, _unmark_dispatched,
-                   _last_project_by_room, _save_last_projects, _project_last_active)
+                   _last_project_by_room, _save_last_projects, _project_last_active,
+                   _room_model, _save_room_models)
 from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files, _redact,
                        _thread_of, _thread_root_of, _ack, _react, _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
@@ -30,32 +31,36 @@ import gitea_health
 log = logging.getLogger("matrix-claude.tasks")
 
 
-RESET_CMDS = {"/reset", "/new", "重置", "新对话", "清空"}
+RESET_CMDS = {"/reset", "/new"}
 
 
 
-HELP_CMDS = {"/help", "/?", "帮助", "用法"}
+HELP_CMDS = {"/help", "/?"}
 
 
 
-SUMMARY_CMDS = {"/summarize", "/catchup", "总结", "回顾", "小结"}   # 也认 "/summarize N" 前缀
+SUMMARY_CMDS = {"/summarize", "/catchup"}   # 也认 "/summarize N" 前缀
 
 
 
-CANCEL_CMDS = {"/cancel", "/stop", "停止", "取消", "停"}            # 也认 "/cancel"/"/stop" 前缀
+CANCEL_CMDS = {"/cancel", "/stop"}          # 也认 "/cancel"/"/stop" 前缀
 
 
 
-STATUS_CMDS = {"/status", "状态"}                                   # 也认 "/status" 前缀
+STATUS_CMDS = {"/status"}                   # 也认 "/status" 前缀
 
 
 
-UNBIND_CMDS = {"/unbind", "解绑", "取消绑定"}                        # 解除本房间/私聊的仓库绑定
+UNBIND_CMDS = {"/unbind"}                   # 解除本房间/私聊的仓库绑定
 
 
 
-NEW_PROJECT_CMDS = {"新建项目", "新建仓库"}   # 按前缀匹配（见 bot.py），"新建项目 foo" 也认；
-                                            # 也认 "/new-project"/"/newproject" 前缀
+# /model：查看/设置本房间用的模型，按 "/model" 前缀路由（见 bot.py）。
+# 模型名的合法形态（opus / fable / claude-opus-4-8 这类）：字母数字开头，之后允许 . _ : -。
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
+# 恢复默认（清掉本房间覆盖）的关键词
+_MODEL_RESET_WORDS = {"reset", "clear", "default"}
 
 
 
@@ -70,11 +75,13 @@ _HELP_TEXT = (
     "• 也可以不进 Matrix：在 Gitea 上把 issue **指派给我**，我会接单、开 PR（合并自动关单）并回报进展\n"
     "• 长任务我会边干边把进度更新到同一条消息；要文件我用附件发回来\n\n"
     "**命令**（群里不必 @ 也认）\n"
-    "• `帮助` / `用法` 看这个——注意 `/help` 会被 Matrix 客户端当自带命令吞掉，发不到我这，\n"
-    "  想发斜杠命令用中文词、或 `//help`（双斜杠发字面文本）、或 @我 带上命令\n"
+    "• `/help` 看这个——注意 `/help` 可能被 Matrix 客户端当自带命令吞掉，发不到我这，\n"
+    "  这时用 `//help`（双斜杠发字面文本）、或 @我 带上命令\n"
     "• `/bind <URL>` 把本群 / 本私聊定到某仓库（私聊也能绑）；`/unbind` 解绑\n"
     "• `/new-project <仓库名>` 不想先手动建仓库？我在 Gitea 上新建一个（默认公开）再自动绑定本房间\n"
     "• `/status` 看我当前状态（项目 / 正在跑的任务 / 在跟的 PR）\n"
+    "• `/model` 看本房间用的模型；`/model <名字>`（如 fable / opus / sonnet）单独给本房间换模型，\n"
+    "  `/model reset` 恢复默认——改动对新会话生效，进行中的对话要 /reset 后才切换\n"
     "• `/summarize [N]` 小结最近 N 条对话（catch me up）\n"
     "• `/cancel` 停掉我正在跑的任务\n"
     "• `/reset` 开启新对话（清空多轮上下文）\n"
@@ -86,8 +93,8 @@ _HELP_TEXT = (
 _WELCOME = (
     "👋 我是 Claude Code 工程师 bot。@我（群里）或直接私聊就能派活：写代码、查问题、做方案，"
     "改代码会自动开 PR；闲聊、问一般问题也行。要派仓库的活，先发个 Gitea 仓库地址或 "
-    "`/bind <URL>` 绑定（群和私聊都行）。发 `帮助` 看完整用法"
-    "（`/help` 会被 Matrix 客户端自己吞掉，用中文词 `帮助`）。"
+    "`/bind <URL>` 绑定（群和私聊都行）。发 `/help` 看完整用法"
+    "（若被 Matrix 客户端当自带命令吞掉，用 `//help` 双斜杠发字面文本）。"
 )
 
 
@@ -312,6 +319,8 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     # 线程首次派活：从房间会话分叉（--fork-session）。fork_from 只在线程任务时传——
     # 显式 kwargs 组装，普通任务不带此参数（测试里的假 runner 不必都认识它）。
     fork_kw = {"fork_from": _sess_key(rec, rid)} if sess_thread else {}
+    if _room_model.get(rid):   # 房间 /model 覆盖：同样只在测试假 runner 认识它时才需要，条件组装
+        fork_kw["model"] = _room_model[rid]
     # 在途登记：进执行/排队即记一笔，重启对账据此收尾占位/催重发（见 inflight）。摘除放 finally，
     # 覆盖成功/取消/报错所有退出路径。占位 eid 在占位创建后（首个 delta）再补录。
     inflight_key = inflight.record(rid, text, inflight.KIND_CHAT)
@@ -668,6 +677,76 @@ async def handle_cancel(room: MatrixRoom):
 
 
 
+def _sess_model_now(rid: str) -> str:
+    """本房间当前可续接会话「创建时记录的模型」；无存活会话/旧版条目没记录返回 ""。
+    /model 与 /status 用它提示"改了设置但对进行中的会话不生效"。getattr 兜底：
+    测试里的假 runner 不必都认识 session_model。"""
+    skey = _sess_key(projects.get_room(rid) or _general_rec(), rid)
+    if runner.session_ts(skey) is None:
+        return ""
+    return getattr(runner, "session_model", lambda k: "")(skey)
+
+
+async def handle_model(room: MatrixRoom, body: str):
+    """/model：查看/设置本房间用的模型（如 fable / opus / sonnet）。
+    · `/model`            看当前用的模型（本房间覆盖 > 全局 CLAUDE_MODEL > CLI 默认）
+    · `/model <名字>`     给本房间单独设模型（存下来，重启不丢）
+    · `/model reset`      清掉本房间覆盖，回到全局配置
+    与 CLAUDE_MODEL 同语义：--resume 不回传 --model，改动只对【新开的会话】生效，
+    进行中的会话要 /reset 翻篇后才切换——设置时如有存活会话会顺带提示。"""
+    rid = room.room_id
+    parts = body.split(None, 1)
+    arg = (parts[1].strip() if len(parts) > 1 else "")
+    override = _room_model.get(rid, "")
+    eff = override or settings.claude_model
+    sess_model = _sess_model_now(rid)
+    stale = sess_model and sess_model != (eff or "")   # 存活会话还跑在别的模型上
+
+    if not arg:   # 查看
+        if override:
+            lines = [f"🧠 当前模型：{override}（本房间通过 /model 设置；`/model reset` 恢复默认）"]
+        elif settings.claude_model:
+            lines = [f"🧠 当前模型：{settings.claude_model}（全局配置 CLAUDE_MODEL，本房间未单独设置）"]
+        else:
+            lines = ["🧠 当前模型：跟随 Claude CLI 的默认（未配置 CLAUDE_MODEL，本房间也未单独设置）"]
+        if stale:
+            lines.append(f"• 进行中的会话仍在用 {sess_model}（/reset 开新对话后按当前设置走）")
+        lines.append("• 换模型：`/model <名字>`（如 fable / opus / sonnet / haiku）")
+        await send(rid, "\n".join(lines))
+        return
+
+    if arg.lower() in _MODEL_RESET_WORDS:   # 恢复默认
+        if _room_model.pop(rid, None) is None:
+            await send(rid, "本房间没有单独设置过模型，现在用的就是默认"
+                            + (f"（{settings.claude_model}）。" if settings.claude_model else "。"))
+            return
+        _save_room_models()
+        msg = "✅ 已恢复默认模型" + (f"（{settings.claude_model}）" if settings.claude_model
+                                     else "（跟随 Claude CLI 默认）")
+        if sess_model and sess_model != (settings.claude_model or ""):
+            msg += f"。进行中的会话仍在用 {sess_model}，/reset 后生效"
+        await send(rid, msg + "。")
+        return
+
+    if not _MODEL_NAME_RE.match(arg):
+        await send(rid, "模型名只能是字母/数字开头，含 `.` `_` `:` `-`，"
+                        "比如 `/model fable`、`/model opus`；`/model reset` 恢复默认。")
+        return
+    if arg == override or (not override and arg == settings.claude_model):
+        already = "本房间已经在用" if override else "全局配置就是"
+        await send(rid, f"🧠 {already} {arg}，无需改动。"
+                        + (f"（进行中的会话仍在用 {sess_model}，/reset 后切换）" if stale else ""))
+        return
+    _room_model[rid] = arg
+    _save_room_models()
+    msg = f"✅ 本房间模型已设为 {arg}"
+    if sess_model and sess_model != arg:
+        msg += f"。进行中的会话仍在用 {sess_model}，发 /reset 开新对话后生效"
+    else:
+        msg += "，下次派活生效"
+    await send(rid, msg + "。")
+
+
 async def handle_status(room: MatrixRoom):
     """/status：本房间视角的运行状态——项目、正在跑的任务、在跟的 PR、会话新鲜度、主动性开关。
     给用户一个"你现在在干嘛 / 盯着啥"的窗口，不用翻日志。"""
@@ -680,6 +759,8 @@ async def handle_status(room: MatrixRoom):
         lines.append(f"• 项目：{rec['owner']}/{rec['repo']}{pinned}")
     else:
         lines.append("• 项目：未绑定——发仓库地址或 /bind <URL> 绑定；不绑我就当通用助手陪聊/答疑")
+    if _room_model.get(rid):
+        lines.append(f"• 模型：{_room_model[rid]}（本房间 /model 设置；`/model reset` 恢复默认）")
     n_run = runner.running(rid)
     # 排队/准备中 = 在途但还没起子进程的（pending 含全部在途，running 只算已起进程的）。
     # getattr 兜底同排队回执处：测试里的假 runner 不必都认识 pending/capacity_full。
@@ -712,12 +793,13 @@ async def handle_status(room: MatrixRoom):
         ts = runner.session_ts(skey)
         lines.append(f"• 多轮会话：{_human_gap(max(0.0, time.time() - ts))}前活跃（/reset 可重开）"
                      if ts else "• 多轮会话：无（下次派活即新开）")
-        # 模型配置漂移提示：续接的会话沿用创建时记录的模型（--resume 不回传 --model），改了
-        # CLAUDE_MODEL 对它不生效且不会自行过期——在这里暴露出来，别让用户以为已切换。
+        # 模型设置漂移提示：续接的会话沿用创建时记录的模型（--resume 不回传 --model），改了
+        # 房间 /model 或 CLAUDE_MODEL 对它不生效且不会自行过期——在这里暴露出来，别让用户以为已切换。
         # getattr 兜底同上：测试里的假 runner 不必都认识 session_model。
         sess_model = getattr(runner, "session_model", lambda k: "")(skey)
-        if ts and sess_model and settings.claude_model and sess_model != settings.claude_model:
-            lines.append(f"• 会话模型：{sess_model}（配置已改为 {settings.claude_model}，"
+        eff_model = _room_model.get(rid) or settings.claude_model
+        if ts and sess_model and eff_model and sess_model != eff_model:
+            lines.append(f"• 会话模型：{sess_model}（设置已改为 {eff_model}，"
                          "对当前会话不生效，/reset 后按新值走）")
     if settings.proactive_heartbeat_enabled:
         import heartbeat   # 函数内延迟导入：heartbeat 模块顶层反过来 import 本模块，避免循环导入

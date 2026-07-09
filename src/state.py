@@ -46,6 +46,7 @@ _ctx_recent: deque = deque(maxlen=4096)
 _sent_events: deque = deque(maxlen=4096)        # 自己发出的 event_id：防自激 + 识别"回复了 bot"（重启清空）
 _foreign_events: deque = deque(maxlen=4096)     # 查证过"不是 bot 发的"的 event_id：防重复向服务器拉取
 _last_project_by_room: dict[str, str] = {}      # room_id -> proj_id，房间在弄哪个项目（自驱心跳/Gitea 健康度找汇报口）
+_room_model: dict[str, str] = {}                # room_id -> /model 给本房间设的模型（覆盖 CLAUDE_MODEL；没设=跟随全局）
 _project_last_active: dict[str, float] = defaultdict(float)   # proj_id -> 上次有人派活的时刻，自驱心跳据此避让
 _group_engaged: dict[tuple[str, str], float] = {}   # (room_id, user) -> 上次点名/续话时刻：群里"对话延续窗口"用
 # KNOWN_BOTS 名单 bot 在各房间用过的【显示名】：rid -> {name}。上下文元组只存显示名不存 MXID，
@@ -213,5 +214,27 @@ def _load_last_projects() -> None:
 def _save_last_projects() -> None:
     try:
         atomic_write_json(_last_proj_file(), _last_project_by_room)
+    except OSError:
+        pass
+
+
+def _room_models_file() -> str:
+    return os.path.join(settings.store_path, "room_models.json")
+
+
+def _load_room_models() -> None:
+    """恢复各房间通过 /model 设置的模型（房间属性，随重启保留；解绑仓库不清、退房才清）。"""
+    try:
+        with open(_room_models_file()) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict):
+        _room_model.update({k: v for k, v in data.items() if isinstance(v, str) and v})
+
+
+def _save_room_models() -> None:
+    try:
+        atomic_write_json(_room_models_file(), _room_model)
     except OSError:
         pass

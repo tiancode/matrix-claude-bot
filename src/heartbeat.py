@@ -45,12 +45,14 @@ async def _heartbeat_execute(rec: dict, room: str, proposal: str):
         "最终回复附上 PR 链接。用简洁中文回复。"
     )
     sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
+    # 与聊天共用同一会话 key：模型也跟房间 /model 设置走，别让自驱新开的会话把模型带偏
+    model_kw = {"model": state._room_model[room]} if state._room_model.get(room) else {}
     try:
         async with _typing(room):
             # cancel_key=汇报房间：让房间里的 /cancel 也能停掉自驱任务（不然只能干看着它跑）
             answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"], system_prompt=sp,
                                       lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec),
-                                      cancel_key=room)
+                                      cancel_key=room, **model_kw)
         _project_last_active[rec["id"]] = time.time()
         await send(room, f"🤖 自驱完成：\n{answer}", track=True)
         pr = _extract_pr(answer, rec)

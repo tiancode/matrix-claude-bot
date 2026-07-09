@@ -220,8 +220,8 @@ def test_new_project_binds_even_with_reserved_owner_name():
     # trusted_repo_info 不套用 parse_repo_url 的 _RESERVED_OWNERS 拒绝名单，owner=admin 照样绑定成功
     assert bound.get("repo", {}).get("owner") == "admin"
 
-# ---------- 19c) 中文命令别名带参数也能建仓（此前只有裸词才匹配，带名字反而落空） ----------
-def test_new_project_chinese_alias_with_name_dispatches():
+# ---------- 19c) /newproject 短别名带参数也能建仓（与 /new-project 同路） ----------
+def test_new_project_short_alias_with_name_dispatches():
     set_identity()
     state._synced = True
     room = FakeRoom("!g:ex.org", 3)
@@ -230,10 +230,10 @@ def test_new_project_chinese_alias_with_name_dispatches():
     bot.handle_new_project = lambda rm, ev, body: called.append(body)
     state._spawn = lambda coro: coro.close() if hasattr(coro, "close") else None
     try:
-        asyncio.run(bot.on_message(room, make_event("新建项目 foo")))
+        asyncio.run(bot.on_message(room, make_event("/newproject foo")))
     finally:
         (bot.handle_new_project, state._spawn) = orig
-    assert called == ["新建项目 foo"]   # 带名字的中文命令能匹配到 handle_new_project（此前会落空到普通消息处理）
+    assert called == ["/newproject foo"]   # 短别名带名字也能匹配到 handle_new_project
 
 # ---------- 20) /new-project 建仓失败 / 名字非法都有明确提示，不静默 ----------
 def test_new_project_rejects_bad_name_and_reports_failure():
@@ -290,7 +290,7 @@ TESTS = [
     ('纯链接才自动绑定', test_just_url_autobind_only_for_bare_url),
     ('/new-project 建仓成功后走 do_bind+带任务接着派', test_new_project_creates_and_binds),
     ('/new-project owner 命中保留字仍能绑定', test_new_project_binds_even_with_reserved_owner_name),
-    ('/new-project 中文别名带参数也能派发', test_new_project_chinese_alias_with_name_dispatches),
+    ('/newproject 短别名带参数也能派发', test_new_project_short_alias_with_name_dispatches),
     ('/new-project 非法名字/建仓失败均有提示', test_new_project_rejects_bad_name_and_reports_failure),
     ('未同步群不当私聊+剥外链img', test_dm_classification_and_html_hardening),
 ]

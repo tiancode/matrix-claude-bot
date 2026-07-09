@@ -59,10 +59,10 @@ from matrix_io import (send, _is_dm, _thread_of,
 from addressing import (_address_kind, _has_trigger, _strip_reply_fallback,
                         _strip_self_mentions, _mark_engaged, _mention_note,
                         _addresses_other_user, _is_known_bot)
-from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, do_bind,
-                   handle_unbind, handle_new_project, _backfill_cmd, _auto_backfill,
+from tasks import (handle_task, handle_summarize, handle_cancel, handle_status, handle_model,
+                   do_bind, handle_unbind, handle_new_project, _backfill_cmd, _auto_backfill,
                    RESET_CMDS, HELP_CMDS, SUMMARY_CMDS, CANCEL_CMDS, STATUS_CMDS, UNBIND_CMDS,
-                   NEW_PROJECT_CMDS, _HELP_TEXT, _WELCOME)
+                   _HELP_TEXT, _WELCOME)
 from pr_followup import _pr_followup_loop
 from heartbeat import _heartbeat_loop
 from issue_intake import _issue_execute, _issue_intake_loop
@@ -221,11 +221,13 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     if low.startswith("/status") or stripped in STATUS_CMDS:
         state._spawn(handle_status(room))
         return
+    if low.startswith("/model"):   # 查看/设置本房间用的模型
+        state._spawn(handle_model(room, stripped))
+        return
     if low in UNBIND_CMDS:                 # 解绑（群 / 私聊通用）
         state._spawn(handle_unbind(room))
         return
-    if (low.startswith("/new-project") or low.startswith("/newproject")
-            or any(stripped.startswith(w) for w in NEW_PROJECT_CMDS)):
+    if low.startswith("/new-project") or low.startswith("/newproject"):
         state._spawn(handle_new_project(room, event, stripped))
         return
     # /bind 但没带可解析的仓库地址：无论群 / 私聊都提示怎么用（私聊过去直接拒绝，现在也支持绑定了）
@@ -515,6 +517,11 @@ async def _cleanup_room(rid: str):
             state._save_last_projects()
         except Exception:
             log.exception("退房清理：路由记忆落盘失败 %s", rid)
+    if state._room_model.pop(rid, None) is not None:   # ③' 清 /model 给该房间设的模型并落盘
+        try:
+            state._save_room_models()
+        except Exception:
+            log.exception("退房清理：房间模型设置落盘失败 %s", rid)
     try:
         transcript.discard(rid)   # ④ 删逐字记录 + 回灌标记
     except Exception:
@@ -715,6 +722,7 @@ async def main():
     os.makedirs(settings.claude_workdir, exist_ok=True)
     sweep_stale_downloads()       # 清掉上次被杀留下的下载残件（mxdl-*），启动时扫一遍
     state._load_last_projects()   # 恢复重启前各房间的项目路由（DM /reset、多轮延续要用）
+    state._load_room_models()     # 恢复各房间 /model 设置的模型（房间属性，重启不丢）
     log.info("启动: 身份=%s (%s) E2EE=%s 工作目录=%s 主动模式=%s",
              state.MY_ID, state.MY_NAME, state.E2E, settings.claude_workdir, settings.proactive)
 
