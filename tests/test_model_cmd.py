@@ -1,4 +1,4 @@
-"""冒烟：/model 房间级模型——命令识别·查看/设置/恢复默认·派活透传·--model 只在新会话带·持久化"""
+"""冒烟：/model 房间级模型——查看/设置/恢复默认·派活透传·--model 只在新会话带·持久化"""
 from _helpers import (
     FakeRoom, _CapClient, _task_fixtures, asyncio, bot, claude_runner, json, make_event,
     set_identity, settings, state, tasks, time)
@@ -7,26 +7,7 @@ import dispatch
 import projects as projects_mod
 
 
-# ---------- /model 命令识别：斜杠按前缀、中文「模型」严进（别吞普通聊天） ----------
-def test_model_cmd_recognition():
-    ok = tasks._is_model_cmd
-    assert ok("/model")
-    assert ok("/model opus")
-    assert ok("/Model fable")          # 大小写不敏感（低层比对用 low）
-    assert ok("模型")
-    assert ok("当前模型")
-    assert ok("模型 opus")
-    assert ok("模型 claude-opus-4-8")
-    assert ok("模型 默认")
-    assert ok("模型 reset")
-    # 中文入口严进：参数不像模型名/恢复默认词的，当普通聊天放行
-    assert not ok("模型是什么")
-    assert not ok("模型 是什么意思")
-    assert not ok("模型 这个词咋理解")
-    assert not ok("聊聊模型")
-
-
-# ---------- /model：查看 / 设置 / 非法名 / 重复设置 / reset / 中文入口 ----------
+# ---------- /model：查看 / 设置 / 非法名 / 重复设置 / reset ----------
 def test_model_cmd_view_set_reset():
     set_identity()
     c = _CapClient(); state.client = c
@@ -63,13 +44,12 @@ def test_model_cmd_view_set_reset():
         asyncio.run(tasks.handle_model(room, "/model"))
         assert "old-model" in c.sent[-1]["body"]
         claude_runner.runner._sessions.pop(skey, None)
-        # ⑦ reset 清掉覆盖
+        # ⑦ reset 清掉覆盖（default/clear 同义）
         asyncio.run(tasks.handle_model(room, "/model reset"))
         assert rid not in state._room_model
-        # ⑧ 中文入口：「模型 <名字>」设置、「模型 默认」恢复
-        asyncio.run(tasks.handle_model(room, "模型 sonnet"))
+        asyncio.run(tasks.handle_model(room, "/model sonnet"))
         assert state._room_model.get(rid) == "sonnet"
-        asyncio.run(tasks.handle_model(room, "模型 默认"))
+        asyncio.run(tasks.handle_model(room, "/model default"))
         assert rid not in state._room_model
     finally:
         projects_mod.projects.get_room = orig_get
@@ -155,7 +135,6 @@ def test_room_model_persistence():
 
 
 TESTS = [
-    ('/model 命令识别·中文严进不吞聊天', test_model_cmd_recognition),
     ('/model 查看/设置/恢复默认/漂移提示', test_model_cmd_view_set_reset),
     ('房间模型随派活透传 runner.ask', test_room_model_passed_to_ask),
     ('--model 只在新会话带·会话记录生效模型', test_runner_model_override_cmdline_and_session_record),

@@ -31,58 +31,36 @@ import gitea_health
 log = logging.getLogger("matrix-claude.tasks")
 
 
-RESET_CMDS = {"/reset", "/new", "重置", "新对话", "清空"}
+RESET_CMDS = {"/reset", "/new"}
 
 
 
-HELP_CMDS = {"/help", "/?", "帮助", "用法"}
+HELP_CMDS = {"/help", "/?"}
 
 
 
-SUMMARY_CMDS = {"/summarize", "/catchup", "总结", "回顾", "小结"}   # 也认 "/summarize N" 前缀
+SUMMARY_CMDS = {"/summarize", "/catchup"}   # 也认 "/summarize N" 前缀
 
 
 
-CANCEL_CMDS = {"/cancel", "/stop", "停止", "取消", "停"}            # 也认 "/cancel"/"/stop" 前缀
+CANCEL_CMDS = {"/cancel", "/stop"}          # 也认 "/cancel"/"/stop" 前缀
 
 
 
-STATUS_CMDS = {"/status", "状态"}                                   # 也认 "/status" 前缀
+STATUS_CMDS = {"/status"}                   # 也认 "/status" 前缀
 
 
 
-UNBIND_CMDS = {"/unbind", "解绑", "取消绑定"}                        # 解除本房间/私聊的仓库绑定
+UNBIND_CMDS = {"/unbind"}                   # 解除本房间/私聊的仓库绑定
 
 
 
-MODEL_CMDS = {"/model", "模型", "当前模型"}      # 查看/设置本房间用的模型；也认 "/model <名字>" 前缀
-
+# /model：查看/设置本房间用的模型，按 "/model" 前缀路由（见 bot.py）。
 # 模型名的合法形态（opus / fable / claude-opus-4-8 这类）：字母数字开头，之后允许 . _ : -。
-# 中文入口「模型 xxx」靠它把普通聊天（"模型 这个词是啥意思"）挡在命令外，别误吞。
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 # 恢复默认（清掉本房间覆盖）的关键词
-_MODEL_RESET_WORDS = {"reset", "clear", "default", "默认", "恢复默认", "清除"}
-
-
-def _is_model_cmd(stripped: str) -> bool:
-    """这条消息是不是 /model 元命令。"/model" 按前缀认（同 /status 等）；中文「模型」裸词只认
-    精确匹配，「模型 <参数>」要求参数像模型名/恢复默认关键词——群里元命令不必 @ 也认，
-    宽了会把"模型 是什么"这类普通聊天吞成命令。"""
-    if stripped.lower().startswith("/model"):
-        return True
-    if stripped in MODEL_CMDS:
-        return True
-    head, _, rest = stripped.partition(" ")
-    rest = rest.strip()
-    if head in ("模型", "当前模型") and rest:
-        return bool(_MODEL_NAME_RE.match(rest)) or rest.lower() in _MODEL_RESET_WORDS
-    return False
-
-
-
-NEW_PROJECT_CMDS = {"新建项目", "新建仓库"}   # 按前缀匹配（见 bot.py），"新建项目 foo" 也认；
-                                            # 也认 "/new-project"/"/newproject" 前缀
+_MODEL_RESET_WORDS = {"reset", "clear", "default"}
 
 
 
@@ -97,8 +75,8 @@ _HELP_TEXT = (
     "• 也可以不进 Matrix：在 Gitea 上把 issue **指派给我**，我会接单、开 PR（合并自动关单）并回报进展\n"
     "• 长任务我会边干边把进度更新到同一条消息；要文件我用附件发回来\n\n"
     "**命令**（群里不必 @ 也认）\n"
-    "• `帮助` / `用法` 看这个——注意 `/help` 会被 Matrix 客户端当自带命令吞掉，发不到我这，\n"
-    "  想发斜杠命令用中文词、或 `//help`（双斜杠发字面文本）、或 @我 带上命令\n"
+    "• `/help` 看这个——注意 `/help` 可能被 Matrix 客户端当自带命令吞掉，发不到我这，\n"
+    "  这时用 `//help`（双斜杠发字面文本）、或 @我 带上命令\n"
     "• `/bind <URL>` 把本群 / 本私聊定到某仓库（私聊也能绑）；`/unbind` 解绑\n"
     "• `/new-project <仓库名>` 不想先手动建仓库？我在 Gitea 上新建一个（默认公开）再自动绑定本房间\n"
     "• `/status` 看我当前状态（项目 / 正在跑的任务 / 在跟的 PR）\n"
@@ -115,8 +93,8 @@ _HELP_TEXT = (
 _WELCOME = (
     "👋 我是 Claude Code 工程师 bot。@我（群里）或直接私聊就能派活：写代码、查问题、做方案，"
     "改代码会自动开 PR；闲聊、问一般问题也行。要派仓库的活，先发个 Gitea 仓库地址或 "
-    "`/bind <URL>` 绑定（群和私聊都行）。发 `帮助` 看完整用法"
-    "（`/help` 会被 Matrix 客户端自己吞掉，用中文词 `帮助`）。"
+    "`/bind <URL>` 绑定（群和私聊都行）。发 `/help` 看完整用法"
+    "（若被 Matrix 客户端当自带命令吞掉，用 `//help` 双斜杠发字面文本）。"
 )
 
 
