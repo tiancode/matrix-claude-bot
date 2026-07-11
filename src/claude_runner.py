@@ -158,7 +158,8 @@ class _Persist:
     def __init__(self, key: str, proc):
         self.key = key
         self.proc = proc
-        self.reader = None        # stdout 读取任务的强引用（asyncio 只弱引用 task，不存会被 GC 掐死）
+        self.reader = None        # stdout 读取任务的显式保活引用（asyncio 只弱引用 task；实际它还被
+                                  # subprocess transport 链锚着，这里是双保险——写而不读但不是死属性，别清）
         self.turn = None          # 活动回合状态 dict；None=回合外
         self.on_notify = None     # async fn(text)：回合外自发产出的投递回调（每轮 ask 可刷新）
         self.sid = None           # 事件流里报的 session_id（进程死后靠它 --resume 续命）
