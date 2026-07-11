@@ -118,7 +118,7 @@ def test_try_steer_injects_only_mid_turn():
         async def drain(self):
             pass
 
-    ps = cr._Persist("k|r", _types.SimpleNamespace(returncode=None, stdin=FS()), "/tmp")
+    ps = cr._Persist("k|r", _types.SimpleNamespace(returncode=None, stdin=FS()))
     r._persist["k|r"] = ps
     orig = settings.claude_persistent
     settings.claude_persistent = True
