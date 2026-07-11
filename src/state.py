@@ -124,12 +124,22 @@ def _drop_context_event(rid: str, event_id: str) -> bool:
     dq = _context.get(rid)
     if not dq:
         return False
-    for i in range(len(dq) - 1, -1, -1):   # 从近往远：同人重复发同一句时删最近那条
+    i = _rfind_ctx(dq, sender, body)
+    if i < 0:
+        return False
+    del dq[i]
+    return True
+
+
+def _rfind_ctx(dq, sender: str, body: str, dispatched: bool | None = None) -> int:
+    """从右往左（就近优先：同人重复发同一句时取最近那条）找匹配 (sender, body) 的背景条目下标；
+    dispatched 非 None 时还要求 dispatched 标记等于该值。找不到返回 -1。"""
+    for i in range(len(dq) - 1, -1, -1):
         it = dq[i]
-        if it[1] == sender and it[2] == body:
-            del dq[i]
-            return True
-    return False
+        if (it[1] == sender and it[2] == body
+                and (dispatched is None or _ctx_dispatched(it) == dispatched)):
+            return i
+    return -1
 
 
 def _unmark_dispatched(rid: str, sender: str, body: str) -> None:
@@ -138,11 +148,10 @@ def _unmark_dispatched(rid: str, sender: str, body: str) -> None:
     dq = _context.get(rid)
     if not dq:
         return
-    for i in range(len(dq) - 1, -1, -1):
+    i = _rfind_ctx(dq, sender, body, dispatched=True)
+    if i >= 0:
         it = dq[i]
-        if it[1] == sender and it[2] == body and _ctx_dispatched(it):
-            dq[i] = (it[0], sender, body, _ctx_thread(it))
-            return
+        dq[i] = (it[0], sender, body, _ctx_thread(it))
 
 
 def _ctx_thread(item) -> str | None:
@@ -162,11 +171,10 @@ def _mark_dispatched(rid: str, sender: str, body: str) -> None:
     dq = _context.get(rid)
     if not dq:
         return
-    for i in range(len(dq) - 1, -1, -1):
+    i = _rfind_ctx(dq, sender, body)
+    if i >= 0:
         it = dq[i]
-        if it[1] == sender and it[2] == body:
-            dq[i] = (it[0], sender, body, _ctx_thread(it), True)   # 保留 ts/线程，只把第 5 元置真
-            return
+        dq[i] = (it[0], sender, body, _ctx_thread(it), True)   # 保留 ts/线程，只把第 5 元置真
 
 
 def _clear_dispatched(rid: str) -> None:
@@ -196,45 +204,40 @@ def _sess_key(rec: dict, rid: str, thread: str | None = None) -> str:
     return f"{base}|{thread}" if thread else base
 
 
-def _last_proj_file() -> str:
-    return os.path.join(settings.store_path, "last_projects.json")
+def _load_str_map(filename: str, dst: dict, drop_empty: bool = False) -> None:
+    """从 store 里的 JSON 文件恢复一个 str->str 映射到 dst（原地 update，别重绑对象）。
+    文件缺失/损坏静默跳过（首启没有很正常）；只收字符串值，drop_empty=True 时空串也不要。"""
+    try:
+        with open(os.path.join(settings.store_path, filename)) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict):
+        dst.update({k: v for k, v in data.items()
+                    if isinstance(v, str) and (v or not drop_empty)})
+
+
+def _save_str_map(filename: str, src: dict) -> None:
+    """把一个映射原子落盘到 store 里的 JSON 文件；写失败静默（下次改动再试）。"""
+    try:
+        atomic_write_json(os.path.join(settings.store_path, filename), src)
+    except OSError:
+        pass
 
 
 def _load_last_projects() -> None:
     """恢复各房间最近一次路由到的项目，让重启后 DM 的 /reset 与多轮延续仍能定位会话。"""
-    try:
-        with open(_last_proj_file()) as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return
-    if isinstance(data, dict):
-        _last_project_by_room.update({k: v for k, v in data.items() if isinstance(v, str)})
+    _load_str_map("last_projects.json", _last_project_by_room)
 
 
 def _save_last_projects() -> None:
-    try:
-        atomic_write_json(_last_proj_file(), _last_project_by_room)
-    except OSError:
-        pass
-
-
-def _room_models_file() -> str:
-    return os.path.join(settings.store_path, "room_models.json")
+    _save_str_map("last_projects.json", _last_project_by_room)
 
 
 def _load_room_models() -> None:
     """恢复各房间通过 /model 设置的模型（房间属性，随重启保留；解绑仓库不清、退房才清）。"""
-    try:
-        with open(_room_models_file()) as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return
-    if isinstance(data, dict):
-        _room_model.update({k: v for k, v in data.items() if isinstance(v, str) and v})
+    _load_str_map("room_models.json", _room_model, drop_empty=True)
 
 
 def _save_room_models() -> None:
-    try:
-        atomic_write_json(_room_models_file(), _room_model)
-    except OSError:
-        pass
+    _save_str_map("room_models.json", _room_model)

@@ -161,6 +161,33 @@ async def _debounced_dispatch(key: tuple) -> None:
                       mention_note="", ack_eid=ack_eid)
 
 
+# 元命令路由表（群里不必 @ 也认，与 /reset 同类；各命令走快路径，不进任务分诊）。
+# 一行 = (小写前缀集, 小写精确匹配集, 处理协程工厂 (room, event, 原文 stripped) -> coro)。
+# on_message 按序匹配、命中即 spawn——新增元命令加一行即可，别再往 if 链里插分支。
+# /bind 不在表里：它带「没给可解析仓库地址才提示用法」的附加条件，单独判（见 on_message）。
+_META_ROUTES: tuple = (
+    # /backfill [天数]：从 Matrix 回灌本房间历史
+    (("/backfill",), frozenset(),
+     lambda room, event, s: _backfill_cmd(room, s)),
+    ((), HELP_CMDS,
+     lambda room, event, s: send(room.room_id, _HELP_TEXT)),
+    (("/summarize", "/catchup"), SUMMARY_CMDS,
+     lambda room, event, s: handle_summarize(room, event, s)),
+    (("/cancel", "/stop"), CANCEL_CMDS,
+     lambda room, event, s: handle_cancel(room)),
+    (("/status",), STATUS_CMDS,
+     lambda room, event, s: handle_status(room)),
+    # 查看/设置本房间用的模型
+    (("/model",), frozenset(),
+     lambda room, event, s: handle_model(room, s)),
+    # 解绑（群 / 私聊通用）
+    ((), UNBIND_CMDS,
+     lambda room, event, s: handle_unbind(room)),
+    (("/new-project", "/newproject"), frozenset(),
+     lambda room, event, s: handle_new_project(room, event, s)),
+)
+
+
 async def on_message(room: MatrixRoom, event: RoomMessageText):
     if not settings.process_backlog and not state._synced:  # 跳过历史/离线积压
         return
@@ -203,33 +230,13 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
         state._known_bot_names.setdefault(room.room_id, set()).add(sender_name)
         return
 
-    # 元命令：群里不必 @ 也认（与 /reset 同类）。help/summarize/cancel 走各自快路径，不进任务分诊。
+    # 元命令：按路由表匹配（表和逐条说明见 _META_ROUTES），命中即走快路径，不进任务分诊。
     stripped = body.strip()
     low = stripped.lower()
-    if low.startswith("/backfill"):       # 从 Matrix 回灌本房间历史
-        state._spawn(_backfill_cmd(room, stripped))
-        return
-    if low in HELP_CMDS:
-        state._spawn(send(room.room_id, _HELP_TEXT))
-        return
-    if low.startswith("/summarize") or low.startswith("/catchup") or stripped in SUMMARY_CMDS:
-        state._spawn(handle_summarize(room, event, stripped))
-        return
-    if low.startswith("/cancel") or low.startswith("/stop") or stripped in CANCEL_CMDS:
-        state._spawn(handle_cancel(room))
-        return
-    if low.startswith("/status") or stripped in STATUS_CMDS:
-        state._spawn(handle_status(room))
-        return
-    if low.startswith("/model"):   # 查看/设置本房间用的模型
-        state._spawn(handle_model(room, stripped))
-        return
-    if low in UNBIND_CMDS:                 # 解绑（群 / 私聊通用）
-        state._spawn(handle_unbind(room))
-        return
-    if low.startswith("/new-project") or low.startswith("/newproject"):
-        state._spawn(handle_new_project(room, event, stripped))
-        return
+    for prefixes, exact, factory in _META_ROUTES:
+        if low in exact or (prefixes and low.startswith(prefixes)):
+            state._spawn(factory(room, event, stripped))
+            return
     # /bind 但没带可解析的仓库地址：无论群 / 私聊都提示怎么用（私聊过去直接拒绝，现在也支持绑定了）
     if low.startswith("/bind") and not parse_repo_url(body):
         state._spawn(send(room.room_id,

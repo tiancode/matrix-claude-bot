@@ -43,6 +43,15 @@ _PROGRESS_TAIL_CHARS = 6000   # on_delta 展示进度时保留的尾部字符数
 
 
 
+def _resolve_reply(reply_to) -> str | None:
+    """reply_to 参数的统一收口：既可以是 event_id/None，也可以是零参可调用（发送那一刻才求值——
+    "要不要引用回复"取决于那时群里是否已插进别的消息）。求值失败按 None（顶层直答）。"""
+    try:
+        return reply_to() if callable(reply_to) else reply_to
+    except Exception:
+        return None
+
+
 def _thread_of(event) -> str | None:
     """这条消息若已在某线程(m.thread)里，返回该线程根；顶层消息返回 None。
     bot 不再为顶层消息强开新线程（记忆按房间拍平，视觉也不 fork），只跟进用户自己开的线程。"""
@@ -255,10 +264,7 @@ class _LiveReply:
         self.shown = ""
 
     def _reply_eid(self) -> str | None:
-        try:
-            return self.reply_to() if callable(self.reply_to) else self.reply_to
-        except Exception:
-            return None
+        return _resolve_reply(self.reply_to)
 
     async def _ensure(self, initial: str) -> None:
         if self.eid is not None:
