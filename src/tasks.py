@@ -13,7 +13,8 @@ from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
                    _last_project_by_room, _save_last_projects, _project_last_active,
                    _room_model, _save_room_models)
 from matrix_io import (send, _typing, _is_dm, _LiveReply, _emit_files, _redact,
-                       _thread_of, _thread_root_of, _ack, _react, _FILE_SEND_HINT)
+                       _thread_of, _thread_root_of, _ack, _react, _resolve_reply,
+                       _FILE_SEND_HINT)
 from fmt import _format_context, _safe_name, _human_gap
 from addressing import _strip_reply_fallback
 from dispatch import _dispatch, _general_rec
@@ -326,10 +327,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
     inflight_key = inflight.record(rid, text, inflight.KIND_CHAT)
 
     def _reply_eid():   # 发送那一刻求值；未启用引用回复（DM/线程内）时恒 None
-        try:
-            return reply_to() if callable(reply_to) else reply_to
-        except Exception:
-            return None
+        return _resolve_reply(reply_to)
 
     async def _bg_notify(bg_text: str):
         # 常驻进程模式：回合结束后后台任务（子代理/后台命令）完成，Claude 续跑的产出从这里
@@ -379,6 +377,12 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                 _unmark_dispatched(rid, s_, b_)
             if silent:
                 await _redact(rid, queued_eid["v"])
+        # 两条投递路径（流式占位 / 整条直发）用完全相同的参数派活，只差 on_delta——
+        # 公共 kwargs 收拢在一处，别让两个调用点各自漂移。
+        ask_kwargs = dict(cwd=cwd, system_prompt=sp, lock_key=lock_key, prepare=prepare,
+                          cancel_key=rid, on_reset=lambda: _clear_dispatched(rid),
+                          on_notify=_bg_notify, steerable=True, on_queued=_on_queued,
+                          trigger_eid=trigger_eid, **fork_kw)
         if settings.stream_replies:                      # 流式：边生成边编辑同一条占位消息
             live = _LiveReply(rid, thread_root=thread_root, reply_to=reply_to)
             _attached = {"v": False}
@@ -389,12 +393,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
                     inflight.attach_eid(inflight_key, live.eid)
                     _attached["v"] = True
             try:
-                answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
-                                          lock_key=lock_key, prepare=prepare,
-                                          on_delta=_relay, cancel_key=rid,
-                                          on_reset=lambda: _clear_dispatched(rid),
-                                          on_notify=_bg_notify, steerable=True,
-                                          on_queued=_on_queued, trigger_eid=trigger_eid, **fork_kw)
+                answer = await runner.ask(sess, prompt, on_delta=_relay, **ask_kwargs)
             except ClaudeCancelled as e:
                 silent = getattr(e, "silent", False)
                 await _cancelled_cleanup(silent)   # 静默撤单时连「⏳ 已排队」回执一并撤掉
@@ -416,11 +415,7 @@ async def _run_on_project(room: MatrixRoom, event: RoomMessageText, text: str, r
             await live.finalize(answer, track=True)
         else:
             try:
-                answer = await runner.ask(sess, prompt, cwd=cwd, system_prompt=sp,
-                                          lock_key=lock_key, prepare=prepare, cancel_key=rid,
-                                          on_reset=lambda: _clear_dispatched(rid),
-                                          on_notify=_bg_notify, steerable=True,
-                                          on_queued=_on_queued, trigger_eid=trigger_eid, **fork_kw)
+                answer = await runner.ask(sess, prompt, **ask_kwargs)
             except ClaudeCancelled as e:
                 silent = getattr(e, "silent", False)
                 await _cancelled_cleanup(silent)   # 静默撤单时连「⏳ 已排队」回执一并撤掉
@@ -599,7 +594,7 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
             if not getattr(e, "silent", False):
                 try:
                     await send(rid, "🛑 已停止。", thread_root=thr,
-                               reply_to=reply_to() if callable(reply_to) else None)
+                               reply_to=_resolve_reply(reply_to))
                 except Exception:
                     pass
         except Exception as e:
@@ -612,7 +607,7 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                 except Exception:
                     sess = None
                 await send(rid, _friendly_err(e, sess_key=sess), thread_root=thr,
-                           reply_to=reply_to() if callable(reply_to) else None)
+                           reply_to=_resolve_reply(reply_to))
             except Exception:
                 pass
 

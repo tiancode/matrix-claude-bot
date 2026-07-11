@@ -69,6 +69,11 @@ class _CancelToken:
         self.event_id = event_id
         self.silent = False
 
+    def raise_if_cancelled(self) -> None:
+        """已被取消就抛 ClaudeCancelled（带上 silent 标记）。ask/退避等待的各检查点统一走这里。"""
+        if self.cancelled:
+            raise ClaudeCancelled(silent=self.silent)
+
 
 # quick() 处理不可信外来内容，给子进程剔除这些密钥（它用不到）。agentic 的 ask() 仍需 GITEA_TOKEN。
 _QUICK_STRIP_ENV = ("GITEA_TOKEN", "MATRIX_PASSWORD")
@@ -78,6 +83,40 @@ _QUICK_STRIP_ENV = ("GITEA_TOKEN", "MATRIX_PASSWORD")
 # 还「需要鉴权」根本用不了），直接把 60s 的 quick 超时撑爆。用空 --mcp-config + --strict-mcp-config 关掉
 # 所有 MCP，冷启动从 ~75s 降到 ~5s。agentic 的 ask() 不加：那是真干活的路径，留着 MCP 的可能性。
 _NO_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+
+
+def _join_para(acc: str, text: str) -> str:
+    """把新一段 assistant 文本接到已累计文本后（段落间空行）。"""
+    return acc + (("\n\n" if acc else "") + text)
+
+
+class _NdjsonFeed:
+    """stream-json(NDJSON) 输出的增量解析器：feed() 喂入原始字节块，产出解析好的事件 dict。
+
+    自己按 \\n 切行（不用 StreamReader.readline，避免 tool_result 里的大块输出撑爆行缓冲）；
+    空行、解析不了的行直接跳过；单行超 32MB 视为失控，整个缓冲丢弃防吃内存。
+    _run_stream 与 _persist_reader 共用——两处读循环的行为必须一致，别各自漂移。"""
+    __slots__ = ("buf",)
+    _MAX_BUF = 32 * 1024 * 1024
+
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, chunk: bytes):
+        self.buf.extend(chunk)
+        while True:
+            nl = self.buf.find(b"\n")
+            if nl < 0:
+                break
+            line = bytes(self.buf[:nl]); del self.buf[:nl + 1]
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line.decode(errors="ignore"))
+            except json.JSONDecodeError:
+                continue
+        if len(self.buf) > self._MAX_BUF:   # 防单行失控吃内存
+            del self.buf[:]
 
 
 def _user_msg(text: str) -> bytes:
@@ -387,7 +426,7 @@ class ClaudeRunner:
                     pass
 
             async def _read_stdout():
-                buf = bytearray()
+                feed = _NdjsonFeed()
                 while True:
                     # eff 是【空闲】超时而非整体墙钟：只要还在持续产出（token / 工具事件）就一直读，
                     # 仅当 eff 秒内一个字节都没来（真卡死）才超时。整体跑多久不设限——长任务
@@ -395,24 +434,11 @@ class ClaudeRunner:
                     chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=eff)
                     if not chunk:
                         break
-                    buf.extend(chunk)
-                    while True:
-                        nl = buf.find(b"\n")
-                        if nl < 0:
-                            break
-                        line = bytes(buf[:nl]); del buf[:nl + 1]
-                        if not line.strip():
-                            continue
-                        try:
-                            obj = json.loads(line.decode(errors="ignore"))
-                        except json.JSONDecodeError:
-                            continue
+                    for obj in feed.feed(chunk):
                         try:
                             await on_line(obj)
                         except Exception:
                             log.exception("流式 on_line 回调异常（忽略，继续读）")
-                    if len(buf) > 32 * 1024 * 1024:   # 防单行失控吃内存
-                        del buf[:]
                 # stdout 已 EOF，进程应即将退出；给个上限别在僵死进程上无限等
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=30)
@@ -439,31 +465,54 @@ class ClaudeRunner:
                     pass
         return proc.returncode, bytes(err_buf)
 
-    # ---- 常驻进程模式（CLAUDE_PERSISTENT）：进程跨轮次保活，后台任务不随回合死 ----
-    def _cmd_persistent(self, sid: str | None, system_prompt: str | None,
-                        fork: bool, model: str | None = None) -> list[str]:
-        """常驻 agentic 进程的命令行：无位置 prompt（消息走 stdin NDJSON），其余同 _cmd(agentic)。
-        model：调用方解析好的模型覆盖（如 /model 给房间设的），None=跟随 CLAUDE_MODEL。"""
-        cmd = [settings.claude_bin, "-p",
-               "--input-format", "stream-json",
-               "--output-format", "stream-json", "--verbose"]
-        eff_model = model if model is not None else settings.claude_model
-        if eff_model and not sid:   # 只在开新会话时传（同 _cmd，理由见彼处）
-            cmd += ["--model", eff_model]
-        if settings.claude_dangerous:
-            cmd += ["--dangerously-skip-permissions"]
-        elif settings.claude_permission_mode:
-            cmd += ["--permission-mode", settings.claude_permission_mode]
+    # ---- 命令行拼装：一次性(_cmd) / 常驻(_cmd_persistent) / 只读(_cmd_ro) 共用下面两个尾部 ----
+    @staticmethod
+    def _session_flags(sid: str | None, system_prompt: str | None, fork: bool) -> list[str]:
+        """系统提示与会话续接的公共尾部。系统提示只在开新会话时设一次（--resume 时会话里已有）；
+        fork=从 sid 分叉出新会话（继承历史、各走各的），而不是续写原会话。"""
+        cmd = []
         sp = system_prompt if system_prompt is not None else settings.claude_system_prompt
-        if sp and not sid:   # 系统提示只在开新会话时设一次（同 _cmd）
+        if sp and not sid:
             cmd += ["--append-system-prompt", sp]
         if sid:
             cmd += ["--resume", sid]
             if fork:
                 cmd += ["--fork-session"]
+        return cmd
+
+    def _agentic_flags(self, sid: str | None, system_prompt: str | None,
+                       fork: bool, model: str | None) -> list[str]:
+        """agentic 命令行的公共尾部（_cmd 与 _cmd_persistent 共用）：模型、权限、系统提示、
+        会话续接、额外参数。model=调用方解析好的模型覆盖（如 /model 给房间设的），
+        None=跟随 CLAUDE_MODEL。
+
+        --model 只在开新会话时传（同 --append-system-prompt）：--resume 时再带 --model 会把恢复出的
+        会话【连同被恢复的子代理】整体强制成该模型，覆盖掉子代理各自的模型路由——被中断的
+        opus 子代理续跑时会被打回主模型，烧错额度。不传则会话沿用中断前各自记录的模型。
+        代价：改 CLAUDE_MODEL 对续接中的会话不生效——空闲 TTL 每轮都被刷新（见 ask 的写回），
+        活跃房间的会话不会自行过期，要对【房间】/reset 才切换（线程会话从房间会话分叉，线程内
+        /reset 后仍会从房间会话重新 fork 出旧模型）。/status 会拿记录的会话模型对比配置来提示。"""
+        cmd = []
+        eff_model = model if model is not None else settings.claude_model
+        if eff_model and not sid:
+            cmd += ["--model", eff_model]
+        if settings.claude_dangerous:
+            cmd += ["--dangerously-skip-permissions"]
+        elif settings.claude_permission_mode:
+            cmd += ["--permission-mode", settings.claude_permission_mode]
+        cmd += self._session_flags(sid, system_prompt, fork)
         if settings.claude_extra_args:
             cmd += shlex.split(settings.claude_extra_args)
         return cmd
+
+    # ---- 常驻进程模式（CLAUDE_PERSISTENT）：进程跨轮次保活，后台任务不随回合死 ----
+    def _cmd_persistent(self, sid: str | None, system_prompt: str | None,
+                        fork: bool, model: str | None = None) -> list[str]:
+        """常驻 agentic 进程的命令行：无位置 prompt（消息走 stdin NDJSON），其余同 _cmd(agentic)。"""
+        return [settings.claude_bin, "-p",
+                "--input-format", "stream-json",
+                "--output-format", "stream-json", "--verbose"] \
+            + self._agentic_flags(sid, system_prompt, fork, model)
 
     async def _persist_spawn(self, key: str, sid: str | None, fork: bool,
                              system_prompt: str | None, cwd: str | None,
@@ -504,31 +553,18 @@ class ClaudeRunner:
         """常驻进程的 stdout 读取循环（进程同寿命）。回合内事件喂给活动回合；回合外的
         自发产出（后台任务完成后 CLI 自动续跑）经 on_notify 投递。进程一死就收尾摘除。"""
         proc = ps.proc
-        buf = bytearray()
+        feed = _NdjsonFeed()
         try:
             while True:
                 chunk = await proc.stdout.read(65536)
                 if not chunk:
                     break
                 ps.last_activity = time.time()
-                buf.extend(chunk)
-                while True:
-                    nl = buf.find(b"\n")
-                    if nl < 0:
-                        break
-                    line = bytes(buf[:nl]); del buf[:nl + 1]
-                    if not line.strip():
-                        continue
-                    try:
-                        obj = json.loads(line.decode(errors="ignore"))
-                    except json.JSONDecodeError:
-                        continue
+                for obj in feed.feed(chunk):
                     try:
                         await self._persist_event(ps, obj)
                     except Exception:
                         log.exception("常驻进程事件处理异常（忽略，继续读）")
-                if len(buf) > 32 * 1024 * 1024:   # 防单行失控吃内存
-                    del buf[:]
         finally:
             try:
                 await proc.wait()
@@ -540,6 +576,32 @@ class ClaudeRunner:
             if t and not t["fut"].done():   # 回合进行中进程死了（被杀/崩溃/resume 失败秒退）
                 t["fut"].set_exception(RuntimeError("claude 常驻进程退出"))
 
+    @staticmethod
+    async def _apply_stream_event(st: dict, obj: dict, on_delta) -> bool:
+        """把一条 stream-json 事件套用到回合状态 st 上，返回"回合是否结束"（result 事件）。
+        st 用到的键：text(assistant 文本累计) / result / is_err / tool(是否已有工具落地)。
+        assistant 增量经 on_delta(文本, 工具名或None) 边跑边回报（None 则只累计不回报）。
+        常驻进程的回合内事件（_persist_event）与一次性流式（ask._once._on_line）共用——
+        两条路径对同一事件流的解读必须一致，别各自漂移。"""
+        t = obj.get("type")
+        if t == "assistant":
+            for blk in (obj.get("message") or {}).get("content") or []:
+                if blk.get("type") == "text" and blk.get("text"):
+                    st["text"] = _join_para(st["text"], blk["text"])
+                    if on_delta:
+                        await on_delta(st["text"], None)
+                elif blk.get("type") == "tool_use":
+                    st["tool"] = True   # 已有工具落地（可能含 push 等副作用）：重试决策要知道
+                    if on_delta:
+                        await on_delta(st["text"], blk.get("name"))
+            return False
+        if t == "result":
+            if isinstance(obj.get("result"), str):
+                st["result"] = obj["result"]
+            st["is_err"] = bool(obj.get("is_error"))
+            return True
+        return False
+
     async def _persist_event(self, ps: _Persist, obj: dict):
         if obj.get("session_id"):
             ps.sid = obj["session_id"]
@@ -547,18 +609,7 @@ class ClaudeRunner:
         turn = ps.turn
         if turn is not None:                     # 回合内：行为等同 _run_stream 的 _on_line
             turn["last_io"] = time.time()
-            if t == "assistant":
-                for blk in (obj.get("message") or {}).get("content") or []:
-                    if blk.get("type") == "text" and blk.get("text"):
-                        turn["text"] += (("\n\n" if turn["text"] else "") + blk["text"])
-                        if turn["on_delta"]:
-                            await turn["on_delta"](turn["text"], None)
-                    elif blk.get("type") == "tool_use" and turn["on_delta"]:
-                        await turn["on_delta"](turn["text"], blk.get("name"))
-            elif t == "result":
-                if isinstance(obj.get("result"), str):
-                    turn["result"] = obj["result"]
-                turn["is_err"] = bool(obj.get("is_error"))
+            if await self._apply_stream_event(turn, obj, turn["on_delta"]):
                 if not turn["fut"].done():
                     turn["fut"].set_result(None)
             return
@@ -566,7 +617,7 @@ class ClaudeRunner:
         if t == "assistant":
             for blk in (obj.get("message") or {}).get("content") or []:
                 if blk.get("type") == "text" and blk.get("text"):
-                    ps.spont_text += (("\n\n" if ps.spont_text else "") + blk["text"])
+                    ps.spont_text = _join_para(ps.spont_text, blk["text"])
         elif t == "result":
             text = obj["result"] if isinstance(obj.get("result"), str) else ps.spont_text
             ps.spont_text = ""
@@ -682,35 +733,14 @@ class ClaudeRunner:
         cmd = [settings.claude_bin, "-p", prompt]
         cmd += (["--output-format", "stream-json", "--verbose"] if stream
                 else ["--output-format", "json"])
-        # 干活用 model 参数（调用方解析好的房间 /model 覆盖）或 CLAUDE_MODEL；
-        # 轻判断（非 agentic 的 quick）优先 CLAUDE_QUICK_MODEL（小模型省钱提速）。
-        # 只在开新会话时传（同 --append-system-prompt）：--resume 时再带 --model 会把恢复出的
-        # 会话【连同被恢复的子代理】整体强制成该模型，覆盖掉子代理各自的模型路由——被中断的
-        # opus 子代理续跑时会被打回主模型，烧错额度。不传则会话沿用中断前各自记录的模型。
-        # 代价：改 CLAUDE_MODEL 对续接中的会话不生效——空闲 TTL 每轮都被刷新（见 ask 的写回），
-        # 活跃房间的会话不会自行过期，要对【房间】/reset 才切换（线程会话从房间会话分叉，线程内
-        # /reset 后仍会从房间会话重新 fork 出旧模型）。/status 会拿记录的会话模型对比配置来提示。
-        eff_model = ((model if model is not None else settings.claude_model) if agentic
-                     else (settings.claude_quick_model or settings.claude_model))
+        if agentic:   # 干活：模型/权限/额外参数的语义见 _agentic_flags
+            return cmd + self._agentic_flags(sid, system_prompt, fork, model)
+        # 轻判断（quick）：优先 CLAUDE_QUICK_MODEL（小模型省钱提速）、无危险权限/额外参数，
+        # 且不碰 MCP（省掉远端 server 的启动/健康检查延迟）。--model 同样只在开新会话时传。
+        eff_model = settings.claude_quick_model or settings.claude_model
         if eff_model and not sid:
             cmd += ["--model", eff_model]
-        if agentic:
-            if settings.claude_dangerous:
-                cmd += ["--dangerously-skip-permissions"]
-            elif settings.claude_permission_mode:
-                cmd += ["--permission-mode", settings.claude_permission_mode]
-        else:
-            cmd += _NO_MCP   # 轻判断不碰 MCP，省掉远端 server 的启动/健康检查延迟
-        sp = system_prompt if system_prompt is not None else settings.claude_system_prompt
-        if sp and not sid:  # 系统提示只在开新会话时设一次
-            cmd += ["--append-system-prompt", sp]
-        if sid:
-            cmd += ["--resume", sid]
-            if fork:   # 从 sid 分叉出新会话（继承历史、各走各的），而不是续写原会话
-                cmd += ["--fork-session"]
-        if agentic and settings.claude_extra_args:
-            cmd += shlex.split(settings.claude_extra_args)
-        return cmd
+        return cmd + _NO_MCP + self._session_flags(sid, system_prompt, fork)
 
     @staticmethod
     async def _transient_wait(attempt: int, token: "_CancelToken | None", what: str) -> None:
@@ -721,13 +751,13 @@ class ClaudeRunner:
         log.warning("上游瞬时故障，%.0fs 后自动重试（第 %d 次）：%s", delay, attempt + 1, what[:200])
         end = time.monotonic() + delay
         while time.monotonic() < end:
-            if token is not None and token.cancelled:
-                raise ClaudeCancelled(silent=bool(token and token.silent))
+            if token is not None:
+                token.raise_if_cancelled()
             await asyncio.sleep(min(0.5, max(0.0, end - time.monotonic())))
         # 落在最后一个睡片里的 /cancel 会躲过循环顶部的检查：这里必须再验一次，
         # 否则 continue 会起新子进程把整个回合跑完（cancel 已执行过，杀不到后起的进程）。
-        if token is not None and token.cancelled:
-            raise ClaudeCancelled(silent=bool(token and token.silent))
+        if token is not None:
+            token.raise_if_cancelled()
 
     @staticmethod
     def _looks_like_session_error(out: bytes, err: bytes) -> bool:
@@ -833,19 +863,7 @@ class ClaudeRunner:
             async def _on_line(obj):
                 if obj.get("session_id"):
                     st["sid"] = obj["session_id"]
-                t = obj.get("type")
-                if t == "assistant":
-                    for blk in (obj.get("message") or {}).get("content") or []:
-                        if blk.get("type") == "text" and blk.get("text"):
-                            st["text"] += (("\n\n" if st["text"] else "") + blk["text"])
-                            await on_delta(st["text"], None)
-                        elif blk.get("type") == "tool_use":
-                            st["tool"] = True   # 已有工具落地（可能含 push 等副作用）：重试决策要知道
-                            await on_delta(st["text"], blk.get("name"))
-                elif t == "result":
-                    if isinstance(obj.get("result"), str):
-                        st["result"] = obj["result"]
-                    st["is_err"] = bool(obj.get("is_error"))
+                await self._apply_stream_event(st, obj, on_delta)
             rc, err = await self._run_stream(
                 self._cmd(p, sid, True, system_prompt, stream=True, fork=fork, model=model),
                 cwd, _reg, _on_line)
@@ -866,8 +884,7 @@ class ClaudeRunner:
                 # 拿到锁后、起子进程前先验一次：排队等锁期间若被 /cancel，这里即刻了断，
                 # 连 prepare（git fetch 可数十秒）和子进程都不再起——正是"派 A 又派 B、B 排队时 /cancel"
                 # 那条 B 该走的路：不能等它默默开跑。
-                if token.cancelled:
-                    raise ClaudeCancelled(silent=token.silent)
+                token.raise_if_cancelled()
                 epoch = self._epoch.get(key, 0)
                 sid, expired = self._sid(key)
                 if sid is None:
@@ -909,8 +926,7 @@ class ClaudeRunner:
                         await prepare()
                     except Exception:
                         log.exception("任务前置准备失败（继续按现状跑）")
-                    if token.cancelled:   # prepare（git fetch 可数十秒）跑完再验一次，别白起子进程
-                        raise ClaudeCancelled(silent=token.silent)
+                    token.raise_if_cancelled()   # prepare（git fetch 可数十秒）跑完再验一次，别白起子进程
                 # 上游瞬时故障（Overloaded/限流/5xx）自动退避重试。重试姿势按错误形态区分：
                 # · CLI 正常退出但结果 is_error（如 "API Error: Overloaded"）→ session_id 已拿到，
                 #   --resume 它并用接续提示续跑：已完成的工作（含已 push 的）都在会话里，不会重做；
@@ -921,8 +937,7 @@ class ClaudeRunner:
                 run_sid, run_fork, nudge = sid, fork, None
                 for attempt in range(retries + 1):
                     rc, payload, err, meta = await _once(run_sid, run_fork, prompt_override=nudge)
-                    if token.cancelled:
-                        raise ClaudeCancelled(silent=token.silent)
+                    token.raise_if_cancelled()
                     if rc != 0 and run_sid and self._looks_like_session_error(
                             payload if isinstance(payload, bytes) else b"", err):
                         # fork 场景失效的是【父】会话（--resume 的是它）：清父，别让房间任务再撞尸体；
@@ -939,8 +954,7 @@ class ClaudeRunner:
                         run_sid, run_fork, nudge = None, False, None   # 会话没了，接续提示也无从谈起
                         sess_model = eff_model                         # 全新开：记本轮生效的模型
                         rc, payload, err, meta = await _once(None)
-                        if token.cancelled:
-                            raise ClaudeCancelled(silent=token.silent)
+                        token.raise_if_cancelled()
                     if rc != 0:
                         # 先 redact 再截断，免得 token 跨在截断边界被切成半截
                         detail = redact(err.decode(errors="ignore").strip())
