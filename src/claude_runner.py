@@ -465,7 +465,7 @@ class ClaudeRunner:
                     pass
         return proc.returncode, bytes(err_buf)
 
-    # ---- 命令行拼装：一次性(_cmd) / 常驻(_cmd_persistent) / 只读(_cmd_ro) 共用下面两个尾部 ----
+    # ---- 命令行拼装：一次性(_cmd) 与常驻(_cmd_persistent) 共用下面两个尾部 ----
     @staticmethod
     def _session_flags(sid: str | None, system_prompt: str | None, fork: bool) -> list[str]:
         """系统提示与会话续接的公共尾部。系统提示只在开新会话时设一次（--resume 时会话里已有）；
