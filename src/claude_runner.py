@@ -153,13 +153,13 @@ class _Persist:
     续跑再吐一轮 assistant/result，这类"回合外自发产出"经 on_notify 回投给房间。
     """
     __slots__ = ("key", "proc", "reader", "turn", "on_notify", "sid",
-                 "last_activity", "err_tail", "spont_text", "cwd")
+                 "last_activity", "err_tail", "spont_text")
 
-    def __init__(self, key: str, proc, cwd: str):
+    def __init__(self, key: str, proc):
         self.key = key
         self.proc = proc
-        self.cwd = cwd
-        self.reader = None        # stdout 读取任务（进程同寿命）
+        self.reader = None        # stdout 读取任务的显式保活引用（asyncio 只弱引用 task；实际它还被
+                                  # subprocess transport 链锚着，这里是双保险——写而不读但不是死属性，别清）
         self.turn = None          # 活动回合状态 dict；None=回合外
         self.on_notify = None     # async fn(text)：回合外自发产出的投递回调（每轮 ask 可刷新）
         self.sid = None           # 事件流里报的 session_id（进程死后靠它 --resume 续命）
@@ -527,7 +527,7 @@ class ClaudeRunner:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True, limit=1024 * 1024,
         )
-        ps = _Persist(key, proc, workdir)
+        ps = _Persist(key, proc)
         ps.sid = None if fork else sid   # fork 会派生新 sid，事件流里会报真值
         loop = asyncio.get_running_loop()
         ps.reader = loop.create_task(self._persist_reader(ps))
