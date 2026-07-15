@@ -218,6 +218,48 @@ def test_group_unbound_chat_general():
     assert captured["key"].startswith(dispatch._GENERAL_ID)                        # 通用助手会话、按房间隔离
     assert "还没绑定仓库" in captured["sp"] and "/bind" in captured["sp"]           # 指引进了系统提示
 
+def test_bare_mention_targets_previous_message():
+    """裸 @bot（剥完 @ 正文为空、也没引用谁）不再静默丢弃：把同范围最近一条真人消息补成
+    「请针对上一条消息回应」的主题派活；背景里找不到真人消息时维持原有静默。"""
+    set_identity()
+    c = _CapClient(); state.client = c
+    _task_fixtures()
+    captured = {}
+    async def fake_ask(key, prompt, cwd=None, system_prompt=None, lock_key=None, prepare=None,
+                       on_delta=None, cancel_key=None, **_kw):
+        captured["prompt"] = prompt
+        return "搞定"
+    bot.runner.ask = fake_ask
+    room = FakeRoom("!bare:ex.org", 3)
+    rid = room.room_id
+    orig = (settings.stream_replies, settings.reply_in_thread)
+    settings.stream_replies = False; settings.reply_in_thread = False
+    try:
+        # 模拟 on_message 的落背景顺序：Alice 先说一句（没点名、bot 没理），随后发裸 @bot
+        bot._context[rid].clear()
+        bot._context[rid].append((time.time(), "Alice", "登录页面白屏了", None))
+        bot._context[rid].append((time.time(), "Alice", "@claude-bot", None))
+        asyncio.run(bot.handle_task(
+            room, make_event("@claude-bot", mentions=[state.MY_ID], event_id="$BM"),
+            "", skip_body="@claude-bot"))
+        assert "上一条消息" in captured.get("prompt", "")             # 兜底主题话术进了任务
+        assert "登录页面白屏了" in captured["prompt"]                 # 上一条真人消息成了回应对象
+        assert any((m.get("body") or "") == "搞定" for m in c.sent)   # 真的答了
+
+        # 对照：背景里只有 bot 自己的话 → 找不到可回应的真人消息，仍静默丢弃
+        c.sent.clear(); captured.clear()
+        bot._context[rid].clear()
+        bot._context[rid].append((time.time(), "claude-bot", "我之前的答复", None))
+        bot._context[rid].append((time.time(), "Alice", "@claude-bot", None))
+        asyncio.run(bot.handle_task(
+            room, make_event("@claude-bot", mentions=[state.MY_ID], event_id="$BM2"),
+            "", skip_body="@claude-bot"))
+        assert "prompt" not in captured
+        assert not any((m.get("body") or "") == "搞定" for m in c.sent)
+    finally:
+        settings.stream_replies, settings.reply_in_thread = orig
+        bot._context[rid].clear()
+
 def test_task_ack_reaction():
     """收到任务先给触发消息打 👀 reaction 回执，处理完 redact 撤掉。"""
     set_identity()
@@ -730,6 +772,7 @@ TESTS = [
     ('群任务答复挂线程(旧式)', test_group_task_reply_threaded),
     ('群答复默认平铺+插话时引用回复', test_group_flat_reply_and_smart_quote),
     ('未绑定群当通用助手聊', test_group_unbound_chat_general),
+    ('裸@bot 兜底回应上一条消息', test_bare_mention_targets_previous_message),
     ('任务回执 👀 打上/撤掉', test_task_ack_reaction),
     ('runner 会话分叉 fork/续/父失效', test_runner_fork_session),
     ('runner 会话过期全新开触发 on_reset', test_runner_on_reset_fires_on_expired_session),
