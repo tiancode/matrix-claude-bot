@@ -505,6 +505,16 @@ async def _quoted_subject(room: MatrixRoom, event: RoomMessageText) -> str:
     return f"{who}：{body[:800]}"
 
 
+
+# 裸点名（@bot / 触发词，剥完啥也不剩、也没引用任何消息）时兜底派下去的任务正文。
+# 不硬指定"就是上一条"——想让 bot 回应哪条（紧邻的上一条、还是楼上没人接的问题/报错）
+# 由 Claude 结合背景对话自行判断；看不出来就反问，总比 @ 了毫无反应强。
+_BARE_MENTION_TASK = (
+    "我@了你，但没写具体内容。请结合最近的对话（上面的背景块，以及我们会话里的历史），"
+    "判断我最可能想让你回应或处理的是哪条消息——通常是最近的消息，但也可能是更早"
+    "没被接住的问题、报错或请求——直接针对它回应。实在判断不出就简短问我想让你做什么。")
+
+
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                       skip_body: str | list[str] | None = None, mention_note: str = "",
                       ack_eid: str | None = None):
@@ -514,13 +524,17 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
     # 时传入（房间不能在合并窗里毫无反应），这里只接管撤销、不重复打。
     async with _ack(rid, getattr(event, "event_id", None), pre_eid=ack_eid):
         # 引用回复：客户端常只发 m.in_reply_to 指针、不内联引文，本条正文可能只剩一个 @。把被引用的
-        # 消息拉进来——正文空时它就是要处理的主题（否则会被下面的空正文闸静默丢掉）；正文非空时作为
-        # "用户在指这条"的上文附带过去。重置类元命令不动，别把 /reset 揉进引文。
+        # 消息拉进来——正文空时它就是要处理的主题；正文非空时作为"用户在指这条"的上文附带过去。
+        # 重置类元命令不动，别把 /reset 揉进引文。
         if text.strip() not in RESET_CMDS:
             quoted = await _quoted_subject(room, event)
             if quoted:
                 text = (f"我引用/回复了这条消息，请针对它回应：\n> {quoted}" if not text.strip()
                         else f"（我引用/回复了这条消息作为上文：\n> {quoted}\n）\n\n{text.strip()}")
+            elif not text.strip():
+                # 裸 @bot / 裸触发词（没写内容也没引用谁）：不再静默丢弃，派"结合背景自行判断
+                # 要回应哪条"的兜底任务。背景为空（如刚重启）也照派——反问一句总比 @ 了没反应强。
+                text = _BARE_MENTION_TASK
         # 线程策略：跟着用户走——他在线程里说话就把答复挂进那个线程，并且【会话也细分到线程】
         # （首次派活从房间会话 fork，记忆随视觉一起分叉，线程之间互不串台）；顶层消息不再强开新线程。
         # REPLY_IN_THREAD=1 保留旧式"每条顶层消息开线程"，供偏爱线程的群显式选回——但会话细分
@@ -543,8 +557,6 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
             def reply_to():
                 return trigger_eid if (dq and tuple(dq[-1][:3]) != tail_at_start) else None
         try:
-            if not text.strip():
-                return
             if text.strip() in RESET_CMDS:
                 # 绑了重置该项目会话；没绑（群/私聊都一样）重置通用助手会话——总有东西可重置
                 rec = projects.get_room(rid) or _general_rec()
