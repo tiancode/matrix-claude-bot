@@ -524,8 +524,8 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
     # 时传入（房间不能在合并窗里毫无反应），这里只接管撤销、不重复打。
     async with _ack(rid, getattr(event, "event_id", None), pre_eid=ack_eid):
         # 引用回复：客户端常只发 m.in_reply_to 指针、不内联引文，本条正文可能只剩一个 @。把被引用的
-        # 消息拉进来——正文空时它就是要处理的主题（否则会被下面的空正文闸静默丢掉）；正文非空时作为
-        # "用户在指这条"的上文附带过去。重置类元命令不动，别把 /reset 揉进引文。
+        # 消息拉进来——正文空时它就是要处理的主题；正文非空时作为"用户在指这条"的上文附带过去。
+        # 重置类元命令不动，别把 /reset 揉进引文。
         if text.strip() not in RESET_CMDS:
             quoted = await _quoted_subject(room, event)
             if quoted:
@@ -557,8 +557,6 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
             def reply_to():
                 return trigger_eid if (dq and tuple(dq[-1][:3]) != tail_at_start) else None
         try:
-            if not text.strip():
-                return
             if text.strip() in RESET_CMDS:
                 # 绑了重置该项目会话；没绑（群/私聊都一样）重置通用助手会话——总有东西可重置
                 rec = projects.get_room(rid) or _general_rec()
