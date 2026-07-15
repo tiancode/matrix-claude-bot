@@ -8,7 +8,7 @@ from nio import MatrixRoom, RoomMessageText
 
 from config import settings
 import state
-from state import (_context, _ctx_thread, _sess_key, _mark_dispatched, _clear_dispatched,
+from state import (_context, _sess_key, _mark_dispatched, _clear_dispatched,
                    _drop_pending, _steered_dispatched, _unmark_dispatched,
                    _last_project_by_room, _save_last_projects, _project_last_active,
                    _room_model, _save_room_models)
@@ -506,30 +506,13 @@ async def _quoted_subject(room: MatrixRoom, event: RoomMessageText) -> str:
 
 
 
-def _prev_subject(room: MatrixRoom, event: RoomMessageText,
-                  skip_body: str | list[str] | None) -> str:
-    """裸点名（@bot / 触发词，剥完啥也不剩、也没引用任何消息）的兜底主题：从背景缓冲里找
-    同一范围（顶层/同线程）、触发消息之前最近的一条【真人】发言，当作"请针对它回应"的对象——
-    光 @ 一下的本意几乎总是"看看上一条"。触发消息本身按 skip_body 剔（连发合并对应多条原文，
-    逐条各剔一次）；bot 自己和 KNOWN_BOTS 名单 bot 的话不算数（@我一下不是让我评论我自己
-    刚说的话）。找不到返回空串，上层维持原有的空正文静默丢弃。"""
-    rid = room.room_id
-    thr = _thread_of(event)
-    sender_name = room.user_name(event.sender) or event.sender
-    skips = list(skip_body) if isinstance(skip_body, (list, tuple)) else (
-        [skip_body] if skip_body else [])
-    bot_names = {state.MY_NAME or "bot"} | set(state._known_bot_names.get(rid, ()))
-    for it in reversed(_context.get(rid) or ()):
-        if _ctx_thread(it) != thr:
-            continue
-        name, body = it[1], it[2] or ""
-        if name == sender_name and body in skips:
-            skips.remove(body)
-            continue
-        if not body.strip() or name in bot_names:
-            continue
-        return f"{name}：{body.strip()[:800]}"
-    return ""
+# 裸点名（@bot / 触发词，剥完啥也不剩、也没引用任何消息）时兜底派下去的任务正文。
+# 不硬指定"就是上一条"——想让 bot 回应哪条（紧邻的上一条、还是楼上没人接的问题/报错）
+# 由 Claude 结合背景对话自行判断；看不出来就反问，总比 @ 了毫无反应强。
+_BARE_MENTION_TASK = (
+    "我@了你，但没写具体内容。请结合最近的对话（上面的背景块，以及我们会话里的历史），"
+    "判断我最可能想让你回应或处理的是哪条消息——通常是最近的消息，但也可能是更早"
+    "没被接住的问题、报错或请求——直接针对它回应。实在判断不出就简短问我想让你做什么。")
 
 
 async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
@@ -549,11 +532,9 @@ async def handle_task(room: MatrixRoom, event: RoomMessageText, text: str,
                 text = (f"我引用/回复了这条消息，请针对它回应：\n> {quoted}" if not text.strip()
                         else f"（我引用/回复了这条消息作为上文：\n> {quoted}\n）\n\n{text.strip()}")
             elif not text.strip():
-                # 裸 @bot / 裸触发词（没写内容也没引用谁）：不再静默丢弃——@ 一下的意思几乎总是
-                # "看看上一条消息"，把同范围最近一条真人发言补成主题派下去。
-                prev = _prev_subject(room, event, skip_body)
-                if prev:
-                    text = f"我@了你但没写具体内容，请针对上一条消息回应：\n> {prev}"
+                # 裸 @bot / 裸触发词（没写内容也没引用谁）：不再静默丢弃，派"结合背景自行判断
+                # 要回应哪条"的兜底任务。背景为空（如刚重启）也照派——反问一句总比 @ 了没反应强。
+                text = _BARE_MENTION_TASK
         # 线程策略：跟着用户走——他在线程里说话就把答复挂进那个线程，并且【会话也细分到线程】
         # （首次派活从房间会话 fork，记忆随视觉一起分叉，线程之间互不串台）；顶层消息不再强开新线程。
         # REPLY_IN_THREAD=1 保留旧式"每条顶层消息开线程"，供偏爱线程的群显式选回——但会话细分
