@@ -106,6 +106,26 @@ async def _aget(url: str):
         return 0, None
 
 
+# ---- 只读查询的三个公共形状（各业务函数曾逐个重复这三行）----
+async def _aget_list(url: str) -> list:
+    """GET 一个期望为 JSON 数组的端点；非 200 / 形状不对返回 []（轮询尽力而为）。"""
+    st, d = await _aget(url)
+    return d if st == 200 and isinstance(d, list) else []
+
+
+async def _aget_dict(url: str) -> dict | None:
+    """GET 一个期望为 JSON 对象的端点；非 200 / 形状不对返回 None（抖动还是真没了由调用方定性）。"""
+    st, d = await _aget(url)
+    return d if st == 200 and isinstance(d, dict) else None
+
+
+async def _gone(url: str) -> bool:
+    """对象是否确切 404（pr_gone / issue_gone 共用）：只有拿到确切 404 才返回 True；
+    抖动 / 其它错误返回 False——宁可下轮再试也别误销账。"""
+    st, _ = await _aget(url)
+    return st == 404
+
+
 _own_user: dict = {}   # GITEA_TOKEN 对应用户的缓存（查到过才缓存，失败下次再试）
 
 
@@ -141,27 +161,22 @@ async def assigned_issues(rec: dict, assignee: str) -> list:
     if not assignee:
         return []
     q = urllib.parse.quote(assignee)
-    st, d = await _aget(f"{_repo_api(rec)}/issues?state=open&type=issues&assigned_by={q}")
-    return d if st == 200 and isinstance(d, list) else []
+    return await _aget_list(f"{_repo_api(rec)}/issues?state=open&type=issues&assigned_by={q}")
 
 
 async def issue_info(rec: dict, number: int) -> dict | None:
     """单个 issue 的状态：含 state(open/closed)、title、assignees。查不到返回 None。"""
-    st, d = await _aget(f"{_repo_api(rec)}/issues/{number}")
-    return d if st == 200 and isinstance(d, dict) else None
+    return await _aget_dict(f"{_repo_api(rec)}/issues/{number}")
 
 
 async def issue_gone(rec: dict, number: int) -> bool:
-    """确认某 issue 在 Gitea 上是否真的没了（HTTP 404）——与"网络抖动"区分，用于销账前定性。
-    只有拿到确切 404 才返回 True；抖动 / 其它错误返回 False（宁可下轮再试也别误销账）。"""
-    st, _ = await _aget(f"{_repo_api(rec)}/issues/{number}")
-    return st == 404
+    """确认某 issue 在 Gitea 上是否真的没了（确切 404 才算，语义见 _gone），用于销账前定性。"""
+    return await _gone(f"{_repo_api(rec)}/issues/{number}")
 
 
 async def issue_comments(rec: dict, number: int) -> list:
     """issue 下的评论列表（body + user），接单时给 Claude 当讨论上下文。"""
-    st, d = await _aget(f"{_repo_api(rec)}/issues/{number}/comments")
-    return d if st == 200 and isinstance(d, list) else []
+    return await _aget_list(f"{_repo_api(rec)}/issues/{number}/comments")
 
 
 async def comment_issue(rec: dict, number: int, body: str) -> bool:
@@ -178,27 +193,22 @@ async def comment_issue(rec: dict, number: int, body: str) -> bool:
 async def open_pulls(rec: dict) -> list:
     """仓库里 open 的 PR 列表（每条含 number、body、html_url）。
     启动对账查「是否已为某工单开过 PR」用：崩溃可能发生在 PR 已开、台账还没记 pr 号之间。"""
-    st, d = await _aget(f"{_repo_api(rec)}/pulls?state=open")
-    return d if st == 200 and isinstance(d, list) else []
+    return await _aget_list(f"{_repo_api(rec)}/pulls?state=open")
 
 
 async def pr_info(rec: dict, number: int) -> dict | None:
     """单个 PR 的状态：含 state(open/closed)、merged、mergeable、head.sha/ref。"""
-    st, d = await _aget(f"{_repo_api(rec)}/pulls/{number}")
-    return d if st == 200 and isinstance(d, dict) else None
+    return await _aget_dict(f"{_repo_api(rec)}/pulls/{number}")
 
 
 async def pr_gone(rec: dict, number: int) -> bool:
-    """确认某 PR 在 Gitea 上是否真的没了（HTTP 404）——与"网络抖动"区分，用于销账前定性。
-    只有拿到确切 404 才返回 True；抖动 / 其它错误返回 False（宁可下轮再试也别误销账）。"""
-    st, _ = await _aget(f"{_repo_api(rec)}/pulls/{number}")
-    return st == 404
+    """确认某 PR 在 Gitea 上是否真的没了（确切 404 才算，语义见 _gone），用于销账前定性。"""
+    return await _gone(f"{_repo_api(rec)}/pulls/{number}")
 
 
 async def pr_reviews(rec: dict, number: int) -> list:
     """PR 的评审列表：每条含 id、state(APPROVED/REQUEST_CHANGES/COMMENT/PENDING)、body、user、submitted_at。"""
-    st, d = await _aget(f"{_repo_api(rec)}/pulls/{number}/reviews")
-    return d if st == 200 and isinstance(d, list) else []
+    return await _aget_list(f"{_repo_api(rec)}/pulls/{number}/reviews")
 
 
 async def ci_state(rec: dict, sha: str) -> str | None:

@@ -5,15 +5,13 @@ import time
 
 from config import settings
 import state
-from state import _sess_key
-from matrix_io import send, _typing
-from tasks import _employee_prompt, _transient_blurb
+from matrix_io import send
+from tasks import run_employee_task, _transient_blurb
 from projects import projects
-from claude_runner import runner, ClaudeCancelled
+from claude_runner import ClaudeCancelled
 import gitea
 import gitea_health
 import pr_ledger
-import memory
 
 log = logging.getLogger("matrix-claude.pr")
 
@@ -58,16 +56,9 @@ async def _followup_dispatch(rec: dict, entry: dict, detail: str):
         f"**该分支**（PR 会自动更新）；若是误会或只需回应评审，就在最终回复里说明。"
         f"**不要新开 PR。**用简洁中文回复你做了什么。"
     )
-    sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
-    # 与聊天共用同一会话 key：模型也跟房间 /model 设置走（新开会话时生效）
-    model_kw = {"model": state._room_model[room]} if state._room_model.get(room) else {}
     try:
-        async with _typing(room):
-            # cancel_key=原房间：让房间里的 /cancel 也能停掉跟进任务
-            answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"],
-                                      system_prompt=sp, lock_key=rec["id"],
-                                      prepare=lambda: projects.prepare_worktree(rec),
-                                      cancel_key=room, **model_kw)
+        # 员工提示词/项目记忆/房间模型/串行锁/cancel_key=房间 等共用跑法见 tasks.run_employee_task
+        answer = await run_employee_task(rec, room, prompt)
         await send(room, f"🔁 PR #{n} 跟进结果：\n{answer}", track=True)
     except ClaudeCancelled:
         await send(room, f"🛑 已停止 PR #{n} 的跟进任务。")

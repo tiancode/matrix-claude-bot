@@ -5,11 +5,13 @@ import logging
 import os
 import re
 import shutil
-import signal
 from urllib.parse import urlparse, urlsplit
 
 from config import settings, redact
 from storage import atomic_write_json
+# 杀整个进程组的兜底手法与 runner 杀 claude 子进程完全同一套，取现成的别再抄一份；
+# claude_runner 只依赖 config/storage 两个叶子，这个方向不成环。
+from claude_runner import _kill_group
 
 log = logging.getLogger("matrix-claude.projects")
 
@@ -144,10 +146,7 @@ async def _git(*args: str, cwd: str | None = None) -> tuple[int, str, str]:
             proc.communicate(), timeout=settings.git_timeout
         )
     except asyncio.TimeoutError:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
+        _kill_group(proc)
         await proc.wait()
         # 让上层当普通失败处理，而不是永远卡住占着绑定锁
         return 124, "", f"git {args[0] if args else ''} 超时（>{settings.git_timeout}s）"
@@ -168,6 +167,14 @@ def _auth_url(clone_url: str) -> str:
 def proj_id(info: dict) -> str:
     """项目稳定标识 host/owner/repo，同时作为 Claude worker 的会话 key。"""
     return f"{urlparse(info['host']).netloc}/{info['owner']}/{info['repo']}"
+
+
+def has_local_clone(rec: dict) -> bool:
+    """该项目记录的本地 checkout 是否还在（粗判：.git 目录存在即可）。heartbeat / issue_intake /
+    proactive / prepare_worktree 各自的「有 clone 才干活」预筛统一走这里；真正的健康度
+    （半截 clone 之类）由 _repo_ok 在 ensure 路径上管。"""
+    path = rec.get("path") or ""
+    return bool(path) and os.path.isdir(os.path.join(path, ".git"))
 
 
 async def _repo_ok(path: str) -> bool:
@@ -306,7 +313,7 @@ class Projects:
         best-effort：fetch/checkout 失败只告警，仍按现状把活派下去，免得离线时彻底卡死。"""
         path = rec.get("path")
         base = rec.get("base") or "main"
-        if not path or not os.path.isdir(os.path.join(path, ".git")):
+        if not has_local_clone(rec):
             return
         await self._stash_dirty(path, rec)   # 先把脏树寄存住，别让下面的 checkout -f/reset/clean 把没提交的活删没
         await _git("fetch", "--prune", "origin", cwd=path)

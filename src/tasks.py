@@ -124,6 +124,22 @@ def _employee_prompt(info: dict) -> str:
 
 
 
+async def run_employee_task(rec: dict, room: str, prompt: str) -> str:
+    """后台任务（PR 跟进 / 自驱执行 / 工单执行）共用的「员工任务」跑法——三处曾各抄一份，
+    参数一多改就得三处同步，收敛到这一处：员工提示词 + 项目长期记忆；与聊天共用同一会话 key
+    （模型也跟房间 /model 设置走，新开会话时生效）；lock_key=项目 id（同一 checkout 串行）+
+    prepare 把工作树拉回干净 base；cancel_key=汇报房间——让房间里的 /cancel 也能停掉后台任务；
+    期间开着"正在输入"。取消 / 异常原样上抛，回报文案由各调用方按自己的场景措辞。"""
+    sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
+    model_kw = {"model": _room_model[room]} if _room_model.get(room) else {}
+    async with _typing(room):
+        return await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"],
+                                system_prompt=sp, lock_key=rec["id"],
+                                prepare=lambda: projects.prepare_worktree(rec),
+                                cancel_key=room, **model_kw)
+
+
+
 async def do_bind(room: MatrixRoom, repo: dict,
                   event: RoomMessageText | None = None, task_text: str = "",
                   skip_body: str | None = None, mention_note: str = ""):

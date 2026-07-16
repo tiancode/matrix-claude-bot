@@ -223,10 +223,11 @@ def test_issue_execute_and_sweep():
             assert "Closes #3" in prompt                          # 提示词要求 PR 带关单标记
             return "已修复并开 PR：http://h/o/r/pulls/9"
 
-    orig = (state.client, issue_intake.runner, gitea.issue_comments, gitea.comment_issue,
+    # 工单执行的 runner.ask 走 tasks.run_employee_task（三条后台路径共用），桩挂在 tasks.runner 上
+    orig = (state.client, tasks.runner, gitea.issue_comments, gitea.comment_issue,
             bot.projects.get_project, gitea.issue_info)
     state.client = FC()
-    issue_intake.runner = R()
+    tasks.runner = R()
     async def no_comments(r, n): return []
     async def comment(r, n, body): comments.append(body); return True
     gitea.issue_comments, gitea.comment_issue = no_comments, comment
@@ -244,7 +245,7 @@ def test_issue_execute_and_sweep():
         asyncio.run(issue_intake._sweep_closed())
         assert issue_ledger.active() == []
     finally:
-        (state.client, issue_intake.runner, gitea.issue_comments, gitea.comment_issue,
+        (state.client, tasks.runner, gitea.issue_comments, gitea.comment_issue,
          bot.projects.get_project, gitea.issue_info) = orig
         settings.store_path = orig_store
         _reset_issue_ledger(); _reset_ledger()

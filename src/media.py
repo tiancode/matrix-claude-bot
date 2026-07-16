@@ -3,18 +3,15 @@ import logging
 import os
 import shutil
 import tempfile
-import time
 
 from nio import MatrixRoom, RoomEncryptedMedia
 
 from config import settings
 import state
-from state import _context
 from fmt import _safe_name, _human_bytes
-from matrix_io import send, _is_dm, _resolve_reply_author, _thread_of
+from matrix_io import send, _is_dm, _resolve_reply_author, _thread_of, _track_incoming
 from addressing import _has_trigger, _is_addressed, _is_known_bot, _mark_engaged, _mention_note
 from tasks import handle_task
-import transcript
 
 log = logging.getLogger("matrix-claude.media")
 
@@ -209,9 +206,7 @@ async def _process_media(room: MatrixRoom, event, is_self: bool):
         # skip_body 传的就是这个 line，去重天然逐字节匹配，派活层不再重算（防显示名漂移）。
         mention_note = _mention_note(room, (event.source or {}).get("content", {}))
         line += mention_note
-        _context[rid].append((time.time(), sender, line, _thread_of(event)))   # 本地时钟+线程标记，与文本一致
-        state._ctx_recent.append((getattr(event, "event_id", ""), rid, sender, line))  # 供删消息时从背景剔除
-        transcript.append(rid, sender, line, event_id=getattr(event, "event_id", ""))
+        _track_incoming(rid, getattr(event, "event_id", ""), sender, line, _thread_of(event))
 
         # 与文本相同的派活闸：自己账号无触发词不派活
         if is_self and not _has_trigger(event.body or ""):

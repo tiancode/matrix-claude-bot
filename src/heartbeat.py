@@ -1,16 +1,15 @@
 """自驱心跳：没人派活时巡检各项目找值得做的事；autopilot 直接认领开 PR。"""
 import asyncio
 import logging
-import os
 import time
 from datetime import datetime
 
 from config import settings, fixed_tz
 import state
-from state import _sess_key, _last_project_by_room, _project_last_active
-from matrix_io import send, _typing, _is_dm
-from tasks import _employee_prompt, _extract_pr, _transient_blurb
-from projects import projects
+from state import _last_project_by_room, _project_last_active
+from matrix_io import send, _is_dm
+from tasks import run_employee_task, _employee_prompt, _extract_pr, _transient_blurb
+from projects import projects, has_local_clone
 from claude_runner import runner, ClaudeCancelled
 import pr_ledger
 import memory
@@ -44,15 +43,9 @@ async def _heartbeat_execute(rec: dict, room: str, proposal: str):
         "请像平常派活一样把它做完：从 origin/base 建分支、改代码、commit、push、开 PR，"
         "最终回复附上 PR 链接。用简洁中文回复。"
     )
-    sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
-    # 与聊天共用同一会话 key：模型也跟房间 /model 设置走，别让自驱新开的会话把模型带偏
-    model_kw = {"model": state._room_model[room]} if state._room_model.get(room) else {}
     try:
-        async with _typing(room):
-            # cancel_key=汇报房间：让房间里的 /cancel 也能停掉自驱任务（不然只能干看着它跑）
-            answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"], system_prompt=sp,
-                                      lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec),
-                                      cancel_key=room, **model_kw)
+        # 员工提示词/项目记忆/房间模型/串行锁/cancel_key=房间 等共用跑法见 tasks.run_employee_task
+        answer = await run_employee_task(rec, room, prompt)
         _project_last_active[rec["id"]] = time.time()
         await send(room, f"🤖 自驱完成：\n{answer}", track=True)
         pr = _extract_pr(answer, rec)
@@ -141,7 +134,7 @@ def _pick_due_project(now: float) -> tuple[dict, str] | None:
         room = _project_home_room(pid)
         if not room:
             continue
-        if not os.path.isdir(os.path.join(rec.get("path", ""), ".git")):
+        if not has_local_clone(rec):
             continue
         due, due_ts, due_room = rec, ts, room
     return (due, due_room) if due else None
