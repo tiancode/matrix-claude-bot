@@ -115,8 +115,9 @@ def _in_heartbeat_window(now: float) -> bool:
 
 # 循环"探测"节奏上限（秒）：即便 PROACTIVE_HEARTBEAT_INTERVAL 配得很大（如 4 小时），也按这个更短
 # 的节奏醒来检查是否进入了巡检时段——真正"多久巡检一次"仍由每项目的 _project_last_active 节流
-# 保证，这里只管别让大 interval 与巡检时段错峰、导致整段时段被永久错过。它同时是多项目间的
-# 错峰间距：每轮只巡检一个项目（见 _pick_due_project），到期的项目至少隔这么久才轮到下一个。
+# 保证，这里只管别让大 interval 与巡检时段错峰、导致整段时段被永久错过。它同时决定多项目间的
+# 错峰轮距：每轮只巡检一个项目（见 _pick_due_project），同时到期的项目相邻两个至少隔一轮——
+# 一轮 = min(PROACTIVE_HEARTBEAT_INTERVAL, 本值) 加上巡检本身的耗时。
 _WINDOW_POLL_INTERVAL = 300
 
 
@@ -126,7 +127,9 @@ def _pick_due_project(now: float) -> tuple[dict, str] | None:
     每轮只挑一个是刻意错峰：启动后/进入巡检时段时多个项目常常同时到期，一轮全巡完会
     集中爆发——汇报同时刷屏、autopilot 并发抢执行额度，且 _project_last_active 被同一
     时刻的 now 占住后各项目节奏永远同步，之后每个间隔点都再爆发一波。一轮一个配合循环
-    的探测节奏，项目间天然错开至少 _WINDOW_POLL_INTERVAL，且一旦错开就保持错开。"""
+    的探测节奏，同时到期的项目按轮次自然错开，且一旦错开就保持错开。代价是吞吐上限：
+    项目非常多时单项目的实际巡检周期 ≈ 项目数×一轮时长，可能超过配置的间隔（见
+    .env.example 里 PROACTIVE_HEARTBEAT_INTERVAL 的说明）。"""
     due, due_ts, due_room = None, 0.0, None
     for rec in projects.list_projects():
         pid = rec["id"]
