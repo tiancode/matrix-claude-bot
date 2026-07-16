@@ -115,12 +115,41 @@ def _in_heartbeat_window(now: float) -> bool:
 
 # 循环"探测"节奏上限（秒）：即便 PROACTIVE_HEARTBEAT_INTERVAL 配得很大（如 4 小时），也按这个更短
 # 的节奏醒来检查是否进入了巡检时段——真正"多久巡检一次"仍由每项目的 _project_last_active 节流
-# 保证，这里只管别让大 interval 与巡检时段错峰、导致整段时段被永久错过。
+# 保证，这里只管别让大 interval 与巡检时段错峰、导致整段时段被永久错过。它同时决定多项目间的
+# 错峰轮距：每轮只巡检一个项目（见 _pick_due_project），同时到期的项目相邻两个至少隔一轮——
+# 一轮 = min(PROACTIVE_HEARTBEAT_INTERVAL, 本值) 加上巡检本身的耗时。
 _WINDOW_POLL_INTERVAL = 300
 
 
+def _pick_due_project(now: float) -> tuple[dict, str] | None:
+    """挑本轮要巡检的项目：到期（超过间隔没动）、有汇报口、有本地 clone 的项目里取
+    「最久没动」的一个，返回 (rec, 汇报房间)；没有到期的返回 None。
+    每轮只挑一个是刻意错峰：启动后/进入巡检时段时多个项目常常同时到期，一轮全巡完会
+    集中爆发——汇报同时刷屏、autopilot 并发抢执行额度，且 _project_last_active 被同一
+    时刻的 now 占住后各项目节奏永远同步，之后每个间隔点都再爆发一波。一轮一个配合循环
+    的探测节奏，同时到期的项目按轮次自然错开，且一旦错开就保持错开。代价是吞吐上限：
+    项目非常多时单项目的实际巡检周期 ≈ 项目数×一轮时长，可能超过配置的间隔（见
+    .env.example 里 PROACTIVE_HEARTBEAT_INTERVAL 的说明）。"""
+    due, due_ts, due_room = None, 0.0, None
+    for rec in projects.list_projects():
+        pid = rec["id"]
+        ts = _project_last_active.get(pid, 0)
+        if now - ts < settings.proactive_heartbeat_interval:
+            continue   # 最近有人在弄 / 刚巡检过：别打扰
+        if due is not None and ts >= due_ts:
+            continue   # 已有更久没动的候选，后面的贵检查（汇报口/磁盘）不必做
+        room = _project_home_room(pid)
+        if not room:
+            continue
+        if not os.path.isdir(os.path.join(rec.get("path", ""), ".git")):
+            continue
+        due, due_ts, due_room = rec, ts, room
+    return (due, due_room) if due else None
+
+
 async def _heartbeat_loop():
-    """周期巡检有"汇报口"的项目；避让最近在弄的项目，免得打断正在派的活、也别为巡检而 clone。"""
+    """周期巡检有"汇报口"的项目；避让最近在弄的项目，免得打断正在派的活、也别为巡检而 clone。
+    每轮只巡检一个（多项目错峰，见 _pick_due_project）。"""
     if not settings.proactive_heartbeat_enabled:
         return
     log.info("自驱心跳已启动（每 %ds 巡检一次，autopilot=%s）",
@@ -131,20 +160,15 @@ async def _heartbeat_loop():
             now = time.time()
             if not _in_heartbeat_window(now):
                 continue   # 非工作时段：跳过本轮，别半夜/周末打扰人
-            for rec in projects.list_projects():
-                pid = rec["id"]
-                room = _project_home_room(pid)
-                if not room:
-                    continue
-                if now - _project_last_active.get(pid, 0) < settings.proactive_heartbeat_interval:
-                    continue   # 最近有人在弄 / 刚巡检过：别打扰
-                if not os.path.isdir(os.path.join(rec.get("path", ""), ".git")):
-                    continue
-                _project_last_active[pid] = now   # 占住，避免与真任务/下一轮重叠
-                try:
-                    await _heartbeat_one(rec, room)
-                except Exception:
-                    log.exception("[%s] 自驱心跳失败", pid)
+            picked = _pick_due_project(now)
+            if picked is None:
+                continue
+            rec, room = picked
+            _project_last_active[rec["id"]] = now   # 占住，避免与真任务/下一轮重叠
+            try:
+                await _heartbeat_one(rec, room)
+            except Exception:
+                log.exception("[%s] 自驱心跳失败", rec["id"])
         except asyncio.CancelledError:
             raise
         except Exception:

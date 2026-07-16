@@ -100,7 +100,7 @@ journalctl --user -u matrix-claude -f
 **Gitea 闭环**
 - PR 台账：bot 开的 PR 全部记账跟进——新评审意见→自动在原分支处理并推送；CI 失败→自动修（各 `PR_AUTOFIX_MAX` 次上限）；可合并+CI 绿+无未决改动→**自动合并**（`PR_AUTOMERGE`，默认开）
 - 工单接活（`ISSUE_INTAKE`，默认开）：issue 指派给 bot 账号 = 派活。接单即评论认领，干完开 PR（描述带 `Closes #N`，合并自动关单）、链接贴回 issue，进展同步到项目房间；台账持久化，重启不重复接单；重派 = 关单再重开
-- 自驱心跳（`PROACTIVE_HEARTBEAT_ENABLED`，默认开）：没人派活时按小时巡检各项目找值得做的事（小 bug、缺测试、陈旧 TODO）；autopilot 模式自己认领开 PR，关掉则只提议等你点头。巡检时段可限定为工作日白天（`PROACTIVE_HEARTBEAT_WEEKDAYS_ONLY` 默认开，`PROACTIVE_HEARTBEAT_START_HOUR`/`_END_HOUR` 默认 9~19 点，`PROACTIVE_HEARTBEAT_TZ_HOURS` 默认东八区）
+- 自驱心跳（`PROACTIVE_HEARTBEAT_ENABLED`，默认开）：没人派活时按小时巡检各项目找值得做的事（小 bug、缺测试、陈旧 TODO）；多项目按「最久没巡」排队错峰，一轮只巡一个，不会同时爆发一波；autopilot 模式自己认领开 PR，关掉则只提议等你点头。巡检时段可限定为工作日白天（`PROACTIVE_HEARTBEAT_WEEKDAYS_ONLY` 默认开，`PROACTIVE_HEARTBEAT_START_HOUR`/`_END_HOUR` 默认 9~19 点，`PROACTIVE_HEARTBEAT_TZ_HOURS` 默认东八区）
 - Gitea 健康度：连接失败/token 失效不再静默降级——`/status` 显示连通性，连续失败跨阈值向相关房间告警一次、恢复再报一次
 
 **记忆与上下文**
