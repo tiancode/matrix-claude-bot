@@ -111,6 +111,48 @@ def test_heartbeat_schedule_window():
         (settings.proactive_heartbeat_weekdays_only, settings.proactive_heartbeat_start_hour,
          settings.proactive_heartbeat_end_hour, settings.proactive_heartbeat_tz_hours) = orig
 
+# ---------- 自驱心跳：多项目错峰——每轮只挑「最久没动」的一个巡检 ----------
+def test_heartbeat_stagger_one_per_round():
+    import tempfile
+    from state import _project_last_active
+
+    base = tempfile.mkdtemp()
+
+    def mkrepo(name, with_git=True):
+        p = os.path.join(base, name)
+        os.makedirs(os.path.join(p, ".git") if with_git else p)
+        return p
+
+    recs = [{"id": f"h/o/r{i}", "owner": "o", "repo": f"r{i}", "host": "http://h",
+             "path": mkrepo(f"r{i}", with_git=(i != 3)), "base": "main"} for i in range(4)]
+    orig = (heartbeat.projects.list_projects, heartbeat._project_home_room,
+            settings.proactive_heartbeat_interval)
+    saved = {r["id"]: _project_last_active.get(r["id"]) for r in recs}
+    heartbeat.projects.list_projects = lambda: list(recs)
+    heartbeat._project_home_room = lambda pid: None if pid == "h/o/r1" else "!room"  # r1 没汇报口
+    settings.proactive_heartbeat_interval = 100
+    try:
+        now = 10_000.0
+        # 四个项目全部到期：r3 最久没动但没本地 clone，r1 次之但没汇报口 → 挑 r2
+        _project_last_active.update({"h/o/r0": now - 300, "h/o/r1": now - 500,
+                                     "h/o/r2": now - 400, "h/o/r3": now - 600})
+        picked = heartbeat._pick_due_project(now)
+        assert picked is not None and picked[0]["id"] == "h/o/r2" and picked[1] == "!room"
+        # 一轮只出一个：巡检后占住 r2，下一轮才轮到 r0（同时到期的项目由此错开，不集中爆发）
+        _project_last_active["h/o/r2"] = now
+        assert heartbeat._pick_due_project(now)[0]["id"] == "h/o/r0"
+        _project_last_active["h/o/r0"] = now + 1
+        assert heartbeat._pick_due_project(now + 1) is None   # 可巡的都巡过、间隔未到 → 本轮没有
+        assert heartbeat._pick_due_project(now + 200)[0]["id"] == "h/o/r2"   # 间隔一到又按最旧优先
+    finally:
+        (heartbeat.projects.list_projects, heartbeat._project_home_room,
+         settings.proactive_heartbeat_interval) = orig
+        for pid, ts in saved.items():
+            if ts is None:
+                _project_last_active.pop(pid, None)
+            else:
+                _project_last_active[pid] = ts
+
 # ---------- 自驱心跳：PASS 不打扰；有建议→提议；autopilot→派执行 ----------
 def test_heartbeat_propose_and_autopilot():
     set_identity()
@@ -618,6 +660,7 @@ TESTS = [
     ('CI查询失败不放行自动合并', test_automerge_skips_on_ci_unknown),
     ('PR 冲突只告警一次不刷屏', test_conflict_alert_once),
     ('自驱心跳 巡检时段（工作日白天）', test_heartbeat_schedule_window),
+    ('自驱心跳 多项目错峰一轮一个', test_heartbeat_stagger_one_per_round),
     ('自驱心跳 提议/autopilot', test_heartbeat_propose_and_autopilot),
     ('/status 状态一屏可见', test_status_command),
     ('流式定稿 编辑失败退回新发', test_livereply_finalize_edit_fallback),
