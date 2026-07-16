@@ -1,6 +1,5 @@
 """主动插话：不被 @ 时也判断该不该就群消息开口（求助 / 有错可纠正），带冷却防刷屏。"""
 import logging
-import os
 import time
 
 from nio import MatrixRoom, RoomMessageText
@@ -10,7 +9,7 @@ from state import _last_proactive
 from matrix_io import send, _is_dm, _thread_of, _thread_root_of
 from fmt import _format_context
 from addressing import _looks_actionable
-from projects import projects
+from projects import projects, has_local_clone
 from claude_runner import runner
 
 log = logging.getLogger("matrix-claude.proactive")
@@ -73,7 +72,7 @@ async def maybe_proactive(room: MatrixRoom, event: RoomMessageText, body: str):
         # 群已绑仓库且本地 checkout 还在：用只读 consult 让它对着真实代码作答，而不是凭空瞎猜；
         # 否则（未绑/没 clone）退回纯文本 quick。proactive 不主动 clone。
         rec = projects.get_room(rid) if not _is_dm(room) else None
-        if rec and os.path.isdir(os.path.join(rec.get("path") or "", ".git")):
+        if rec and has_local_clone(rec):
             sp = ("你是该仓库的助手。这是主动插话场景：可以只读地查看仓库代码把问题答准、"
                   "或核实对话里的说法对不对，但绝不要修改文件、提交或开 PR。判断标准同上："
                   "有求助或有值得纠正的错误才插话、且简洁；不该插话或拿不准就只回 __PASS__。")

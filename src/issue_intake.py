@@ -6,22 +6,20 @@
 """
 import asyncio
 import logging
-import os
 import time
 
 from config import settings
 import state
-from state import _sess_key, _project_last_active
-from matrix_io import send, _typing
-from tasks import _employee_prompt, _extract_pr, _transient_blurb
+from state import _project_last_active
+from matrix_io import send
+from tasks import run_employee_task, _extract_pr, _transient_blurb
 from heartbeat import _project_home_room
-from projects import projects
-from claude_runner import runner, ClaudeCancelled
+from projects import projects, has_local_clone
+from claude_runner import ClaudeCancelled
 import gitea
 import gitea_health
 import issue_ledger
 import pr_ledger
-import memory
 import inflight
 # reconcile_gone 是 PR / 工单共用的「连续 ≥N 轮 404 才销账」状态机，落在 pr_followup（先加载、
 # 无反向依赖，不成环）；issue_intake 本就 import pr_ledger，再取一个跟进侧工具不算越界。
@@ -54,15 +52,9 @@ async def _issue_execute(rec: dict, room: str, issue: dict):
             f"若这个 issue 不需要改代码（提问 / 讨论类），直接给出结论，并用 Gitea API "
             f"在 issue #{n} 下回复结论后关闭它。\n用简洁中文回复。"
         )
-        sp = memory.augment_system_prompt(_employee_prompt(rec), rec["id"])
-        # 与聊天共用同一会话 key：模型也跟房间 /model 设置走（新开会话时生效）
-        model_kw = {"model": state._room_model[room]} if state._room_model.get(room) else {}
         try:
-            async with _typing(room):
-                # cancel_key=汇报房间：房间里的 /cancel 也能停掉工单任务
-                answer = await runner.ask(_sess_key(rec, room), prompt, cwd=rec["path"], system_prompt=sp,
-                                          lock_key=rec["id"], prepare=lambda: projects.prepare_worktree(rec),
-                                          cancel_key=room, **model_kw)
+            # 员工提示词/项目记忆/房间模型/串行锁/cancel_key=房间 等共用跑法见 tasks.run_employee_task
+            answer = await run_employee_task(rec, room, prompt)
             _project_last_active[rec["id"]] = time.time()
             await send(room, f"📋 工单 #{n} 处理结果：\n{answer}", track=True)
             pr = _extract_pr(answer, rec)
@@ -137,7 +129,7 @@ async def _issue_intake_loop():
                 room = _project_home_room(rec["id"])
                 if not room:
                     continue   # 没有可回报的房间：先不接（进展没处说；绑群/私聊路由过即有）
-                if not os.path.isdir(os.path.join(rec.get("path", ""), ".git")):
+                if not has_local_clone(rec):
                     continue
                 try:
                     await _intake_one(rec, room, login)

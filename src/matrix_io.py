@@ -172,6 +172,16 @@ async def send(room_id: str, text: str, track: bool = False, thread_root: str | 
 
 
 
+def _track_incoming(room_id: str, event_id: str, sender: str, body: str,
+                    thread: str | None) -> None:
+    """把一条收到的消息记进三处留存：内存背景（本地时钟 + 线程标记）、event_id 索引
+    （消息被删时据此从背景精确剔除）、逐字记录。文本(bot.on_message)与媒体(media._process_media)
+    两个入口共用——三处必须一起落，收敛到一处免得两个入口各自漂移。"""
+    _context[room_id].append((time.time(), sender, body, thread))
+    state._ctx_recent.append((event_id, room_id, sender, body))
+    transcript.append(room_id, sender, body, event_id=event_id)
+
+
 def _track_reply(room_id: str, text: str, thread_root: str | None = None) -> None:
     """把一条已发出的完整答复并入上下文 + 历史（流式定稿走这里，不再二次发送）。
     thread_root：这条答复发进了哪个线程（None=顶层）——背景按线程分范围，bot 自己的答复也得带上

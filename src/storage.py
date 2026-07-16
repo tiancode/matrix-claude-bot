@@ -38,8 +38,10 @@ def store_root(*parts: str) -> str:
     return os.path.abspath(os.path.join(settings.store_path, *parts))
 
 
-def atomic_write_text(path: str, text: str, *, fsync: bool = False) -> None:
-    """把 text 原子写到 path。fsync=True 时落盘后强制刷盘（更耐崩溃，略慢）。
+def atomic_write_text(path: str, text: str, *, fsync: bool = False,
+                      mode: int | None = None) -> None:
+    """把 text 原子写到 path。fsync=True 时落盘后强制刷盘（更耐崩溃，略慢）；
+    mode 非 None 时 rename 前先 chmod 临时文件（如凭证要 0o600），文件从不以宽权限示人。
     失败抛 OSError，由调用方决定告警 / 静默 / 上抛。"""
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
@@ -49,6 +51,8 @@ def atomic_write_text(path: str, text: str, *, fsync: bool = False) -> None:
         if fsync:
             f.flush()
             os.fsync(f.fileno())
+    if mode is not None:
+        os.chmod(tmp, mode)
     os.replace(tmp, path)
     if fsync:
         # 只 fsync 临时文件的数据不够：rename 落到目录里这一步本身也得刷盘，否则崩溃时目录项
@@ -61,7 +65,9 @@ def atomic_write_text(path: str, text: str, *, fsync: bool = False) -> None:
 
 
 def atomic_write_json(path: str, obj, *, ensure_ascii: bool = False,
-                      indent: int | None = None, fsync: bool = False) -> None:
+                      indent: int | None = None, fsync: bool = False,
+                      mode: int | None = None) -> None:
     """把 obj 序列化为 JSON 后原子写到 path。ensure_ascii / indent 语义同 json.dump。"""
     atomic_write_text(
-        path, json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent), fsync=fsync)
+        path, json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent),
+        fsync=fsync, mode=mode)

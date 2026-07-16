@@ -50,8 +50,9 @@ def test_autonomous_tasks_cancellable_by_room():
                       prepare=None, on_delta=None, cancel_key=None, **_kw):
             seen.append(cancel_key); return "干完了，没开 PR"
 
-    orig = (heartbeat.runner, pr_followup.runner, state.client)
-    heartbeat.runner = pr_followup.runner = R()
+    # 自驱 / 跟进的 runner.ask 走 tasks.run_employee_task（三条后台路径共用），桩挂在 tasks.runner 上
+    orig = (tasks.runner, state.client)
+    tasks.runner = R()
     state.client = FC()
     try:
         asyncio.run(heartbeat._heartbeat_execute(rec, "!room", "修个小 bug"))
@@ -59,7 +60,7 @@ def test_autonomous_tasks_cancellable_by_room():
             rec, {"pid": "h/o/r", "number": 3, "room": "!room", "branch": "claude/x"}, "有评审"))
         assert seen == ["!room", "!room"]                  # 取消维度=汇报房间，/cancel(按房间) 能命中
     finally:
-        heartbeat.runner, pr_followup.runner, state.client = orig
+        tasks.runner, state.client = orig
 
 # ---------- /cancel：排队中的任务被取消后绝不开跑；三种情况文案可区分 ----------
 def test_cancel_stops_queued_task():

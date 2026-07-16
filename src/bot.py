@@ -39,8 +39,11 @@ from nio import (
 
 from config import settings, register_secret
 import state
-from state import (_context, _sent_events, _last_project_by_room, _pending_dispatch,
+from state import (_context, _sent_events, _last_project_by_room, _pending_dispatch,  # noqa: F401
                    _drop_pending, _drop_pending_event, _drop_context_event)
+# ↑ _context 本文件已不直接用（入背景收敛进 matrix_io._track_incoming），仅作 `bot._context`
+#   兼容再导出留着（测试仍按这个名字访问），同下面的 _format_context。
+from storage import atomic_write_json
 from claude_runner import runner  # noqa: F401
 from projects import projects, parse_repo_url, proj_id
 import transcript
@@ -53,7 +56,7 @@ import gitea
 # 下面 import 的名字都是本文件回调/启动自己在用的。唯一例外 _format_context 本文件不直接
 # 用，仅作 `bot.X` 兼容再导出留着（测试仍按这个名字访问）；其余纯测试用的再导出已退役。
 from fmt import _format_context  # noqa: F401  # 测试专用再导出（本文件未直接用）
-from matrix_io import (send, _is_dm, _thread_of,
+from matrix_io import (send, _is_dm, _thread_of, _track_incoming,
                        _resolve_reply_author, _edit_message,
                        _react, _unreact, _ACK_EMOJI)
 from addressing import (_address_kind, _has_trigger, _strip_reply_fallback,
@@ -212,9 +215,7 @@ async def on_message(room: MatrixRoom, event: RoomMessageText):
     # 而背景去重靠与 ctx_body 逐字节匹配。
     mention_note = _mention_note(room, content)
     ctx_body = body + mention_note
-    _context[room.room_id].append((time.time(), sender_name, ctx_body, _thread_of(event)))
-    state._ctx_recent.append((event.event_id, room.room_id, sender_name, ctx_body))  # 供删消息时从背景剔除
-    transcript.append(room.room_id, sender_name, ctx_body, event_id=event.event_id)  # 落盘逐字记录，供回溯
+    _track_incoming(room.room_id, event.event_id, sender_name, ctx_body, _thread_of(event))
     if digest.should_digest(room.room_id):   # 攒够量 / 跨天残留就后台把原始日志预压成日摘要+主题索引
         state._spawn(digest.digest_room(room.room_id))
 
@@ -615,13 +616,10 @@ async def _login():
     if not isinstance(resp, LoginResponse):
         raise SystemExit(f"登录失败: {resp}")
     register_secret(state.client.access_token)  # Matrix token 纳入 redact
-    tmp = settings.creds_path + ".tmp"     # 原子写：临时文件 + chmod 600 + rename
-    with open(tmp, "w") as f:
-        json.dump({"user_id": state.client.user_id,
-                   "device_id": state.client.device_id,
-                   "access_token": state.client.access_token}, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, settings.creds_path)
+    atomic_write_json(settings.creds_path,      # 原子写 + chmod 600（凭证不落宽权限），见 storage
+                      {"user_id": state.client.user_id,
+                       "device_id": state.client.device_id,
+                       "access_token": state.client.access_token}, mode=0o600)
     log.info("登录成功并保存会话: %s (device %s)", state.client.user_id, state.client.device_id)
 
 
